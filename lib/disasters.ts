@@ -34,6 +34,33 @@ export type EventGeometry = {
   coordinates: unknown;
 };
 
+export type CycloneForecastPoint = {
+  forecastAt: string;
+  latitude: number;
+  longitude: number;
+  leadHours: number;
+  windSpeedKnots?: number;
+  pressureHpa?: number;
+  category?: string;
+};
+
+export type CycloneForecast = {
+  official: true;
+  source: string;
+  sourceUrl: string;
+  advisory?: string;
+  issuedAt: string;
+  forecastValidUntil: string;
+  track: CycloneForecastPoint[];
+  trackGeometry: EventGeometry;
+  uncertaintyGeometry?: EventGeometry;
+  uncertaintyLabel?: string;
+  impactGeometry?: EventGeometry;
+  impactBasis: "forecast_wind_radii" | "current_wind_extent" | "uncertainty_only";
+  impactThreshold?: string;
+  note: string;
+};
+
 export type DisasterEvent = {
   id: string;
   masterEventId: string;
@@ -63,6 +90,7 @@ export type DisasterEvent = {
   confidenceLevel: "high" | "medium" | "low";
   geometryType: "Point" | "LineString" | "Polygon" | "MultiPolygon";
   geometry: EventGeometry;
+  cycloneForecast?: CycloneForecast;
   locationQuality: "precise" | "estimated" | "representative" | "unknown";
   locationAccuracyKm: number;
   aoiApprovalRequired: boolean;

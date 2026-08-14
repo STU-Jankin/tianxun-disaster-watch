@@ -132,5 +132,10 @@ test("implements stale-data, map resize, AOI preview and server task gates", asy
   assert.match(eventRoute, /recordCapCancellations/);
   assert.match(eventRoute, /confidenceCode/);
   assert.match(eventRoute, /windKt/);
+  assert.match(eventRoute, /parseNhcTrackKml/);
+  assert.match(eventRoute, /buildJmaCycloneForecast/);
+  assert.match(dashboard, /官方台风预报/);
+  assert.match(dashboard, /cyclone-forecast-track/);
+  assert.match(dashboard, /台风官方路径\/风圈/);
   assert.match(eventRoute, /authorizeApiRequest/);
 });

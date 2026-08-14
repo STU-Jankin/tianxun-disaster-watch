@@ -64,6 +64,7 @@ type SatelliteTask = {
   aoiLengthKm: number;
   aoiBearingDeg: number;
   sourceGeometry?: DisasterEvent["geometry"];
+  cycloneForecast?: DisasterEvent["cycloneForecast"];
   minimumCoveragePercent: number;
   maximumCloudPercent: number;
   spatialResolutionMeters: number;
@@ -152,6 +153,10 @@ export function Dashboard() {
   const taskTriggerRef = useRef<HTMLButtonElement>(null);
   const previousTaskPanelOpen = useRef(false);
   const closeTaskPanel = useCallback(() => setTaskPanelOpen(false), []);
+  const selectEvent = useCallback((event: DisasterEvent) => {
+    setSelected(event);
+    if (window.matchMedia("(max-width: 720px)").matches) setListOpen(false);
+  }, []);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -397,7 +402,7 @@ export function Dashboard() {
             {error && !data ? <EmptyState title="暂时无法连接数据源" detail="请检查网络后点击右上角刷新。" /> : null}
             {!loading && filtered.length === 0 ? <EmptyState title={`${scopes[scope].label}暂无匹配事件`} detail="这通常是好消息。系统仍在持续监听新事件。" /> : null}
             {filtered.map((event) => (
-              <EventCard key={event.id} event={event} active={selected?.id === event.id} onClick={() => setSelected(event)} />
+              <EventCard key={event.id} event={event} active={selected?.id === event.id} onClick={() => selectEvent(event)} />
             ))}
           </div>
           <footer className="panel-footer">
@@ -408,12 +413,13 @@ export function Dashboard() {
 
         {!listOpen && <button className="reopen-panel" onClick={() => setListOpen(true)} inert={taskPanelOpen ? true : undefined} aria-hidden={taskPanelOpen || undefined}>事件列表 <b>{filtered.length}</b> ›</button>}
 
-          <MapView scope={scope} events={filtered} selected={selected} activeTask={tasks.find((task) => task.taskId === activeTaskId) ?? null} layoutKey={`${taskPanelOpen}-${listOpen}`} obscured={taskPanelOpen} onSelect={setSelected} />
+          <MapView scope={scope} events={filtered} selected={selected} activeTask={tasks.find((task) => task.taskId === activeTaskId) ?? null} layoutKey={`${taskPanelOpen}-${listOpen}`} obscured={taskPanelOpen} onSelect={selectEvent} />
 
         <div className="map-legend" inert={taskPanelOpen ? true : undefined} aria-hidden={taskPanelOpen || undefined}>
           <span><i className="red" />红色</span><span><i className="orange" />橙色</span><span><i className="yellow" />黄色</span><span><i className="blue" />蓝色</span>
           <em />
           <span className="priority-ring">◎</span><span>重点范围加权</span>
+          {selected?.cycloneForecast ? <><em /><span><i className="forecast-track-key" />官方路径</span><span><i className="forecast-impact-key" />风圈范围</span><span><i className="forecast-uncertainty-key" />路径不确定区</span></> : null}
         </div>
 
         {selected && <DetailPanel event={selected} obscured={taskPanelOpen} locationZh={locationZh[selected.id]} locationLoading={locationLoading === selected.id} locationState={locationState[selected.id]?.state} onRetryLocation={() => { setLocationState((current) => { const next = { ...current }; delete next[selected.id]; return next; }); setLocationRetry((value) => value + 1); }} taskAdded={tasks.some((task) => taskMatchesEvent(task, selected))} aoiConfirmed={confirmedAois.has(selected.masterEventId)} onConfirmAoi={(confirmed) => setConfirmedAois((current) => { const next = new Set(current); if (confirmed) next.add(selected.masterEventId); else next.delete(selected.masterEventId); return next; })} onAddTask={addTask} onClose={() => setSelected(null)} />}
@@ -495,7 +501,7 @@ function MapView({ scope, events, selected, activeTask, layoutKey, obscured, onS
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<import("leaflet").Map | null>(null);
   const markerLayerRef = useRef<import("leaflet").LayerGroup | null>(null);
-  const selectedLayerRef = useRef<import("leaflet").LayerGroup | null>(null);
+  const selectedLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const aoiLayerRef = useRef<import("leaflet").GeoJSON | null>(null);
   const scopeRef = useRef(scope);
   const eventsRef = useRef(events);
@@ -534,7 +540,7 @@ function MapView({ scope, events, selected, activeTask, layoutKey, obscured, onS
       }).addTo(map);
       L.control.zoom({ position: "topright" }).addTo(map);
       markerLayerRef.current = L.layerGroup().addTo(map);
-      selectedLayerRef.current = L.layerGroup().addTo(map);
+      selectedLayerRef.current = L.featureGroup().addTo(map);
       mapRef.current = map;
 
       const updateView = () => {
@@ -571,6 +577,8 @@ function MapView({ scope, events, selected, activeTask, layoutKey, obscured, onS
         if (activeTask) {
           const layer = aoiLayerRef.current;
           if (layer?.getBounds().isValid()) map.fitBounds(layer.getBounds(), { padding: [32, 32], maxZoom: 11, animate: false });
+        } else if (selected?.cycloneForecast && selectedLayerRef.current?.getBounds().isValid()) {
+          map.fitBounds(selectedLayerRef.current.getBounds(), { padding: [32, 32], maxZoom: 7, animate: false });
         } else if (selected) map.setView([selected.latitude, selected.longitude], Math.max(map.getZoom(), scope === "global" ? 4 : map.getZoom()), { animate: false });
         else map.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], { padding: [24, 24], animate: false });
         selectedLayerRef.current?.eachLayer((selectedLayer) => {
@@ -649,13 +657,49 @@ function MapView({ scope, events, selected, activeTask, layoutKey, obscured, onS
     if (!mapReady || !map || !layer) return;
     layer.clearLayers();
     if (!selected) return;
+    let cancelled = false;
     void import("leaflet").then((L) => {
+      if (cancelled) return;
+      const forecast = selected.cycloneForecast;
+      if (forecast?.impactGeometry) {
+        L.geoJSON(unwrapForecastGeometry(forecast.impactGeometry, selected.longitude) as GeoJSON.GeoJsonObject, {
+          style: { color: "#c15624", weight: 1.5, fillColor: "#e58a42", fillOpacity: 0.16, className: "cyclone-impact-area" },
+          interactive: false,
+        }).addTo(layer);
+      }
+      if (forecast?.uncertaintyGeometry) {
+        L.geoJSON(unwrapForecastGeometry(forecast.uncertaintyGeometry, selected.longitude) as GeoJSON.GeoJsonObject, {
+          style: { color: "#6b5aa6", weight: 1.5, fillColor: "#8c79bd", fillOpacity: 0.10, dashArray: "5 4", className: "cyclone-uncertainty-area" },
+          interactive: false,
+        }).addTo(layer);
+      }
+      if (forecast) {
+        L.geoJSON(unwrapForecastGeometry(forecast.trackGeometry, selected.longitude) as GeoJSON.GeoJsonObject, {
+          style: { color: "#075fa8", weight: 3, opacity: 0.9, dashArray: "8 5", className: "cyclone-forecast-track" },
+          interactive: false,
+        }).addTo(layer);
+        forecast.track.forEach((point) => {
+          const marker = L.circleMarker([point.latitude, unwrapLongitudeNear(point.longitude, selected.longitude)], {
+            radius: point.leadHours === 0 ? 6 : 4,
+            color: "#075fa8",
+            weight: 2,
+            fillColor: "#fffdf8",
+            fillOpacity: 1,
+            interactive: true,
+            className: "cyclone-forecast-point",
+          });
+          marker.bindTooltip(`${point.leadHours === 0 ? "实况" : `+${point.leadHours}小时`} · ${formatTimeWithYear(point.forecastAt)} CST${point.windSpeedKnots !== undefined ? ` · ${point.windSpeedKnots} kt` : ""}`, { direction: "top" });
+          marker.addTo(layer);
+        });
+      }
       L.circleMarker([selected.latitude, selected.longitude], { radius: 20, color: "#006d63", weight: 3, fill: false, interactive: false, className: "selected-event-ring" }).addTo(layer);
+      if (!activeTask && forecast && layer.getBounds().isValid()) map.fitBounds(layer.getBounds(), { padding: [32, 32], maxZoom: 7, animate: true, duration: 0.45 });
     });
-  }, [mapReady, selected]);
+    return () => { cancelled = true; };
+  }, [activeTask, mapReady, selected]);
 
   useEffect(() => {
-    if (!mapReady || !selected || !mapRef.current) return;
+    if (!mapReady || !selected || selected.cycloneForecast || !mapRef.current) return;
     const map = mapRef.current;
     const targetZoom = Math.max(map.getZoom(), scope === "global" ? 4 : map.getZoom());
     map.flyTo([selected.latitude, selected.longitude], targetZoom, { animate: true, duration: 0.45 });
@@ -709,6 +753,20 @@ function DetailPanel({ event, obscured, locationZh, locationLoading, locationSta
       {event.sourcePresence === "retained" ? <em>当前短时数据源未再次报告该事件；未据此判定灾害已结束，仍保留至观测期届满或权威撤销。</em> : null}
     </div>
     <div className="observation-deadline"><span>{event.observationPhase === "golden" ? "距建议复核" : "后续观测剩余"}</span><strong>{remainingObservationTime(event.observationPhase === "golden" ? event.observationReviewAt : event.observationExpiresAt)}</strong><small>{event.observationPhase === "golden" ? `黄金期至 ${formatTime(event.observationReviewAt)}；到期不撤销，转后续观测` : `建议持续复核；兜底归档 ${formatTime(event.observationExpiresAt)}`}</small></div>
+    {event.cycloneForecast ? <section className="cyclone-forecast-card">
+      <h3>官方台风预报 · {event.cycloneForecast.source}</h3>
+      <div className="forecast-validity"><span>发布 {formatTimeWithYear(event.cycloneForecast.issuedAt)} CST</span><span>有效至 {formatTimeWithYear(event.cycloneForecast.forecastValidUntil)} CST</span></div>
+      <div className="forecast-layer-notes">
+        <span><i className="track" />中心预报路径</span>
+        <span><i className="impact" />{event.cycloneForecast.impactBasis === "forecast_wind_radii" ? event.cycloneForecast.impactThreshold || "预报风圈" : event.cycloneForecast.impactBasis === "current_wind_extent" ? event.cycloneForecast.impactThreshold || "当前强风范围" : "本报次无官方风圈"}</span>
+        {event.cycloneForecast.uncertaintyGeometry ? <span><i className="uncertainty" />{event.cycloneForecast.uncertaintyLabel || "路径不确定区"}</span> : null}
+      </div>
+      <div className="forecast-points" aria-label="台风中心预报节点">
+        {event.cycloneForecast.track.map((point) => <div key={`${point.leadHours}-${point.forecastAt}`}><b>{point.leadHours === 0 ? "实况" : `+${point.leadHours}h`}</b><time>{formatTime(point.forecastAt)}</time><small>{point.latitude.toFixed(2)}°, {point.longitude.toFixed(2)}°{point.windSpeedKnots !== undefined ? ` · ${point.windSpeedKnots} kt` : ""}</small></div>)}
+      </div>
+      <p className="forecast-disclaimer">{event.cycloneForecast.note}</p>
+      <a href={safeHttpUrl(event.cycloneForecast.sourceUrl)} target="_blank" rel="noreferrer">查看本报次官方预报 ↗</a>
+    </section> : null}
     <section><h3>观测目标</h3><div className="target-list">{event.observationTargets.map((target) => <span key={target}>{target}</span>)}</div></section>
     <section><h3>可选载荷</h3><div className="target-list">{payloadOptions.map((payload) => <span key={payload}>{payload}</span>)}</div></section>
     <section><h3>事件摘要</h3><p>{event.description || "暂无详细描述。"}</p></section>
@@ -796,6 +854,7 @@ function TaskPanel({ tasks, syncState, activeTaskId, onActivate, onUpdate, onRem
         </div>
         <div className="task-coordinates"><span>中心坐标</span><code>{task.latitude.toFixed(6)}, {task.longitude.toFixed(6)}</code><button onClick={() => void copyCoordinates(task).then((copied) => { if (copied) { setCopiedTaskId(task.taskId); window.setTimeout(() => setCopiedTaskId((current) => current === task.taskId ? null : current), 1800); } })}>{copiedTaskId === task.taskId ? "已复制" : "复制"}</button></div>
         <div className={`task-quality ${task.aoiApproval}`}><span>{locationQualityLabels[task.locationQuality]} · ±{task.locationAccuracyKm} km</span><b>{task.aoiApproval === "source_verified" ? "来源可下发" : "已人工核对"}</b><small>{task.evidenceCount} 条证据 · {task.masterEventId}</small></div>
+        {task.cycloneForecast ? <div className="task-forecast-summary"><strong>官方预报已随任务保存</strong><span>{task.cycloneForecast.track.length} 个中心节点 · 至 {formatTimeWithYear(task.cycloneForecast.forecastValidUntil)} CST</span><small>{task.cycloneForecast.impactGeometry ? `${task.cycloneForecast.impactThreshold || "官方风圈"}已作为默认来源 AOI` : "本报次没有官方风圈；默认 AOI 仍以当前中心设置"}</small></div> : null}
         <div className={`task-sync ${syncState[task.taskId]?.state ?? "local"}`} role="status">{syncState[task.taskId]?.state === "saving" ? "正在同步…" : syncState[task.taskId]?.state === "synced" ? "已同步到业务数据库" : syncState[task.taskId]?.state === "error" ? <>同步失败：{syncState[task.taskId]?.message ?? "请重试"} <button onClick={() => onRetry(task)}>重试同步</button></> : "仅保存在本机"}</div>
     <div className="aoi-type-selector" aria-label="AOI目标类型">
           {aoiOptions.filter((option) => option.id !== "source" || task.sourceGeometry).map((option) => <button key={option.id} aria-pressed={task.aoiType === option.id} className={task.aoiType === option.id ? "active" : ""} onClick={() => onUpdate(task.taskId, { aoiType: option.id })}>{option.label}</button>)}
@@ -826,7 +885,7 @@ function TaskPanel({ tasks, syncState, activeTaskId, onActivate, onUpdate, onRem
         </div>
       </article>)}
     </div>
-    <footer>导出字段包括灾害发生时间、任务时间窗、WGS 84坐标、多类型AOI、载荷、目标、优先级与权威来源。</footer>
+    <footer>导出字段包括灾害发生时间、任务时间窗、WGS 84坐标、多类型AOI、台风官方路径/风圈、载荷、目标、优先级与权威来源。</footer>
   </aside>;
 }
 
@@ -884,6 +943,7 @@ function createSatelliteTask(event: DisasterEvent, operatorConfirmed: boolean): 
   const now = Date.now();
   const phaseEnd = new Date(event.observationPhase === "golden" ? event.observationReviewAt : event.observationExpiresAt).getTime();
   const preferredEnd = Math.min(phaseEnd, now + (event.observationPhase === "golden" ? 72 : 168) * 3_600_000);
+  const officialImpactGeometry = event.cycloneForecast?.impactGeometry;
   return {
     taskId: `TASK-${event.id}-${now}`,
     eventId: event.id,
@@ -896,13 +956,14 @@ function createSatelliteTask(event: DisasterEvent, operatorConfirmed: boolean): 
     longitude: event.longitude,
     eventOccurredAt: event.occurredAt,
     eventUpdatedAt: event.updatedAt,
-    aoiType: event.geometryType === "Point" ? "circle" : "source",
+    aoiType: officialImpactGeometry ? "source" : event.geometryType === "Point" ? "circle" : "source",
     aoiRadiusKm: defaultAoiRadiusKm[event.hazard],
     aoiWidthKm: Math.max(10, defaultAoiRadiusKm[event.hazard] * 2),
     aoiHeightKm: Math.max(10, defaultAoiRadiusKm[event.hazard] * 2),
     aoiLengthKm: Math.max(20, defaultAoiRadiusKm[event.hazard] * 3),
     aoiBearingDeg: 0,
-    sourceGeometry: event.geometry,
+    sourceGeometry: officialImpactGeometry ?? event.geometry,
+    cycloneForecast: event.cycloneForecast,
     minimumCoveragePercent: 80,
     maximumCloudPercent: 30,
     spatialResolutionMeters: 10,
@@ -977,6 +1038,13 @@ function downloadTasks(tasks: SatelliteTask[], format: ExportFormat) {
       location_accuracy_km: task.locationAccuracyKm,
       evidence_count: task.evidenceCount,
       aoi_approval: task.aoiApproval,
+      cyclone_forecast_source: task.cycloneForecast?.source ?? "",
+      cyclone_forecast_issued_at_utc: task.cycloneForecast?.issuedAt ?? "",
+      cyclone_forecast_valid_until_utc: task.cycloneForecast?.forecastValidUntil ?? "",
+      cyclone_forecast_point_count: task.cycloneForecast?.track.length ?? 0,
+      cyclone_impact_basis: task.cycloneForecast?.impactBasis ?? "",
+      cyclone_impact_threshold: task.cycloneForecast?.impactThreshold ?? "",
+      cyclone_forecast_url: task.cycloneForecast?.sourceUrl ?? "",
     }));
     const headers = Object.keys(rows[0] ?? {});
     content = `\uFEFF${headers.join(",")}\n${rows.map((row) => headers.map((header) => csvCell(row[header as keyof typeof row])).join(",")).join("\n")}`;
@@ -1025,6 +1093,7 @@ function migrateSatelliteTask(task: Partial<SatelliteTask>): SatelliteTask {
     aoiLengthKm: task.aoiLengthKm ?? Math.max(20, radius * 3),
     aoiBearingDeg: task.aoiBearingDeg ?? 0,
     sourceGeometry: task.sourceGeometry,
+    cycloneForecast: task.cycloneForecast,
     minimumCoveragePercent: task.minimumCoveragePercent ?? 80,
     maximumCloudPercent: task.maximumCloudPercent ?? 30,
     spatialResolutionMeters: task.spatialResolutionMeters ?? 10,
@@ -1088,6 +1157,36 @@ async function copyCoordinates(task: SatelliteTask) {
 
 function taskGeometry(task: SatelliteTask) {
   return buildTaskAoi(task as unknown as Record<string, unknown>) ?? { type: "Point", coordinates: [task.longitude, task.latitude] };
+}
+
+function unwrapForecastGeometry(geometry: DisasterEvent["geometry"], referenceLongitude: number): DisasterEvent["geometry"] {
+  const sequence = (value: unknown, reference = referenceLongitude) => {
+    if (!Array.isArray(value)) return value;
+    let previous = reference;
+    return value.map((coordinate) => {
+      if (!Array.isArray(coordinate) || coordinate.length < 2) return coordinate;
+      const longitude = unwrapLongitudeNear(Number(coordinate[0]), previous);
+      previous = longitude;
+      return [longitude, Number(coordinate[1])];
+    });
+  };
+  if (geometry.type === "Point") {
+    const coordinate = geometry.coordinates as number[];
+    return { ...geometry, coordinates: [unwrapLongitudeNear(Number(coordinate[0]), referenceLongitude), Number(coordinate[1])] };
+  }
+  if (geometry.type === "LineString") return { ...geometry, coordinates: sequence(geometry.coordinates) };
+  if (geometry.type === "Polygon") return { ...geometry, coordinates: (geometry.coordinates as unknown[]).map((ring) => sequence(ring)) };
+  return {
+    ...geometry,
+    coordinates: (geometry.coordinates as unknown[]).map((polygon) => Array.isArray(polygon) ? polygon.map((ring) => sequence(ring)) : polygon),
+  };
+}
+
+function unwrapLongitudeNear(longitude: number, reference: number) {
+  let result = longitude;
+  while (result - reference > 180) result -= 360;
+  while (result - reference < -180) result += 360;
+  return result;
 }
 
 function toggleValue(values: string[], value: string) {

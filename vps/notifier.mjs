@@ -73,6 +73,11 @@ export function changeNotifications(previous, event, config) {
     if (moved >= config.cycloneMoveKm && +new Date(event.updatedAt) > +new Date(previous.updatedAt)) {
       changes.push({ type: "track", label: `台风中心移动约 ${Math.round(moved)} km` });
     }
+    const previousForecastAt = Date.parse(String(previous.cycloneForecast?.issuedAt ?? ""));
+    const forecastAt = Date.parse(String(event.cycloneForecast?.issuedAt ?? ""));
+    if (Number.isFinite(forecastAt) && (!Number.isFinite(previousForecastAt) || forecastAt > previousForecastAt) && Number(event.priority) >= config.minPriority - 10) {
+      changes.push({ type: "forecast", label: `收到${clean(event.cycloneForecast.source, 60)}新一期官方路径/风圈` });
+    }
   }
   if (config.notifyPhaseTransition && previous.observationPhase === "golden" && event.observationPhase === "followup") {
     changes.push({ type: "phase", label: "进入后续观测期" });
@@ -92,6 +97,9 @@ export function buildEventMessage(event, changeLabel) {
     ? event.observationTargets.slice(0, 5).map((item) => clean(item, 50)).join("、")
     : "待判定";
   const review = event.aoiApprovalRequired ? "⚠️ AOI 需人工复核" : "✅ AOI 可直接进入仿真规划";
+  const forecast = event.hazard === "cyclone" && event.cycloneForecast
+    ? `- 官方预报：${clean(event.cycloneForecast.source, 80)} · ${number(event.cycloneForecast.track?.length, 0)} 个中心节点 · 有效至 ${formatTime(event.cycloneForecast.forecastValidUntil)} · ${clean(event.cycloneForecast.impactThreshold || "本报次无官方风圈", 100)}`
+    : "";
 
   return [
     `${SEVERITY_EMOJI[event.severity] ?? "⚪"} **${clean(changeLabel, 160)}｜${clean(event.title, 220)}**`,
@@ -101,10 +109,11 @@ export function buildEventMessage(event, changeLabel) {
     `- 发生/更新：${formatTime(event.occurredAt)} / ${formatTime(event.updatedAt)}`,
     `- 观测阶段：${PHASE_LABELS[event.observationPhase] ?? clean(event.observationPhase, 40)}，截止 ${formatTime(event.observationExpiresAt)}`,
     `- AOI/目标：${clean(event.geometryType || "Point", 30)} · ${targets}`,
+    forecast,
     `- 可选载荷：${sensors}`,
     `- 证据/来源：${number(event.evidenceCount, 0)} 个独立来源，过程更新 ${number(event.updateCount, 0)} 次 · ${source}`,
     `- 事件键：\`${clean(event.entityKey || event.masterEventId || event.id, 180)}\``,
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 export function defaultConfig(env = process.env) {
@@ -482,6 +491,7 @@ function changeVersion(event, type) {
   if (type === "evidence") return String(event.evidenceCount || 0);
   if (type === "location" || type === "dispatch") return `${event.locationQuality}:${event.dispatchEligibility}`;
   if (type === "track") return `${Number(event.latitude).toFixed(1)}:${Number(event.longitude).toFixed(1)}`;
+  if (type === "forecast") return String(event.cycloneForecast?.issuedAt || event.updatedAt);
   if (type === "phase") return String(event.observationPhase);
   return String(event.masterEventId || event.id || event.updatedAt);
 }

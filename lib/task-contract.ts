@@ -54,6 +54,7 @@ export function validateSatelliteTask(task: Record<string, unknown>, options: { 
   const delivery = Date.parse(String(task.deliveryDeadline ?? ""));
   if (!Number.isFinite(delivery) || (Number.isFinite(end) && delivery < end)) errors.push("交付期限必须是有效时间且不早于成像窗口结束");
   if (!isValidAoi(task)) errors.push("AOI 参数无效或超出安全范围");
+  if (task.cycloneForecast !== undefined && !isValidCycloneForecast(task.cycloneForecast)) errors.push("台风官方预报字段无效或超出安全范围");
   if (!isValidApproval(task.aoiApproval)) errors.push("AOI 审批状态无效");
   if (options.requireApproved && task.aoiApproval !== "source_verified" && task.aoiApproval !== "operator_confirmed") errors.push("任务尚未通过 AOI 审批");
   if (task.source === "演示数据") errors.push("演示事件禁止进入任务流");
@@ -127,6 +128,28 @@ function isGeometry(value: unknown) {
   if (geometry.type === "LineString") return geometry.coordinates.length >= 2;
   if (geometry.type === "Polygon") return validPolygon(geometry.coordinates);
   return geometry.coordinates.every((polygon) => validPolygon(polygon));
+}
+
+function isValidCycloneForecast(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const forecast = value as Record<string, unknown>;
+  if (forecast.official !== true || typeof forecast.source !== "string" || forecast.source.length > 120 || !safeHttpUrl(forecast.sourceUrl, "")) return false;
+  if (!Number.isFinite(Date.parse(String(forecast.issuedAt ?? ""))) || !Number.isFinite(Date.parse(String(forecast.forecastValidUntil ?? "")))) return false;
+  if (!Array.isArray(forecast.track) || forecast.track.length < 2 || forecast.track.length > 30 || !isGeometry(forecast.trackGeometry)) return false;
+  if (forecast.uncertaintyGeometry !== undefined && !isGeometry(forecast.uncertaintyGeometry)) return false;
+  if (forecast.impactGeometry !== undefined && !isGeometry(forecast.impactGeometry)) return false;
+  if (!["forecast_wind_radii", "current_wind_extent", "uncertainty_only"].includes(String(forecast.impactBasis))) return false;
+  return forecast.track.every((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+    const point = item as Record<string, unknown>;
+    const latitude = Number(point.latitude);
+    const longitude = Number(point.longitude);
+    const leadHours = Number(point.leadHours);
+    return Number.isFinite(Date.parse(String(point.forecastAt ?? "")))
+      && Number.isFinite(latitude) && latitude >= -90 && latitude <= 90
+      && Number.isFinite(longitude) && longitude >= -180 && longitude <= 180
+      && Number.isFinite(leadHours) && leadHours >= 0 && leadHours <= 360;
+  });
 }
 
 function validPolygon(value: unknown) {

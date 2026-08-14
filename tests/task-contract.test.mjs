@@ -37,6 +37,28 @@ test("requires payload for visibility/export and accepts a complete task", async
   assert.equal(validateSatelliteTask(task, { requireApproved: true }).ok, false);
 });
 
+test("accepts bounded official cyclone forecasts and rejects malformed forecast coordinates", async () => {
+  const { validateSatelliteTask } = await contract();
+  const task = validTask();
+  task.cycloneForecast = {
+    official: true,
+    source: "JMA",
+    sourceUrl: "https://www.jma.go.jp/bosai/typhoon/",
+    issuedAt: "2026-08-14T00:00:00Z",
+    forecastValidUntil: "2026-08-15T00:00:00Z",
+    track: [
+      { forecastAt: "2026-08-14T00:00:00Z", latitude: 20, longitude: 130, leadHours: 0 },
+      { forecastAt: "2026-08-15T00:00:00Z", latitude: 21, longitude: 132, leadHours: 24 },
+    ],
+    trackGeometry: { type: "LineString", coordinates: [[130, 20], [132, 21]] },
+    impactBasis: "uncertainty_only",
+    note: "test",
+  };
+  assert.equal(validateSatelliteTask(task).ok, true);
+  task.cycloneForecast.track[1].longitude = 999;
+  assert.equal(validateSatelliteTask(task).ok, false);
+});
+
 test("enforces auditable task state transitions", async () => {
   const { canTransitionTask } = await contract();
   assert.equal(canTransitionTask(null, "candidate"), true);

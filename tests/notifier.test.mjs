@@ -116,13 +116,21 @@ test("cyclone movement is measured and significant movement is reported", () => 
   assert.equal(changes.at(-1).type, "track");
 });
 
+test("a new official cyclone forecast advisory is reported", () => {
+  const previous = event({ cycloneForecast: { issuedAt: "2026-08-12T00:00:00Z", source: "JMA" } });
+  const current = event({ priority: 70, cycloneForecast: { issuedAt: "2026-08-12T06:00:00Z", source: "JMA" } });
+  assert.equal(changeNotifications(previous, current, config).at(-1).type, "forecast");
+});
+
 test("Feishu message includes task-planning fields and coordinates", () => {
-  const message = buildEventMessage(event({ priority: 75 }), "新灾害事件");
+  const message = buildEventMessage(event({ priority: 75, cycloneForecast: { source: "JMA", track: [{}, {}, {}], forecastValidUntil: "2026-08-15T00:00:00Z", impactThreshold: "当前强风警戒域" } }), "新灾害事件");
   assert.match(message, /20\.00000, 120\.00000/);
   assert.match(message, /AOI 需人工复核/);
   assert.match(message, /SAR \/ 红外/);
   assert.match(message, /发生\/更新/);
   assert.match(message, /事件键/);
+  assert.match(message, /官方预报：JMA · 3 个中心节点/);
+  assert.match(message, /当前强风警戒域/);
 });
 
 test("end-to-end baseline is delivered once and only material changes repeat", async (context) => {

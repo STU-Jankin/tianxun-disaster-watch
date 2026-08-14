@@ -6,12 +6,14 @@ import {
   normalizeSeverity,
   normalizeCapSeverity,
   normalizeEarthquakeSeverity,
+  type CycloneForecast,
   type DisasterEvent,
   type HazardType,
 } from "../../../lib/disasters";
 import { listRetainedCanonicalEvents, persistCanonicalEvents, resolveCanonicalEventsByReferences } from "../../../db/operational";
 import { circularGeometryCenter, cycloneSeverityFromKnots, firmsConfidenceScore, firmsHeatSeverity, latestTrackPoint } from "../../../lib/source-normalization";
 import { authorizeApiRequest } from "../../../lib/api-security";
+import { buildJmaCycloneForecast, extractKmlFromKmz, parseNhcConeKml, parseNhcTrackKml, parseNhcWindRadiiKml } from "../../../lib/cyclone-forecast";
 
 export const dynamic = "force-dynamic";
 
@@ -26,7 +28,7 @@ const endpoints = {
   nhc: "https://www.nhc.noaa.gov/CurrentStorms.json",
   tsunamiNtwc: "https://www.tsunami.gov/events/xml/PAAQCAP.xml",
   tsunamiPtwc: "https://www.tsunami.gov/events/xml/PHEBCAP.xml",
-  jmaTyphoons: "https://www.jma.go.jp/bosai/information/data/typhoon.json",
+  jmaTyphoons: "https://www.jma.go.jp/bosai/typhoon/data/targetTc.json",
   wmoChinaCap: "https://severeweather.wmo.int/v2/cap-alerts/cn-cma-xx/rss.xml",
   usgsVolcanoes: "https://volcanoes.usgs.gov/hans-public/api/volcano/getElevatedVolcanoes",
   geonetVolcanoes: "https://api.geonet.org.nz/volcano/val",
@@ -165,7 +167,7 @@ async function refreshEvents() {
       tier: "第一优先级",
       role: "事件",
       setupUrl: "https://www.jma.go.jp/bosai/map.html#contents=typhoon",
-      successMessage: "在线；使用当前台风中心实况，预报点不冒充发生位置",
+      successMessage: "在线；当前中心为事件坐标，并附官方中心路径、70%预报圆及可用的强风警戒域",
       fetcher: fetchJmaTyphoons,
     },
     {
@@ -327,6 +329,17 @@ async function fetchText(url: string) {
   });
   if (!response.ok) throw new Error(`${response.status} ${url}`);
   return response.text();
+}
+
+async function fetchKmzKml(url: string) {
+  const response = await fetch(url, {
+    headers: { Accept: "application/vnd.google-earth.kmz,application/zip", "User-Agent": "Tianxun-Disaster-Watch/0.1" },
+    signal: AbortSignal.timeout(12_000),
+  });
+  if (!response.ok) throw new Error(`${response.status} ${url}`);
+  const contentLength = Number(response.headers.get("content-length") ?? 0);
+  if (contentLength > 6_000_000) throw new Error("KMZ 文件超过安全上限");
+  return extractKmlFromKmz(await response.arrayBuffer());
 }
 
 async function fetchCenc(): Promise<DisasterEvent[]> {
@@ -641,14 +654,61 @@ async function fetchFirms(): Promise<DisasterEvent[]> {
 async function fetchNhc(): Promise<DisasterEvent[]> {
   const data = await fetchJson(endpoints.nhc) as Record<string, unknown>;
   const storms = ((data.activeStorms ?? data.storms ?? []) as Array<Record<string, unknown>>);
-  return storms.flatMap((storm, index) => {
+  const events = await Promise.all(storms.slice(0, 12).map(async (storm, index): Promise<DisasterEvent | null> => {
     const latitude = parseCoordinate(storm.latitude ?? storm.lat);
     const longitude = parseCoordinate(storm.longitude ?? storm.lon);
-    if (latitude === null || longitude === null) return [];
-    const occurredAt = validIso(storm.lastUpdate ?? storm.advisoryDate ?? storm.binNumber) ?? new Date().toISOString();
+    if (latitude === null || longitude === null) return null;
+    const publicAdvisory = isRecord(storm.publicAdvisory) ? storm.publicAdvisory : {};
+    const forecastTrack = isRecord(storm.forecastTrack) ? storm.forecastTrack : {};
+    const trackCone = isRecord(storm.trackCone) ? storm.trackCone : {};
+    const forecastWindRadii = isRecord(storm.forecastWindRadiiGIS) ? storm.forecastWindRadiiGIS : {};
+    const occurredAt = validIso(storm.lastUpdate ?? publicAdvisory.issuance ?? storm.advisoryDate ?? storm.binNumber) ?? new Date().toISOString();
     const name = String(storm.stormName ?? storm.name ?? storm.id ?? `热带气旋 ${index + 1}`);
     const windKt = Number(storm.intensity ?? storm.windSpeed ?? 0);
-    return [baseEvent({
+    const pressureHpa = Number(storm.pressure);
+    const sourceUrl = String(publicAdvisory.url ?? (isRecord(storm.forecastGraphics) ? storm.forecastGraphics.url : undefined) ?? "https://www.nhc.noaa.gov/");
+    let cycloneForecast: CycloneForecast | undefined;
+    const trackKmzUrl = typeof forecastTrack.kmzFile === "string" ? forecastTrack.kmzFile : "";
+    if (trackKmzUrl) {
+      try {
+        const trackKml = await fetchKmzKml(trackKmzUrl);
+        const issuedAt = validIso(forecastTrack.issuance) ?? occurredAt;
+        const parsedTrack = parseNhcTrackKml(trackKml, issuedAt, {
+          latitude,
+          longitude,
+          windSpeedKnots: Number.isFinite(windKt) && windKt > 0 ? windKt : undefined,
+          pressureHpa: Number.isFinite(pressureHpa) && pressureHpa > 0 ? pressureHpa : undefined,
+          category: String(storm.classification ?? storm.stormType ?? ""),
+        });
+        if (parsedTrack) {
+          const [coneResult, windResult] = await Promise.allSettled([
+            typeof trackCone.kmzFile === "string" ? fetchKmzKml(trackCone.kmzFile) : Promise.reject(new Error("无概率锥")),
+            typeof forecastWindRadii.kmzFile === "string" ? fetchKmzKml(forecastWindRadii.kmzFile) : Promise.reject(new Error("无预报风圈")),
+          ]);
+          const uncertaintyGeometry = coneResult.status === "fulfilled" ? parseNhcConeKml(coneResult.value) : undefined;
+          const windRadii = windResult.status === "fulfilled" ? parseNhcWindRadiiKml(windResult.value) : {};
+          cycloneForecast = {
+            official: true,
+            source: "NOAA NHC",
+            sourceUrl,
+            advisory: forecastTrack.advNum ? `Advisory ${String(forecastTrack.advNum)}` : undefined,
+            issuedAt,
+            forecastValidUntil: parsedTrack.track[parsedTrack.track.length - 1].forecastAt,
+            track: parsedTrack.track,
+            trackGeometry: parsedTrack.trackGeometry,
+            uncertaintyGeometry,
+            uncertaintyLabel: uncertaintyGeometry ? "NHC 官方路径概率锥（约 60%–70% 的中心路径落入）" : undefined,
+            impactGeometry: windRadii.geometry,
+            impactBasis: windRadii.geometry ? "forecast_wind_radii" : "uncertainty_only",
+            impactThreshold: windRadii.thresholdKnots ? `预报 ≥${windRadii.thresholdKnots} kt 风圈` : undefined,
+            note: "预报路径、概率锥和风圈会随每个报次更新；概率锥只表示中心路径不确定性，不代表风雨影响边界。",
+          };
+        }
+      } catch (error) {
+        console.warn(`NHC forecast unavailable for ${String(storm.id ?? name)}`, error);
+      }
+    }
+    return baseEvent({
       id: `nhc-${String(storm.id ?? storm.stormId ?? name)}-${occurredAt}`,
       title: `${String(storm.classification ?? storm.stormType ?? "热带气旋")} ${name}`,
       hazard: "cyclone",
@@ -657,14 +717,18 @@ async function fetchNhc(): Promise<DisasterEvent[]> {
       occurredAt,
       updatedAt: occurredAt,
       source: "NOAA NHC",
-      sourceUrl: String(storm.publicAdvisory ?? storm.url ?? "https://www.nhc.noaa.gov/"),
+      sourceUrl,
       sourceSeverity: windKt ? `${windKt} kt` : String(storm.classification ?? "活动中"),
       severity: cycloneSeverityFromKnots(windKt),
       magnitude: windKt || undefined,
       magnitudeUnit: windKt ? "kt" : undefined,
-      description: "NHC业务区当前热带气旋中心位置；全球覆盖仍由GDACS及后续区域台风中心馈送补充。",
-    })];
-  });
+      description: cycloneForecast
+        ? "NHC业务区当前热带气旋中心位置，并附官方预报路径、路径概率锥及可用的预报风圈。"
+        : "NHC业务区当前热带气旋中心位置；本轮官方预报图层暂未取得。",
+      cycloneForecast,
+    });
+  }));
+  return events.filter((event): event is DisasterEvent => Boolean(event));
 }
 
 async function fetchNoaaTsunami(url: string, source: string): Promise<DisasterEvent[]> {
@@ -721,39 +785,52 @@ async function fetchJmaTyphoons(): Promise<DisasterEvent[]> {
   const feed = await fetchJson(endpoints.jmaTyphoons) as unknown;
   const entries = collectRecords(feed).filter((entry) => {
     const text = JSON.stringify(entry).toLowerCase();
-    return /台風|typhoon|tropical cyclone/.test(text);
+    return /台風|typhoon|tropical cyclone|tropicalcyclone|"tc\d{4}"/.test(text);
   });
   const candidates: Array<{ record: Record<string, unknown>; eventId: string }> = [];
   entries.forEach((record) => {
-    const eventId = String(record.eventId ?? record.eventID ?? record.id ?? record.key ?? "");
+    const eventId = String(record.tropicalCyclone ?? record.eventId ?? record.eventID ?? record.id ?? record.key ?? "");
     if (eventId) candidates.push({ record, eventId });
   });
   const unique = [...new Map(candidates.map((candidate) => [candidate.eventId, candidate])).values()].slice(0, 12);
 
   const resolved = await Promise.all(unique.map(async ({ record, eventId }) => {
     let specification: unknown = record;
+    let forecast: unknown = [];
     try {
-      specification = await fetchJson(`https://www.jma.go.jp/bosai/typhoon/data/${encodeURIComponent(eventId)}/specifications.json`);
+      [specification, forecast] = await Promise.all([
+        fetchJson(`https://www.jma.go.jp/bosai/typhoon/data/${encodeURIComponent(eventId)}/specifications.json`),
+        fetchJson(`https://www.jma.go.jp/bosai/typhoon/data/${encodeURIComponent(eventId)}/forecast.json`),
+      ]);
     } catch {
       // 部分列表项已包含完整实况；详情端点短暂不可用时仍可按相同字段解析。
     }
-    return parseJmaTyphoon(specification, eventId);
+    return parseJmaTyphoon(specification, eventId, forecast);
   }));
   return resolved.filter((event): event is DisasterEvent => Boolean(event));
 }
 
-function parseJmaTyphoon(payload: unknown, eventId: string): DisasterEvent | null {
+function parseJmaTyphoon(payload: unknown, eventId: string, forecastPayload: unknown): DisasterEvent | null {
   const records = collectRecords(payload);
   const current = records.find((record) => /実況|analysis|current|observation/i.test(String(record.type ?? record.label ?? record.status ?? record.kind ?? "")))
+    ?? records.find((record) => Number(record.advancedHours) === 0)
     ?? records.find((record) => findLatLon(record) !== null);
   if (!current) return null;
-  const coordinates = findLatLon(current);
+  const sourceUrl = `https://www.jma.go.jp/bosai/map.html#contents=typhoon&typhoon=${encodeURIComponent(eventId)}`;
+  const cycloneForecast = buildJmaCycloneForecast(payload, forecastPayload, sourceUrl);
+  const currentForecastPoint = cycloneForecast?.track.find((point) => point.leadHours === 0);
+  const position = isRecord(current.position) && Array.isArray(current.position.deg) ? current.position.deg : null;
+  const coordinates = currentForecastPoint
+    ? [currentForecastPoint.longitude, currentForecastPoint.latitude] as [number, number]
+    : position && validCoordinates(Number(position[0]), Number(position[1]))
+      ? [Number(position[1]), Number(position[0])] as [number, number]
+      : findLatLon(current);
   if (!coordinates) return null;
-  const occurredAt = findIsoValue(current) ?? findIsoValue(payload);
+  const occurredAt = currentForecastPoint?.forecastAt ?? findIsoValue(current) ?? findIsoValue(payload);
   if (!occurredAt) return null;
-  const root = isRecord(payload) ? payload : {};
-  const name = localizedText(current.name ?? root.name ?? current.typhoonName ?? root.typhoonName) || eventId;
-  const location = localizedText(current.location ?? current.area ?? root.location);
+  const titleRecord = records.find((record) => record.part === "title") ?? {};
+  const name = localizedText(current.name ?? titleRecord.name ?? current.typhoonName ?? titleRecord.typhoonName) || eventId;
+  const location = localizedText(current.location ?? current.area ?? titleRecord.location);
   const wind = firstFinite(
     valueAtPath(current, ["maximumWind", "sustained", "m/s"]),
     valueAtPath(current, ["maximumWind", "sustained", "ms"]),
@@ -768,15 +845,18 @@ function parseJmaTyphoon(payload: unknown, eventId: string): DisasterEvent | nul
     latitude: coordinates[1],
     longitude: coordinates[0],
     occurredAt,
-    updatedAt: occurredAt,
+    updatedAt: cycloneForecast?.issuedAt ?? occurredAt,
     source: "日本气象厅 JMA 台风",
-    sourceUrl: `https://www.jma.go.jp/bosai/map.html#contents=typhoon&typhoon=${encodeURIComponent(eventId)}`,
+    sourceUrl,
     sourceSeverity: wind !== null ? `最大风速 ${wind} m/s` : pressure !== null ? `中心气压 ${pressure} hPa` : "活动中",
     severity: wind !== null && wind >= 51 ? "red" : wind !== null && wind >= 33 ? "orange" : wind !== null && wind >= 17 ? "yellow" : "blue",
     magnitude: wind ?? pressure ?? undefined,
     magnitudeUnit: wind !== null ? "m/s" : pressure !== null ? "hPa" : undefined,
     country: location || "西北太平洋",
-    description: "JMA当前台风中心实况；只采用实况点生成任务，预报路径不作为灾害发生坐标。",
+    description: cycloneForecast
+      ? "JMA当前台风中心实况，并附官方预报中心路径、70%预报圆及当前强风警戒域；预报点不冒充灾害发生坐标。"
+      : "JMA当前台风中心实况；本轮官方预报图层暂未取得。",
+    cycloneForecast,
   });
 }
 
@@ -1025,6 +1105,8 @@ function canonicalizeEvents(events: DisasterEvent[]) {
       .sort((a, b) => +new Date(b.observedAt) - +new Date(a.observedAt))
       .map((item) => [`${sourceFamily(item.source)}|${item.sourceEventId}`, item])).values()].slice(0, 50);
     const location = [...candidates].sort((a, b) => locationRank(b.locationQuality) - locationRank(a.locationQuality) || a.locationAccuracyKm - b.locationAccuracyKm)[0];
+    const cycloneForecast = candidates.flatMap((event) => event.cycloneForecast ? [event.cycloneForecast] : [])
+      .sort((a, b) => +new Date(b.issuedAt) - +new Date(a.issuedAt) || b.track.length - a.track.length)[0];
     const confidenceScore = Math.min(99, primary.confidenceScore + Math.min(18, (evidence.length - 1) * 6));
     const entityKey = candidates.map((event) => event.entityKey || processEntityKey(event)).sort((a, b) => entityKeySpecificity(b) - entityKeySpecificity(a))[0];
     return {
@@ -1042,6 +1124,7 @@ function canonicalizeEvents(events: DisasterEvent[]) {
       longitude: location.longitude,
       geometryType: location.geometryType,
       geometry: location.geometry,
+      cycloneForecast,
       locationQuality: location.locationQuality,
       locationAccuracyKm: location.locationAccuracyKm,
       aoiApprovalRequired: location.locationQuality !== "precise",
