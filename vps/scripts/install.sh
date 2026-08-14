@@ -49,6 +49,10 @@ install -d -o tianxun-engine -g tianxun-engine -m 0750 /var/lib/tianxun/engine
 install -d -o tianxun-notifier -g tianxun-notifier -m 0750 /var/lib/tianxun/notifier
 install -d -o root -g root -m 0755 "$install_root/releases" "$release_dir"
 cp -a "$project_dir/." "$release_dir/"
+# cp -a also copies the source directory mode. Releases are often unpacked in a
+# private mktemp directory (0700), so restore traverse permission for the
+# dedicated service users before switching the current symlink.
+chmod 0755 "$release_dir"
 rm -rf "$release_dir/node_modules" "$release_dir/.git" "$release_dir/.next" "$release_dir/.vinext" "$release_dir/.wrangler" "$release_dir/.data"
 find "$release_dir" -maxdepth 1 -type f -name '.env*' ! -name '.env.example' -delete
 rm -f "$release_dir/.dev-output.log" "$release_dir/.dev-error.log"
