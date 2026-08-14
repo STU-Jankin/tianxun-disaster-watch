@@ -15,7 +15,15 @@ case "$release_dir" in
   *) echo "Refusing unsafe release path: $release_dir" >&2; exit 1 ;;
 esac
 
-node_version="$(node --version 2>/dev/null | sed -E 's/^v//' || true)"
+node_bin="/usr/bin/node"
+npm_bin="/usr/bin/npm"
+if [[ ! -x "$node_bin" || ! -x "$npm_bin" ]]; then
+  echo "System-wide Node.js and npm are required at /usr/bin/node and /usr/bin/npm." >&2
+  echo "Do not rely on a root-only nvm/Hermes Node installation for system services." >&2
+  exit 1
+fi
+
+node_version="$("$node_bin" --version 2>/dev/null | sed -E 's/^v//' || true)"
 node_major="${node_version%%.*}"
 node_minor="$(cut -d. -f2 <<<"$node_version")"
 if [[ -z "$node_major" || "$node_major" -lt 22 || ( "$node_major" -eq 22 && "${node_minor:-0}" -lt 13 ) ]]; then
@@ -23,7 +31,7 @@ if [[ -z "$node_major" || "$node_major" -lt 22 || ( "$node_major" -eq 22 && "${n
   exit 1
 fi
 
-for required_command in npm sqlite3 curl; do
+for required_command in sqlite3 curl; do
   if ! command -v "$required_command" >/dev/null 2>&1; then
     echo "Missing required command: $required_command" >&2
     exit 1
@@ -48,8 +56,8 @@ rm -f "$release_dir/.dev-output.log" "$release_dir/.dev-error.log"
 cd "$release_dir"
 install -d -o tianxun-engine -g tianxun-engine -m 0750 /var/cache/tianxun/npm
 chown -R tianxun-engine:tianxun-engine "$release_dir"
-runuser -u tianxun-engine -- env npm_config_cache=/var/cache/tianxun/npm npm ci
-runuser -u tianxun-engine -- env npm_config_cache=/var/cache/tianxun/npm npm run build
+runuser -u tianxun-engine -- env npm_config_cache=/var/cache/tianxun/npm "$npm_bin" ci
+runuser -u tianxun-engine -- env npm_config_cache=/var/cache/tianxun/npm "$npm_bin" run build
 chown -R root:root "$release_dir"
 previous_target="$(readlink -f "$install_root/current" 2>/dev/null || true)"
 ln -sfn "$release_dir" "$install_root/current"
