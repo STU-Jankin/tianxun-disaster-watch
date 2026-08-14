@@ -85,9 +85,17 @@ install -o root -g root -m 0644 "$release_dir/vps/systemd/tianxun-backup.service
 install -o root -g root -m 0644 "$release_dir/vps/systemd/tianxun-backup.timer" /etc/systemd/system/tianxun-backup.timer
 
 systemctl daemon-reload
-if ! systemctl enable tianxun-engine.service \
-  || ! systemctl restart tianxun-engine.service \
-  || ! curl --fail --silent --show-error --retry 5 --retry-delay 2 http://127.0.0.1:3000/api/health >/dev/null; then
+engine_ready=false
+if systemctl enable tianxun-engine.service && systemctl restart tianxun-engine.service; then
+  for _attempt in {1..15}; do
+    if curl --fail --silent --show-error http://127.0.0.1:3000/api/health >/dev/null 2>&1; then
+      engine_ready=true
+      break
+    fi
+    sleep 1
+  done
+fi
+if [[ "$engine_ready" != true ]]; then
   if [[ -n "$previous_target" && "$previous_target" == /opt/tianxun/releases/* ]]; then
     ln -sfn "$previous_target" "$install_root/current"
     systemctl restart tianxun-engine.service || true
