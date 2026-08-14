@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash, createHmac } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, realpathSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
@@ -553,7 +553,7 @@ function locationLabel(value) {
   return LOCATION_LABELS[value] ?? (clean(value, 40) || "未知");
 }
 
-const isMain = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+const isMain = process.argv[1] && executablePath(process.argv[1]) === executablePath(fileURLToPath(import.meta.url));
 if (isMain) {
   runOnce().then((result) => {
     process.stdout.write(`${JSON.stringify(result)}\n`);
@@ -562,4 +562,13 @@ if (isMain) {
     process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
     process.exitCode = 1;
   });
+}
+
+function executablePath(value) {
+  const absolute = resolve(value);
+  try {
+    return realpathSync(absolute);
+  } catch {
+    return absolute;
+  }
 }
