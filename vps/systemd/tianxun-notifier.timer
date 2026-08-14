@@ -1,0 +1,13 @@
+[Unit]
+Description=Poll Tianxun feeds and notify through Hermes every five minutes
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=5min
+AccuracySec=20s
+RandomizedDelaySec=20s
+Persistent=true
+Unit=tianxun-notifier.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,30 @@
+[Unit]
+Description=Tianxun disaster change detector and Hermes delivery queue
+After=network-online.target tianxun-engine.service
+Wants=network-online.target tianxun-engine.service
+
+[Service]
+Type=oneshot
+User=tianxun-notifier
+Group=tianxun-notifier
+WorkingDirectory=/opt/tianxun/current
+EnvironmentFile=/etc/tianxun/notifier.env
+Environment=NODE_OPTIONS=--disable-warning=ExperimentalWarning
+ExecStart=/usr/bin/node /opt/tianxun/current/vps/notifier.mjs
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/tianxun/notifier
+MemoryMax=180M
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

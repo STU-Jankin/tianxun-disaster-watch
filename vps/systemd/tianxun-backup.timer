@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly Tianxun database backup
+
+[Timer]
+OnCalendar=*-*-* 03:20:00
+RandomizedDelaySec=20min
+Persistent=true
+Unit=tianxun-backup.service
+
+[Install]
+WantedBy=timers.target

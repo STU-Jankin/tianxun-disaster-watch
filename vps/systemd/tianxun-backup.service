@@ -1,0 +1,23 @@
+[Unit]
+Description=Back up Tianxun operational databases
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/opt/tianxun/current/vps/scripts/backup.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN
+ReadWritePaths=/var/backups /var/lib/tianxun
+
+[Install]
+WantedBy=multi-user.target
