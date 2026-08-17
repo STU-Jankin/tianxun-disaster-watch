@@ -1,7 +1,7 @@
 export const taskStatuses = ["candidate", "reviewed", "scheduled", "submitted", "acquired", "completed", "failed", "cancelled"] as const;
 export type TaskStatus = (typeof taskStatuses)[number];
 
-export const aoiTypes = ["source", "point", "circle", "rectangle", "corridor"] as const;
+export const aoiTypes = ["source", "point", "circle", "rectangle", "corridor", "polygon", "multi"] as const;
 export const sensorOptions = ["高分辨率光学", "宽幅光学", "多光谱", "高光谱", "SAR", "热红外", "微波辐射计", "激光雷达"] as const;
 
 const transitions: Record<TaskStatus, TaskStatus[]> = {
@@ -20,7 +20,7 @@ export type TaskValidationResult = { ok: true } | { ok: false; errors: string[] 
 const allowedTaskFields = new Set([
   "taskId", "eventId", "masterEventId", "entityKey", "title", "hazard", "priority", "latitude", "longitude",
   "eventOccurredAt", "eventUpdatedAt", "aoiType", "aoiRadiusKm", "aoiWidthKm", "aoiHeightKm", "aoiLengthKm",
-  "aoiBearingDeg", "sourceGeometry", "cycloneForecast", "minimumCoveragePercent", "maximumCloudPercent",
+  "aoiBearingDeg", "sourceGeometry", "customGeometry", "cycloneForecast", "minimumCoveragePercent", "maximumCloudPercent",
   "spatialResolutionMeters", "incidenceAngleMinDeg", "incidenceAngleMaxDeg", "revisitCount", "deliveryDeadline",
   "imagingStart", "imagingEnd", "sensors", "observationTargets", "observationPhase", "source", "sourceUrl",
   "locationQuality", "locationAccuracyKm", "evidenceCount", "aoiApproval", "approvedAt", "approvedBy",
@@ -31,7 +31,7 @@ export function unknownTaskFields(task: Record<string, unknown>) {
   return Object.keys(task).filter((key) => !allowedTaskFields.has(key));
 }
 
-export function validateSatelliteTask(task: Record<string, unknown>, options: { requireApproved?: boolean; requireProvenance?: boolean } = {}): TaskValidationResult {
+export function validateSatelliteTask(task: Record<string, unknown>, options: { requireApproved?: boolean; requirePayload?: boolean; requireProvenance?: boolean } = {}): TaskValidationResult {
   const errors: string[] = [];
   for (const key of ["taskId", "eventId", "masterEventId", "title", "status", "aoiType", "imagingStart", "imagingEnd", "aoiApproval", "createdAt"]) {
     if (typeof task[key] !== "string" || !String(task[key]).trim()) errors.push(`缺少或无效字段：${key}`);
@@ -55,7 +55,7 @@ export function validateSatelliteTask(task: Record<string, unknown>, options: { 
   if (!aoiTypes.includes(task.aoiType as (typeof aoiTypes)[number])) errors.push("AOI 类型不在允许范围内");
   if (!Array.isArray(task.sensors) || task.sensors.length > sensorOptions.length) errors.push("载荷字段必须是受限数组");
   else if (task.sensors.some((sensor) => !sensorOptions.includes(sensor as (typeof sensorOptions)[number]))) errors.push("包含未知载荷");
-  else if (task.sensors.length === 0 && (options.requireApproved || task.status !== "candidate")) errors.push("至少选择一种载荷");
+  else if (task.sensors.length === 0 && (options.requirePayload || task.status !== "candidate")) errors.push("至少选择一种载荷");
   if (!Array.isArray(task.observationTargets) || task.observationTargets.length === 0) errors.push("至少需要一个观测目标");
   else if (task.observationTargets.length > 30 || task.observationTargets.some((target) => typeof target !== "string" || target.length > 120)) errors.push("观测目标数量或长度超限");
   boundedNumber(task.minimumCoveragePercent, 1, 100, "最低覆盖率", errors);
@@ -129,6 +129,8 @@ function isValidAoi(task: Record<string, unknown>) {
   if (type === "circle") return Number.isFinite(radius) && radius >= 1 && radius <= 1000;
   if (type === "rectangle") return Number.isFinite(width) && width >= 1 && width <= 2000 && Number.isFinite(height) && height >= 1 && height <= 2000;
   if (type === "corridor") return Number.isFinite(width) && width >= 1 && width <= 500 && Number.isFinite(length) && length >= 1 && length <= 3000 && Number.isFinite(bearing) && bearing >= 0 && bearing < 360;
+  if (type === "polygon") return isGeometry(task.customGeometry) && (task.customGeometry as { type?: unknown }).type === "Polygon";
+  if (type === "multi") return isGeometry(task.customGeometry) && (task.customGeometry as { type?: unknown }).type === "MultiPolygon";
   return false;
 }
 
@@ -160,6 +162,7 @@ function isValidCycloneForecast(value: unknown) {
   if (!Array.isArray(forecast.track) || forecast.track.length < 2 || forecast.track.length > 30 || !isGeometry(forecast.trackGeometry)) return false;
   if (forecast.uncertaintyGeometry !== undefined && !isGeometry(forecast.uncertaintyGeometry)) return false;
   if (forecast.impactGeometry !== undefined && !isGeometry(forecast.impactGeometry)) return false;
+  if (forecast.impactField !== undefined && !isValidCycloneImpactField(forecast.impactField)) return false;
   if (!["forecast_wind_radii", "current_wind_extent", "uncertainty_only"].includes(String(forecast.impactBasis))) return false;
   return forecast.track.every((item) => {
     if (!item || typeof item !== "object" || Array.isArray(item)) return false;
@@ -171,6 +174,31 @@ function isValidCycloneForecast(value: unknown) {
       && Number.isFinite(latitude) && latitude >= -90 && latitude <= 90
       && Number.isFinite(longitude) && longitude >= -180 && longitude <= 180
       && Number.isFinite(leadHours) && leadHours >= 0 && leadHours <= 360;
+  });
+}
+
+function isValidCycloneImpactField(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const field = value as Record<string, unknown>;
+  if (field.temporalResolutionHours !== 1 || !Array.isArray(field.frames) || field.frames.length < 2 || field.frames.length > 361) return false;
+  return field.frames.every((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+    const frame = item as Record<string, unknown>;
+    const latitude = Number(frame.latitude);
+    const longitude = Number(frame.longitude);
+    const leadHours = Number(frame.leadHours);
+    const uncertaintyRadiusKm = frame.uncertaintyRadiusKm === undefined ? undefined : Number(frame.uncertaintyRadiusKm);
+    if (!Number.isFinite(Date.parse(String(frame.forecastAt ?? ""))) || !Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180 || !Number.isInteger(leadHours) || leadHours < 0 || leadHours > 360) return false;
+    if (uncertaintyRadiusKm !== undefined && (!Number.isFinite(uncertaintyRadiusKm) || uncertaintyRadiusKm <= 0 || uncertaintyRadiusKm > 3000)) return false;
+    if (frame.uncertaintyGeometry !== undefined && !isGeometry(frame.uncertaintyGeometry)) return false;
+    if (!Array.isArray(frame.windFields) || frame.windFields.length > 8) return false;
+    return frame.windFields.every((candidate) => {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+      const wind = candidate as Record<string, unknown>;
+      const quadrants = wind.quadrantsKm as Record<string, unknown> | undefined;
+      return Number.isFinite(Number(wind.thresholdKnots)) && Number(wind.thresholdKnots) > 0 && Number(wind.thresholdKnots) <= 250
+        && Boolean(quadrants) && ["northeast", "southeast", "southwest", "northwest"].every((key) => Number.isFinite(Number(quadrants?.[key])) && Number(quadrants?.[key]) >= 0 && Number(quadrants?.[key]) <= 3000);
+    });
   });
 }
 
@@ -186,5 +214,6 @@ function coordinatesEqual(left: unknown, right: unknown) {
 export function validateTaskAoi(task: Record<string, unknown>, aoi: unknown) {
   if (!isGeometry(aoi)) return false;
   if (task.aoiType === "source") return JSON.stringify(aoi) === JSON.stringify(task.sourceGeometry);
+  if (task.aoiType === "polygon" || task.aoiType === "multi") return JSON.stringify(aoi) === JSON.stringify(task.customGeometry);
   return true;
 }

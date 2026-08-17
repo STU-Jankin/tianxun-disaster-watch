@@ -5,8 +5,8 @@ async function forecastTools() {
   return import(new URL("../lib/cyclone-forecast.ts", import.meta.url));
 }
 
-test("NHC official KML yields forecast nodes, uncertainty cone and the lowest 34 kt wind footprint", async () => {
-  const { parseNhcConeKml, parseNhcTrackKml, parseNhcWindRadiiKml } = await forecastTools();
+test("NHC official KML yields hourly centers, quadrant wind fields, uncertainty cone and the lowest 34 kt footprint", async () => {
+  const { buildHourlyCycloneImpactField, parseNhcConeKml, parseNhcTrackKml, parseNhcWindRadiiKml } = await forecastTools();
   const trackKml = `<kml><Placemark><description>Advisory Information Maximum Wind: 40 knots Minimum Pressure: 1000 mb</description><Point><coordinates>-130,15</coordinates></Point></Placemark><Placemark><description>24 hr Forecast Maximum Wind: 50 knots</description><Point><coordinates>-132,16</coordinates></Point></Placemark></kml>`;
   const track = parseNhcTrackKml(trackKml, "2026-08-14T00:00:00Z", { latitude: 15, longitude: -130 });
   assert.equal(track.track.length, 2);
@@ -16,9 +16,17 @@ test("NHC official KML yields forecast nodes, uncertainty cone and the lowest 34
 
   const polygon = "<Polygon><outerBoundaryIs><LinearRing><coordinates>-131,14 -129,14 -129,16 -131,14</coordinates></LinearRing></outerBoundaryIs></Polygon>";
   assert.equal(parseNhcConeKml(`<kml><Placemark>${polygon}</Placemark></kml>`).type, "Polygon");
-  const radii = parseNhcWindRadiiKml(`<kml><Placemark><name>50</name>${polygon}</Placemark><Placemark><name>34</name>${polygon}</Placemark></kml>`);
+  const secondPolygon = "<Polygon><outerBoundaryIs><LinearRing><coordinates>-133,15 -131,15 -131,17 -133,15</coordinates></LinearRing></outerBoundaryIs></Polygon>";
+  const radii = parseNhcWindRadiiKml(`<kml><Placemark><name>34 kt 0 hr</name>${polygon}</Placemark><Placemark><name>34 kt 24 hr</name>${secondPolygon}</Placemark><Placemark><name>50 kt 0 hr</name>${polygon}</Placemark></kml>`, track.track);
   assert.equal(radii.thresholdKnots, 34);
-  assert.equal(radii.geometry.type, "Polygon");
+  assert.ok(["Polygon", "MultiPolygon"].includes(radii.geometry.type));
+  assert.equal(radii.timeSlices.length, 2);
+  assert.ok(radii.timeSlices[0].windFields[0].quadrantsKm.northeast > 0);
+  const field = buildHourlyCycloneImpactField(track.track, radii.timeSlices, parseNhcConeKml(`<kml><Placemark>${polygon}</Placemark></kml>`));
+  assert.equal(field.frames.length, 25);
+  assert.equal(field.frames[1].centerBasis, "interpolated_official_track");
+  assert.equal(field.frames[12].windFields[0].basis, "interpolated_official_fields");
+  assert.equal(field.uncertaintyBasis, "official_advisory_envelope");
 });
 
 test("JMA specifications preserve lat/lon order and separate 70% forecast circles from current wind extent", async () => {
@@ -40,6 +48,9 @@ test("JMA specifications preserve lat/lon order and separate 70% forecast circle
   assert.equal(result.uncertaintyGeometry.type, "Polygon");
   assert.equal(result.impactGeometry.type, "Polygon");
   assert.equal(result.impactBasis, "current_wind_extent");
+  assert.equal(result.impactField.frames.length, 25);
+  assert.equal(result.impactField.frames[0].windFields[0].basis, "official_circular_extent");
+  assert.equal(result.impactField.frames[24].uncertaintyRadiusKm, 120.38);
   assert.match(result.note, /不等同于受灾范围/);
 });
 

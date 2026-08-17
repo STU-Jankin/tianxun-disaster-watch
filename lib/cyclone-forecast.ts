@@ -1,10 +1,24 @@
-import type { CycloneForecast, CycloneForecastPoint, EventGeometry } from "./disasters";
+import type {
+  CycloneForecast,
+  CycloneForecastPoint,
+  CycloneImpactField,
+  CycloneImpactFrame,
+  CycloneQuadrantRadiiKm,
+  CycloneWindField,
+  EventGeometry,
+} from "./disasters";
 
 const MAX_KMZ_BYTES = 6_000_000;
 const MAX_KML_BYTES = 12_000_000;
 
 type Coordinate = [number, number];
 type JsonRecord = Record<string, unknown>;
+export type OfficialImpactSlice = {
+  leadHours: number;
+  uncertaintyRadiusKm?: number;
+  uncertaintyGeometry?: EventGeometry;
+  windFields: CycloneWindField[];
+};
 
 export async function extractKmlFromKmz(input: ArrayBuffer | Uint8Array): Promise<string> {
   const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
@@ -85,17 +99,94 @@ export function parseNhcConeKml(kml: string): EventGeometry | undefined {
   return polygonGeometry(placemarks(kml).flatMap((placemark) => polygonRings(placemark)));
 }
 
-export function parseNhcWindRadiiKml(kml: string): { geometry?: EventGeometry; thresholdKnots?: number } {
+export function parseNhcWindRadiiKml(kml: string, track: CycloneForecastPoint[] = []): { geometry?: EventGeometry; thresholdKnots?: number; timeSlices: OfficialImpactSlice[] } {
   const byThreshold = new Map<number, Coordinate[][]>();
+  const byLead = new Map<number, Map<number, Coordinate[][]>>();
   for (const placemark of placemarks(kml)) {
     const name = stripTags(placemark.match(/<name[^>]*>([\s\S]*?)<\/name>/i)?.[1] ?? "");
     const threshold = Number(name.match(/\b(\d{2,3})\b/)?.[1]);
     if (!Number.isFinite(threshold)) continue;
-    byThreshold.set(threshold, [...(byThreshold.get(threshold) ?? []), ...polygonRings(placemark)]);
+    const rings = polygonRings(placemark);
+    byThreshold.set(threshold, [...(byThreshold.get(threshold) ?? []), ...rings]);
+    const plainText = stripTags(placemark);
+    const leadHours = Number(`${name} ${plainText}`.match(/\b(\d{1,3})\s*(?:hr|hrs|hour|hours)\b/i)?.[1] ?? 0);
+    const thresholds = byLead.get(leadHours) ?? new Map<number, Coordinate[][]>();
+    thresholds.set(threshold, [...(thresholds.get(threshold) ?? []), ...rings]);
+    byLead.set(leadHours, thresholds);
   }
   const thresholds = [...byThreshold.keys()].sort((a, b) => a - b);
   const thresholdKnots = thresholds.includes(34) ? 34 : thresholds[0];
-  return { geometry: thresholdKnots === undefined ? undefined : polygonGeometry(byThreshold.get(thresholdKnots) ?? []), thresholdKnots };
+  const timeSlices = [...byLead.entries()].sort(([left], [right]) => left - right).flatMap(([leadHours, fields]): OfficialImpactSlice[] => {
+    const center = nearestTrackPoint(track, leadHours);
+    if (!center) return [];
+    return [{
+      leadHours,
+      windFields: [...fields.entries()].sort(([left], [right]) => left - right).flatMap(([threshold, rings]): CycloneWindField[] => {
+        const quadrantsKm = quadrantRadiiFromRings(rings, center.latitude, center.longitude);
+        return maximumQuadrantRadius(quadrantsKm) > 0 ? [{ thresholdKnots: threshold, quadrantsKm, basis: "derived_official_polygon" }] : [];
+      }),
+    }];
+  });
+  return { geometry: thresholdKnots === undefined ? undefined : polygonGeometry(byThreshold.get(thresholdKnots) ?? []), thresholdKnots, timeSlices };
+}
+
+export function buildHourlyCycloneImpactField(
+  track: CycloneForecastPoint[],
+  officialSlices: OfficialImpactSlice[],
+  uncertaintyEnvelope?: EventGeometry,
+): CycloneImpactField | undefined {
+  if (track.length < 2) return undefined;
+  const orderedTrack = [...track].sort((left, right) => left.leadHours - right.leadHours);
+  const firstHour = Math.max(0, Math.ceil(orderedTrack[0].leadHours));
+  const lastHour = Math.min(360, Math.floor(orderedTrack[orderedTrack.length - 1].leadHours));
+  if (lastHour < firstHour) return undefined;
+  const slices = [...officialSlices].sort((left, right) => left.leadHours - right.leadHours);
+  const frames: CycloneImpactFrame[] = [];
+  for (let leadHours = firstHour; leadHours <= lastHour; leadHours += 1) {
+    const center = interpolateTrackPoint(orderedTrack, leadHours);
+    if (!center) continue;
+    const exactSlice = slices.find((slice) => slice.leadHours === leadHours);
+    const lowerSlice = [...slices].reverse().find((slice) => slice.leadHours <= leadHours);
+    const upperSlice = slices.find((slice) => slice.leadHours >= leadHours);
+    const uncertaintyRadiusKm = exactSlice?.uncertaintyRadiusKm ?? interpolateOptionalNumber(lowerSlice, upperSlice, leadHours, "uncertaintyRadiusKm");
+    const windFields = exactSlice?.windFields.length
+      ? exactSlice.windFields
+      : interpolateWindFields(lowerSlice, upperSlice, leadHours);
+    frames.push({
+      forecastAt: new Date(Date.parse(orderedTrack[0].forecastAt) + (leadHours - orderedTrack[0].leadHours) * 3_600_000).toISOString(),
+      leadHours,
+      latitude: center.latitude,
+      longitude: center.longitude,
+      centerBasis: orderedTrack.some((point) => point.leadHours === leadHours) ? "official_node" : "interpolated_official_track",
+      uncertaintyRadiusKm,
+      uncertaintyGeometry: exactSlice?.uncertaintyGeometry,
+      windFields,
+    });
+  }
+  if (!frames.length) return undefined;
+  const hasTimeUncertainty = slices.some((slice) => slice.uncertaintyRadiusKm !== undefined || slice.uncertaintyGeometry);
+  return {
+    temporalResolutionHours: 1,
+    frames,
+    interpolation: "linear_between_official_nodes",
+    uncertaintyBasis: hasTimeUncertainty ? "time_sliced_official" : uncertaintyEnvelope ? "official_advisory_envelope" : "not_available",
+    note: "逐时中心及连续风圈仅在相邻官方预报节点之间插值；官方节点、插值节点和不确定区来源在每个时间片中分别标记，不进行报次之外的外推。",
+  };
+}
+
+export function cycloneWindGeometry(frame: CycloneImpactFrame, field: CycloneWindField): EventGeometry {
+  const ring = Array.from({ length: 73 }, (_, index): Coordinate => {
+    const bearing = index * 5;
+    return destinationCoordinate(frame.latitude, frame.longitude, interpolatedQuadrantRadius(field.quadrantsKm, bearing), bearing);
+  });
+  return { type: "Polygon", coordinates: [ring] };
+}
+
+export function cycloneUncertaintyGeometry(frame: CycloneImpactFrame): EventGeometry | undefined {
+  if (frame.uncertaintyGeometry) return frame.uncertaintyGeometry;
+  return frame.uncertaintyRadiusKm && frame.uncertaintyRadiusKm > 0
+    ? { type: "Polygon", coordinates: [circleRing(frame.latitude, frame.longitude, frame.uncertaintyRadiusKm * 1000)] }
+    : undefined;
 }
 
 export function buildJmaCycloneForecast(
@@ -140,6 +231,23 @@ export function buildJmaCycloneForecast(
   const impactGeometry = windCenter && windRadius && windRadius > 0
     ? { type: "Polygon" as const, coordinates: [circleRing(windCenter[1], windCenter[0], windRadius)] }
     : undefined;
+  const impactSlices = forecastRecords.flatMap((record): OfficialImpactSlice[] => {
+    const leadHours = Number(record.advancedHours);
+    if (!Number.isFinite(leadHours) || leadHours < 0 || leadHours > 360) return [];
+    const probabilityRadiusMeters = finiteNumber(asRecord(record.probabilityCircle)?.radius);
+    const warningArea = asRecord(record.galeWarningArea);
+    const warningRadiusMeters = finiteNumber(warningArea?.radius);
+    const windFields: CycloneWindField[] = warningRadiusMeters && warningRadiusMeters > 0 ? [{
+      thresholdKnots: 29,
+      quadrantsKm: equalQuadrants(warningRadiusMeters / 1000),
+      basis: "official_circular_extent",
+    }] : [];
+    return [{
+      leadHours,
+      uncertaintyRadiusKm: probabilityRadiusMeters && probabilityRadiusMeters > 0 ? probabilityRadiusMeters / 1000 : undefined,
+      windFields,
+    }];
+  });
   const typhoonNumber = String(title.typhoonNumber ?? "").trim();
   return {
     official: true,
@@ -153,6 +261,7 @@ export function buildJmaCycloneForecast(
     uncertaintyGeometry: polygonGeometry(uncertaintyRings),
     uncertaintyLabel: "JMA 官方预报圆（台风中心进入概率约 70%）",
     impactGeometry,
+    impactField: buildHourlyCycloneImpactField(track, impactSlices, polygonGeometry(uncertaintyRings)),
     impactBasis: impactGeometry ? "current_wind_extent" : "uncertainty_only",
     impactThreshold: impactGeometry ? "当前强风警戒域（约 ≥15 m/s）" : undefined,
     note: "预报路径和预报圆会随报次更新；预报圆表示中心位置不确定性，不等同于受灾范围。强风警戒域仅表示当前强风影响边界。",
@@ -267,4 +376,130 @@ function localizedValue(value: unknown) {
 
 function normalizeLongitude(value: number) {
   return ((value + 540) % 360) - 180;
+}
+
+function nearestTrackPoint(track: CycloneForecastPoint[], leadHours: number) {
+  if (!track.length) return undefined;
+  return [...track].sort((left, right) => Math.abs(left.leadHours - leadHours) - Math.abs(right.leadHours - leadHours))[0];
+}
+
+function interpolateTrackPoint(track: CycloneForecastPoint[], leadHours: number) {
+  const exact = track.find((point) => point.leadHours === leadHours);
+  if (exact) return exact;
+  const lower = [...track].reverse().find((point) => point.leadHours < leadHours);
+  const upper = track.find((point) => point.leadHours > leadHours);
+  if (!lower || !upper || upper.leadHours === lower.leadHours) return undefined;
+  const ratio = (leadHours - lower.leadHours) / (upper.leadHours - lower.leadHours);
+  const upperLongitude = unwrapLongitude(upper.longitude, lower.longitude);
+  return {
+    latitude: lower.latitude + (upper.latitude - lower.latitude) * ratio,
+    longitude: normalizeLongitude(lower.longitude + (upperLongitude - lower.longitude) * ratio),
+  };
+}
+
+function interpolateOptionalNumber(lower: OfficialImpactSlice | undefined, upper: OfficialImpactSlice | undefined, leadHours: number, key: "uncertaintyRadiusKm") {
+  const lowerValue = lower?.[key];
+  const upperValue = upper?.[key];
+  if (lowerValue === undefined || upperValue === undefined || !lower || !upper || upper.leadHours === lower.leadHours) return undefined;
+  const ratio = (leadHours - lower.leadHours) / (upper.leadHours - lower.leadHours);
+  return lowerValue + (upperValue - lowerValue) * ratio;
+}
+
+function interpolateWindFields(lower: OfficialImpactSlice | undefined, upper: OfficialImpactSlice | undefined, leadHours: number): CycloneWindField[] {
+  if (!lower || !upper || lower.leadHours === upper.leadHours) return [];
+  const ratio = (leadHours - lower.leadHours) / (upper.leadHours - lower.leadHours);
+  const upperByThreshold = new Map(upper.windFields.map((field) => [field.thresholdKnots, field]));
+  return lower.windFields.flatMap((field): CycloneWindField[] => {
+    const next = upperByThreshold.get(field.thresholdKnots);
+    if (!next) return [];
+    return [{
+      thresholdKnots: field.thresholdKnots,
+      quadrantsKm: mapQuadrants(field.quadrantsKm, next.quadrantsKm, (left, right) => left + (right - left) * ratio),
+      basis: "interpolated_official_fields",
+    }];
+  });
+}
+
+function quadrantRadiiFromRings(rings: Coordinate[][], latitude: number, longitude: number): CycloneQuadrantRadiiKm {
+  const radii = equalQuadrants(0);
+  rings.flat().forEach(([candidateLongitude, candidateLatitude]) => {
+    const distance = greatCircleDistanceKm(latitude, longitude, candidateLatitude, candidateLongitude);
+    const bearing = initialBearing(latitude, longitude, candidateLatitude, candidateLongitude);
+    if (bearing < 90) radii.northeast = Math.max(radii.northeast, distance);
+    else if (bearing < 180) radii.southeast = Math.max(radii.southeast, distance);
+    else if (bearing < 270) radii.southwest = Math.max(radii.southwest, distance);
+    else radii.northwest = Math.max(radii.northwest, distance);
+  });
+  return mapQuadrants(radii, radii, (value) => Number(value.toFixed(2)));
+}
+
+function maximumQuadrantRadius(radii: CycloneQuadrantRadiiKm) {
+  return Math.max(radii.northeast, radii.southeast, radii.southwest, radii.northwest);
+}
+
+function equalQuadrants(radiusKm: number): CycloneQuadrantRadiiKm {
+  return { northeast: radiusKm, southeast: radiusKm, southwest: radiusKm, northwest: radiusKm };
+}
+
+function mapQuadrants(left: CycloneQuadrantRadiiKm, right: CycloneQuadrantRadiiKm, mapper: (left: number, right: number) => number): CycloneQuadrantRadiiKm {
+  return {
+    northeast: mapper(left.northeast, right.northeast),
+    southeast: mapper(left.southeast, right.southeast),
+    southwest: mapper(left.southwest, right.southwest),
+    northwest: mapper(left.northwest, right.northwest),
+  };
+}
+
+function interpolatedQuadrantRadius(radii: CycloneQuadrantRadiiKm, bearing: number) {
+  const centers = [
+    { bearing: -45, radius: radii.northwest },
+    { bearing: 45, radius: radii.northeast },
+    { bearing: 135, radius: radii.southeast },
+    { bearing: 225, radius: radii.southwest },
+    { bearing: 315, radius: radii.northwest },
+    { bearing: 405, radius: radii.northeast },
+  ];
+  const normalized = bearing < -45 ? bearing + 360 : bearing;
+  const upperIndex = centers.findIndex((item) => item.bearing >= normalized);
+  const upper = centers[Math.max(1, upperIndex)];
+  const lower = centers[Math.max(0, upperIndex - 1)];
+  const ratio = (normalized - lower.bearing) / (upper.bearing - lower.bearing);
+  return lower.radius + (upper.radius - lower.radius) * ratio;
+}
+
+function destinationCoordinate(latitude: number, longitude: number, distanceKm: number, bearingDeg: number): Coordinate {
+  const angular = distanceKm / 6371.0088;
+  const bearing = bearingDeg * Math.PI / 180;
+  const lat1 = latitude * Math.PI / 180;
+  const lon1 = longitude * Math.PI / 180;
+  const lat2 = Math.asin(Math.sin(lat1) * Math.cos(angular) + Math.cos(lat1) * Math.sin(angular) * Math.cos(bearing));
+  const lon2 = lon1 + Math.atan2(Math.sin(bearing) * Math.sin(angular) * Math.cos(lat1), Math.cos(angular) - Math.sin(lat1) * Math.sin(lat2));
+  return [normalizeLongitude(lon2 * 180 / Math.PI), lat2 * 180 / Math.PI];
+}
+
+function greatCircleDistanceKm(latitude1: number, longitude1: number, latitude2: number, longitude2: number) {
+  const radians = Math.PI / 180;
+  const lat1 = latitude1 * radians;
+  const lat2 = latitude2 * radians;
+  const deltaLat = (latitude2 - latitude1) * radians;
+  const deltaLon = (unwrapLongitude(longitude2, longitude1) - longitude1) * radians;
+  const a = Math.sin(deltaLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(deltaLon / 2) ** 2;
+  return 6371.0088 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function initialBearing(latitude1: number, longitude1: number, latitude2: number, longitude2: number) {
+  const radians = Math.PI / 180;
+  const lat1 = latitude1 * radians;
+  const lat2 = latitude2 * radians;
+  const deltaLon = (unwrapLongitude(longitude2, longitude1) - longitude1) * radians;
+  const y = Math.sin(deltaLon) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(deltaLon);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+
+function unwrapLongitude(longitude: number, reference: number) {
+  let result = longitude;
+  while (result - reference > 180) result -= 360;
+  while (result - reference < -180) result += 360;
+  return result;
 }

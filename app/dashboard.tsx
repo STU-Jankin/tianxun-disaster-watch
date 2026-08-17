@@ -10,9 +10,10 @@ import {
   type HazardType,
   type ScopeId,
 } from "../lib/disasters";
-import { allowedTaskStatuses, safeHttpUrl, validateSatelliteTask } from "../lib/task-contract";
-import { buildTaskAoi } from "../lib/task-aoi";
+import { allowedTaskStatuses, canTransitionTask, safeHttpUrl, validateSatelliteTask } from "../lib/task-contract";
+import { buildTaskAoi, customAoiPartCount, normalizeCustomAoiGeoJson, type CustomAoiGeometry } from "../lib/task-aoi";
 import { aoiFingerprint, eventRevisionFingerprint } from "../lib/event-integrity";
+import { cycloneUncertaintyGeometry, cycloneWindGeometry } from "../lib/cyclone-forecast";
 
 type ApiResponse = {
   events: DisasterEvent[];
@@ -47,7 +48,7 @@ type SourceStatus = {
   message: string;
   setupUrl: string;
 };
-type AoiType = "source" | "point" | "circle" | "rectangle" | "corridor";
+type AoiType = "source" | "point" | "circle" | "rectangle" | "corridor" | "polygon" | "multi";
 
 type SatelliteTask = {
   taskId: string;
@@ -68,6 +69,7 @@ type SatelliteTask = {
   aoiLengthKm: number;
   aoiBearingDeg: number;
   sourceGeometry?: DisasterEvent["geometry"];
+  customGeometry?: CustomAoiGeometry;
   cycloneForecast?: DisasterEvent["cycloneForecast"];
   minimumCoveragePercent: number;
   maximumCloudPercent: number;
@@ -99,6 +101,7 @@ type SatelliteTask = {
 };
 
 type TaskSyncState = { state: "saving" | "synced" | "local" | "error"; message?: string };
+type TaskStorageMode = "loading" | "operational-database" | "public-read-only" | "unavailable";
 
 type VisibilityWindow = {
   satelliteId?: string;
@@ -122,6 +125,8 @@ const aoiOptions: Array<{ id: AoiType; label: string }> = [
   { id: "circle", label: "圆形面" },
   { id: "rectangle", label: "矩形面" },
   { id: "corridor", label: "线状走廊" },
+  { id: "polygon", label: "自绘单面" },
+  { id: "multi", label: "多块 AOI" },
 ];
 const defaultAoiRadiusKm: Record<HazardType, number> = {
   earthquake: 50,
@@ -156,13 +161,16 @@ export function Dashboard() {
   const [taskPanelOpen, setTaskPanelOpen] = useState(false);
   const [confirmedAois, setConfirmedAois] = useState<Set<string>>(new Set());
   const [taskSync, setTaskSync] = useState<Record<string, TaskSyncState>>({});
+  const [taskStorageMode, setTaskStorageMode] = useState<TaskStorageMode>("loading");
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [clock, setClock] = useState(() => Date.now());
   const taskTriggerRef = useRef<HTMLButtonElement>(null);
   const previousTaskPanelOpen = useRef(false);
   const taskSaveTimers = useRef(new Map<string, number>());
+  const taskSaveControllers = useRef(new Map<string, AbortController>());
+  const taskMutationGeneration = useRef(new Map<string, number>());
   const tasksRef = useRef<SatelliteTask[]>([]);
-  const closeTaskPanel = useCallback(() => { setTaskPanelOpen(false); setActiveTaskId(null); }, []);
+  const closeTaskPanel = useCallback(() => { setTaskPanelOpen(false); }, []);
   const selectEvent = useCallback((event: DisasterEvent) => {
     setSelected(event);
     if (window.matchMedia("(max-width: 720px)").matches) setListOpen(false);
@@ -194,7 +202,10 @@ export function Dashboard() {
   }, [refresh]);
 
   useEffect(() => { tasksRef.current = tasks; }, [tasks]);
-  useEffect(() => () => { taskSaveTimers.current.forEach((timer) => window.clearTimeout(timer)); }, []);
+  useEffect(() => () => {
+    taskSaveTimers.current.forEach((timer) => window.clearTimeout(timer));
+    taskSaveControllers.current.forEach((controller) => controller.abort());
+  }, []);
 
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 30_000);
@@ -218,14 +229,21 @@ export function Dashboard() {
       try {
         const response = await fetch("/api/tasks", { cache: "no-store" });
         if (!response.ok) throw new Error("task database unavailable");
-        const result = await response.json() as { tasks: Array<Partial<SatelliteTask>>; cancelledTaskIds?: string[] };
+        const result = await response.json() as { tasks: Array<Partial<SatelliteTask>>; cancelledTaskIds?: string[]; storage?: string };
+        const storageMode: TaskStorageMode = result.storage === "public-read-only" ? "public-read-only" : "operational-database";
+        setTaskStorageMode(storageMode);
         const serverTasks = result.tasks.map(migrateSatelliteTask);
         const cancelled = new Set(result.cancelledTaskIds ?? []);
         const merged = [...new Map([...localTasks.filter((task) => !cancelled.has(task.taskId)), ...serverTasks].map((task) => [task.taskId, task])).values()];
         setTasks(merged);
-        setTaskSync(Object.fromEntries(merged.map((task) => [task.taskId, { state: serverTasks.some((server) => server.taskId === task.taskId) ? "synced" : "local" } as TaskSyncState])));
+        setTaskSync(Object.fromEntries(merged.map((task) => [task.taskId, {
+          state: serverTasks.some((server) => server.taskId === task.taskId) ? "synced" : "local",
+          message: storageMode === "public-read-only" ? "公网入口为只读模式；此任务仅保存在本机" : undefined,
+        } as TaskSyncState])));
       } catch {
+        setTaskStorageMode("unavailable");
         setTasks(localTasks);
+        setTaskSync(Object.fromEntries(localTasks.map((task) => [task.taskId, { state: "local", message: "任务服务不可用；仅保存在本机" } as TaskSyncState])));
       } finally {
         setTasksHydrated(true);
       }
@@ -239,11 +257,20 @@ export function Dashboard() {
   }, [tasks, tasksHydrated]);
 
   const saveTask = useCallback(async (task: SatelliteTask) => {
+    if (taskStorageMode === "public-read-only") {
+      setTaskSync((current) => ({ ...current, [task.taskId]: { state: "local", message: "公网入口为只读模式；任务仅保存在本机" } }));
+      return false;
+    }
+    const generation = taskMutationGeneration.current.get(task.taskId) ?? 0;
+    taskSaveControllers.current.get(task.taskId)?.abort();
+    const controller = new AbortController();
+    taskSaveControllers.current.set(task.taskId, controller);
     setTaskSync((current) => ({ ...current, [task.taskId]: { state: "saving" } }));
     try {
-      const response = await fetch("/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(task) });
+      const response = await fetch("/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(task), signal: controller.signal });
       const result = await response.json() as { task?: Partial<SatelliteTask>; error?: string; errors?: string[] };
       if (!response.ok) throw new Error(result.errors?.join("；") || result.error || "保存失败");
+      if ((taskMutationGeneration.current.get(task.taskId) ?? 0) !== generation || !tasksRef.current.some((item) => item.taskId === task.taskId)) return false;
       if (result.task) {
         const serverTask = migrateSatelliteTask(result.task);
         setTasks((current) => current.map((item) => item.taskId !== task.taskId ? item : item.updatedAt === task.updatedAt ? serverTask : { ...item, revision: serverTask.revision, eventRevision: serverTask.eventRevision, aoiHash: serverTask.aoiHash }));
@@ -251,10 +278,13 @@ export function Dashboard() {
       setTaskSync((current) => ({ ...current, [task.taskId]: { state: "synced" } }));
       return true;
     } catch (saveError) {
+      if (controller.signal.aborted || (taskMutationGeneration.current.get(task.taskId) ?? 0) !== generation) return false;
       setTaskSync((current) => ({ ...current, [task.taskId]: { state: "error", message: saveError instanceof Error ? saveError.message : "保存失败" } }));
       return false;
+    } finally {
+      if (taskSaveControllers.current.get(task.taskId) === controller) taskSaveControllers.current.delete(task.taskId);
     }
-  }, []);
+  }, [taskStorageMode]);
 
   const addTask = useCallback((event: DisasterEvent, operatorConfirmed: boolean) => {
     const task = createSatelliteTask(event, operatorConfirmed);
@@ -270,8 +300,10 @@ export function Dashboard() {
   }, [saveTask]);
 
   const updateTask = useCallback((taskId: string, patch: Partial<SatelliteTask>) => {
-    const aoiKeys = ["aoiType", "aoiRadiusKm", "aoiWidthKm", "aoiHeightKm", "aoiLengthKm", "aoiBearingDeg"];
+    const aoiKeys = ["aoiType", "aoiRadiusKm", "aoiWidthKm", "aoiHeightKm", "aoiLengthKm", "aoiBearingDeg", "customGeometry"];
     const touchesAoi = Object.keys(patch).some((key) => aoiKeys.includes(key));
+    taskMutationGeneration.current.set(taskId, (taskMutationGeneration.current.get(taskId) ?? 0) + 1);
+    taskSaveControllers.current.get(taskId)?.abort();
     setTasks((current) => current.map((task) => {
       if (task.taskId !== taskId) return task;
       return { ...task, ...patch, ...(touchesAoi ? { aoiApproval: "operator_confirmed" as const, approvalReason: "操作员调整 AOI 参数" } : {}), updatedAt: new Date().toISOString() };
@@ -286,17 +318,31 @@ export function Dashboard() {
   }, [saveTask]);
 
   const removeTask = useCallback(async (taskId: string) => {
-    const previous = tasks;
+    const task = tasksRef.current.find((item) => item.taskId === taskId);
+    if (!task) return;
+    const priorTimer = taskSaveTimers.current.get(taskId);
+    if (priorTimer) window.clearTimeout(priorTimer);
+    taskSaveTimers.current.delete(taskId);
+    taskMutationGeneration.current.set(taskId, (taskMutationGeneration.current.get(taskId) ?? 0) + 1);
+    taskSaveControllers.current.get(taskId)?.abort();
+    taskSaveControllers.current.delete(taskId);
     setTasks((current) => current.filter((task) => task.taskId !== taskId));
-    try {
-      const response = await fetch(`/api/tasks?taskId=${encodeURIComponent(taskId)}`, { method: "DELETE" });
-      if (!response.ok) throw new Error("取消任务失败");
-      setTaskSync((current) => { const next = { ...current }; delete next[taskId]; return next; });
-    } catch {
-      setTasks(previous);
-      setTaskSync((current) => ({ ...current, [taskId]: { state: "error", message: "服务端取消失败，任务已恢复" } }));
+    if (activeTaskId === taskId) setActiveTaskId(null);
+    const removeSyncState = () => setTaskSync((current) => { const next = { ...current }; delete next[taskId]; return next; });
+    if (task.revision === 0 || taskStorageMode === "public-read-only" || taskStorageMode === "unavailable") {
+      removeSyncState();
+      return;
     }
-  }, [tasks]);
+    try {
+      const response = await fetch(`/api/tasks?taskId=${encodeURIComponent(taskId)}&revision=${task.revision}`, { method: "DELETE" });
+      const result = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(result.error || `取消任务失败（HTTP ${response.status}）`);
+      removeSyncState();
+    } catch (removeError) {
+      setTasks((current) => current.some((item) => item.taskId === taskId) ? current : [task, ...current]);
+      setTaskSync((current) => ({ ...current, [taskId]: { state: "error", message: removeError instanceof Error ? removeError.message : "服务端取消失败，任务已恢复" } }));
+    }
+  }, [activeTaskId, taskStorageMode]);
 
   useEffect(() => {
     if (!selected || ["resolved", "fallback", "error"].includes(locationState[selected.id]?.state ?? "")) return;
@@ -367,6 +413,19 @@ export function Dashboard() {
   const producingSourceCount = data?.producingSourceCount ?? data?.sourceStatus.filter((source) => source.producing).length ?? 0;
   const runtimeMode = !data ? "正在连接" : data.fallback && data.retainedCount > 0 ? "缓存模式" : data.fallback ? "演示模式" : producingSourceCount === 0 ? "无事件产出" : data.persistenceAvailable === false ? "数据库降级" : "实时监测中";
   const modeStale = runtimeMode !== "实时监测中" || Boolean(lastRefreshErrorAt);
+  const activeTask = tasks.find((task) => task.taskId === activeTaskId) ?? null;
+  const reviewTaskAoi = useCallback((taskId: string) => {
+    setActiveTaskId(taskId);
+    setSelected(null);
+    setTaskPanelOpen(false);
+    if (window.matchMedia("(max-width: 720px)").matches) setListOpen(false);
+  }, []);
+  const updateCustomAoi = useCallback((taskId: string, geometry?: CustomAoiGeometry) => {
+    updateTask(taskId, {
+      customGeometry: geometry,
+      ...(geometry ? { aoiType: geometry.type === "Polygon" ? "polygon" : "multi" } : {}),
+    });
+  }, [updateTask]);
 
   return (
     <main className="app-shell">
@@ -437,7 +496,7 @@ export function Dashboard() {
 
         {!listOpen && <button className="reopen-panel" onClick={() => setListOpen(true)} inert={taskPanelOpen ? true : undefined} aria-hidden={taskPanelOpen || undefined}>事件列表 <b>{filtered.length}</b> ›</button>}
 
-          <MapView scope={scope} events={filtered} selected={selected} activeTask={tasks.find((task) => task.taskId === activeTaskId) ?? null} detailOpen={Boolean(selected) && !taskPanelOpen} layoutKey={`${taskPanelOpen}-${listOpen}`} obscured={taskPanelOpen} onSelect={selectEvent} />
+          <MapView scope={scope} events={filtered} selected={selected} activeTask={activeTask} detailOpen={Boolean(selected) && !taskPanelOpen} layoutKey={`${taskPanelOpen}-${listOpen}`} obscured={taskPanelOpen} onSelect={selectEvent} onCustomAoiChange={updateCustomAoi} onReturnToTask={() => setTaskPanelOpen(true)} />
 
         <div className="map-legend" inert={taskPanelOpen ? true : undefined} aria-hidden={taskPanelOpen || undefined}>
           <span><i className="red" />红色</span><span><i className="orange" />橙色</span><span><i className="yellow" />黄色</span><span><i className="blue" />蓝色</span>
@@ -447,7 +506,7 @@ export function Dashboard() {
         </div>
 
         {selected && <DetailPanel event={selected} obscured={taskPanelOpen} dispatchBlocked={modeStale} locationZh={locationZh[selected.id]} locationLoading={locationLoading === selected.id} locationState={locationState[selected.id]?.state} onRetryLocation={() => { setLocationState((current) => { const next = { ...current }; delete next[selected.id]; return next; }); setLocationRetry((value) => value + 1); }} taskAdded={tasks.some((task) => taskMatchesEvent(task, selected))} aoiConfirmed={confirmedAois.has(selected.masterEventId)} onConfirmAoi={(confirmed) => setConfirmedAois((current) => { const next = new Set(current); if (confirmed) next.add(selected.masterEventId); else next.delete(selected.masterEventId); return next; })} onAddTask={addTask} onClose={() => setSelected(null)} />}
-        {taskPanelOpen && <TaskPanel tasks={tasks} syncState={taskSync} activeTaskId={activeTaskId} onActivate={setActiveTaskId} onUpdate={updateTask} onRemove={(taskId) => void removeTask(taskId)} onClose={closeTaskPanel} onRetry={(task) => void saveTask(task)} />}
+        {taskPanelOpen && <TaskPanel tasks={tasks} syncState={taskSync} storageMode={taskStorageMode} activeTaskId={activeTaskId} onActivate={reviewTaskAoi} onUpdate={updateTask} onRemove={(taskId) => void removeTask(taskId)} onClose={closeTaskPanel} onRetry={(task) => void saveTask(task)} />}
       </section>
     </main>
   );
@@ -521,13 +580,14 @@ function EventCard({ event, active, onClick }: { event: DisasterEvent; active: b
   </button>;
 }
 
-function MapView({ scope, events, selected, activeTask, detailOpen, layoutKey, obscured, onSelect }: { scope: ScopeId; events: DisasterEvent[]; selected: DisasterEvent | null; activeTask: SatelliteTask | null; detailOpen: boolean; layoutKey: string; obscured: boolean; onSelect: (event: DisasterEvent) => void }) {
+function MapView({ scope, events, selected, activeTask, detailOpen, layoutKey, obscured, onSelect, onCustomAoiChange, onReturnToTask }: { scope: ScopeId; events: DisasterEvent[]; selected: DisasterEvent | null; activeTask: SatelliteTask | null; detailOpen: boolean; layoutKey: string; obscured: boolean; onSelect: (event: DisasterEvent) => void; onCustomAoiChange: (taskId: string, geometry?: CustomAoiGeometry) => void; onReturnToTask: () => void }) {
   const bbox = scopes[scope].bbox;
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<import("leaflet").Map | null>(null);
   const markerLayerRef = useRef<import("leaflet").LayerGroup | null>(null);
   const selectedLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const aoiLayerRef = useRef<import("leaflet").GeoJSON | null>(null);
+  const drawPreviewLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const scopeRef = useRef(scope);
   const eventsRef = useRef(events);
   const onSelectRef = useRef(onSelect);
@@ -535,6 +595,11 @@ function MapView({ scope, events, selected, activeTask, detailOpen, layoutKey, o
   const [mapZoom, setMapZoom] = useState(2);
   const [mapError, setMapError] = useState("");
   const [viewLabel, setViewLabel] = useState("");
+  const [forecastSelection, setForecastSelection] = useState<{ eventId: string; index: number }>({ eventId: "", index: 0 });
+  const [drawing, setDrawing] = useState(false);
+  const [drawingTaskId, setDrawingTaskId] = useState<string | null>(null);
+  const [draftVertices, setDraftVertices] = useState<Array<[number, number]>>([]);
+  const [drawingError, setDrawingError] = useState("");
   const detailOffset = useCallback(() => detailOpen && window.innerWidth > 720 ? Math.min(338, Math.max(0, (containerRef.current?.clientWidth ?? 0) - 180)) : 0, [detailOpen]);
   const fitWithOverlay = useCallback((map: import("leaflet").Map, bounds: import("leaflet").LatLngBoundsExpression, maxZoom: number) => {
     const overlay = detailOffset();
@@ -576,6 +641,7 @@ function MapView({ scope, events, selected, activeTask, detailOpen, layoutKey, o
       L.control.zoom({ position: "topright" }).addTo(map);
       markerLayerRef.current = L.layerGroup().addTo(map);
       selectedLayerRef.current = L.featureGroup().addTo(map);
+      drawPreviewLayerRef.current = L.featureGroup().addTo(map);
       mapRef.current = map;
 
       const updateView = () => {
@@ -597,6 +663,7 @@ function MapView({ scope, events, selected, activeTask, detailOpen, layoutKey, o
       mapRef.current = null;
       markerLayerRef.current = null;
       selectedLayerRef.current = null;
+      drawPreviewLayerRef.current = null;
     };
   }, []);
 
@@ -632,6 +699,41 @@ function MapView({ scope, events, selected, activeTask, detailOpen, layoutKey, o
     if (!mapReady || !map) return;
     map.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], { padding: [24, 24], animate: true, duration: 0.45 });
   }, [bbox, mapReady, scope]);
+
+  const forecastFrameIndex = forecastSelection.eventId === selected?.id ? forecastSelection.index : 0;
+  const activeDrawing = drawing && drawingTaskId === activeTask?.taskId;
+  const activeDraftVertices = useMemo(() => drawingTaskId === activeTask?.taskId ? draftVertices : [], [activeTask?.taskId, draftVertices, drawingTaskId]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!mapReady || !map || !activeDrawing || !activeTask || !["polygon", "multi"].includes(activeTask.aoiType)) return;
+    const onMapClick = (event: import("leaflet").LeafletMouseEvent) => {
+      setDrawingError("");
+      setDraftVertices((current) => current.length >= 2000 ? current : [...current, [Number(event.latlng.lng.toFixed(7)), Number(event.latlng.lat.toFixed(7))]]);
+    };
+    map.getContainer().classList.add("aoi-drawing-cursor");
+    map.on("click", onMapClick);
+    return () => {
+      map.getContainer().classList.remove("aoi-drawing-cursor");
+      map.off("click", onMapClick);
+    };
+  }, [activeDrawing, activeTask, mapReady]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    const layer = drawPreviewLayerRef.current;
+    if (!mapReady || !map || !layer) return;
+    let cancelled = false;
+    void import("leaflet").then((L) => {
+      if (cancelled) return;
+      layer.clearLayers();
+      if (!activeDraftVertices.length) return;
+      L.polyline(activeDraftVertices.map(([longitude, latitude]) => [latitude, longitude]), { color: "#005a87", weight: 3, dashArray: "5 4" }).addTo(layer);
+      activeDraftVertices.forEach(([longitude, latitude], index) => L.circleMarker([latitude, longitude], { radius: index === 0 ? 5 : 3, color: "#005a87", fillColor: "#fff", fillOpacity: 1, weight: 2 }).addTo(layer));
+      if (activeDraftVertices.length >= 3) L.polygon(activeDraftVertices.map(([longitude, latitude]) => [latitude, longitude]), { color: "#005a87", weight: 1, fillColor: "#54a8c6", fillOpacity: 0.14 }).addTo(layer);
+    });
+    return () => { cancelled = true; };
+  }, [activeDraftVertices, mapReady]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -697,13 +799,14 @@ function MapView({ scope, events, selected, activeTask, detailOpen, layoutKey, o
     void import("leaflet").then((L) => {
       if (cancelled) return;
       const forecast = selected.cycloneForecast;
+      const impactFrame = forecast?.impactField?.frames[Math.min(forecastFrameIndex, Math.max(0, forecast.impactField.frames.length - 1))];
       if (selected.geometry.type !== "Point") {
         L.geoJSON(unwrapForecastGeometry(selected.geometry, selected.longitude) as GeoJSON.GeoJsonObject, {
           style: { color: "#006d63", weight: 3, fillColor: "#46a795", fillOpacity: 0.12, dashArray: "4 3", className: "selected-source-geometry" },
           interactive: false,
         }).addTo(layer);
       }
-      if (forecast?.impactGeometry) {
+      if (forecast?.impactGeometry && !forecast.impactField) {
         L.geoJSON(unwrapForecastGeometry(forecast.impactGeometry, selected.longitude) as GeoJSON.GeoJsonObject, {
           style: { color: "#c15624", weight: 1.5, fillColor: "#e58a42", fillOpacity: 0.16, className: "cyclone-impact-area" },
           interactive: false,
@@ -714,6 +817,32 @@ function MapView({ scope, events, selected, activeTask, detailOpen, layoutKey, o
           style: { color: "#6b5aa6", weight: 1.5, fillColor: "#8c79bd", fillOpacity: 0.10, dashArray: "5 4", className: "cyclone-uncertainty-area" },
           interactive: false,
         }).addTo(layer);
+      }
+      if (impactFrame) {
+        const frameUncertainty = cycloneUncertaintyGeometry(impactFrame);
+        if (frameUncertainty) {
+          L.geoJSON(unwrapForecastGeometry(frameUncertainty, impactFrame.longitude) as GeoJSON.GeoJsonObject, {
+            style: { color: "#6b5aa6", weight: 2, fillColor: "#8c79bd", fillOpacity: 0.16, dashArray: "4 3", className: "cyclone-frame-uncertainty" },
+            interactive: false,
+          }).addTo(layer);
+        }
+        [...impactFrame.windFields].sort((left, right) => left.thresholdKnots - right.thresholdKnots).forEach((field) => {
+          const color = field.thresholdKnots >= 64 ? "#a72222" : field.thresholdKnots >= 50 ? "#cf552f" : "#e58a42";
+          L.geoJSON(unwrapForecastGeometry(cycloneWindGeometry(impactFrame, field), impactFrame.longitude) as GeoJSON.GeoJsonObject, {
+            style: { color, weight: 1.8, fillColor: color, fillOpacity: field.thresholdKnots >= 64 ? 0.22 : 0.12, className: `cyclone-wind-${field.thresholdKnots}` },
+            interactive: false,
+          }).addTo(layer);
+        });
+        const frameCenter = L.circleMarker([impactFrame.latitude, unwrapLongitudeNear(impactFrame.longitude, selected.longitude)], {
+          radius: impactFrame.centerBasis === "official_node" ? 7 : 5,
+          color: impactFrame.centerBasis === "official_node" ? "#075fa8" : "#4b87b5",
+          weight: 2,
+          fillColor: impactFrame.centerBasis === "official_node" ? "#fff" : "#dcebf4",
+          fillOpacity: 1,
+          className: "cyclone-impact-frame-center",
+        });
+        frameCenter.bindTooltip(`${impactFrame.centerBasis === "official_node" ? "官方节点" : "官方节点间逐时插值"} · +${impactFrame.leadHours}小时 · ${formatTimeWithYear(impactFrame.forecastAt)} UTC+08`, { direction: "top" });
+        frameCenter.addTo(layer);
       }
       if (forecast) {
         L.geoJSON(unwrapForecastGeometry(forecast.trackGeometry, selected.longitude) as GeoJSON.GeoJsonObject, {
@@ -738,7 +867,7 @@ function MapView({ scope, events, selected, activeTask, detailOpen, layoutKey, o
       if (!activeTask && layer.getBounds().isValid() && (forecast || selected.geometry.type !== "Point")) fitWithOverlay(map, layer.getBounds(), forecast ? 7 : 9);
     });
     return () => { cancelled = true; };
-  }, [activeTask, fitWithOverlay, mapReady, selected]);
+  }, [activeTask, fitWithOverlay, forecastFrameIndex, mapReady, selected]);
 
   useEffect(() => {
     if (!mapReady || !selected || selected.cycloneForecast || selected.geometry.type !== "Point" || !mapRef.current) return;
@@ -757,7 +886,9 @@ function MapView({ scope, events, selected, activeTask, detailOpen, layoutKey, o
       if (aoiLayerRef.current) aoiLayerRef.current.removeFrom(map);
       aoiLayerRef.current = null;
       if (!activeTask) return;
-      const layer = L.geoJSON(taskGeometry(activeTask) as GeoJSON.GeoJsonObject, { style: { color: "#006d63", weight: 2, fillColor: "#46a795", fillOpacity: 0.18, dashArray: "6 4" } }).addTo(map);
+      const geometry = buildTaskAoi(activeTask as unknown as Record<string, unknown>);
+      if (!geometry) return;
+      const layer = L.geoJSON(geometry as GeoJSON.GeoJsonObject, { style: { color: "#006d63", weight: 2, fillColor: "#46a795", fillOpacity: 0.18, dashArray: "6 4" } }).addTo(map);
       aoiLayerRef.current = layer;
       const bounds = layer.getBounds();
       if (bounds.isValid()) map.fitBounds(bounds, { padding: [32, 32], maxZoom: 11 });
@@ -765,11 +896,49 @@ function MapView({ scope, events, selected, activeTask, detailOpen, layoutKey, o
     return () => { cancelled = true; };
   }, [activeTask, mapReady]);
 
+  const finishCustomPolygon = useCallback(() => {
+    if (!activeTask || activeDraftVertices.length < 3) {
+      setDrawingError("至少点击 3 个不同顶点后才能完成多边形");
+      return;
+    }
+    const ring = [...activeDraftVertices, [...activeDraftVertices[0]] as [number, number]];
+    const existing = activeTask.aoiType === "multi" ? customAoiPolygonParts(activeTask.customGeometry) : [];
+    const polygons = [...existing, [ring]];
+    const geometry: CustomAoiGeometry = polygons.length === 1
+      ? { type: "Polygon", coordinates: polygons[0] }
+      : { type: "MultiPolygon", coordinates: polygons };
+    onCustomAoiChange(activeTask.taskId, geometry);
+    setDraftVertices([]);
+    setDrawing(false);
+    setDrawingError("");
+  }, [activeDraftVertices, activeTask, onCustomAoiChange]);
+
+  const forecastFrames = selected?.cycloneForecast?.impactField?.frames ?? [];
+  const activeForecastFrame = forecastFrames[Math.min(forecastFrameIndex, Math.max(0, forecastFrames.length - 1))];
+
   return <div className="map-stage" inert={obscured ? true : undefined} aria-hidden={obscured || undefined}>
     <div ref={containerRef} className="leaflet-map" aria-label={`${scopes[scope].label}灾害事件地图`} />
     <div className="map-shade" />
     <div className="map-title"><span>观测视图</span><strong>{scopes[scope].label}</strong><small>{events.length} 个事件 · 行政范围为快速筛选近似边界</small></div>
     <div className="coordinates">WGS 84 · {viewLabel || "地图初始化中"}</div>
+    {forecastFrames.length > 0 && activeForecastFrame ? <div className="cyclone-timeline" role="group" aria-label="台风四维影响场时间轴">
+      <div><strong>4D 影响场</strong><span>{activeForecastFrame.centerBasis === "official_node" ? "官方节点" : "逐时插值"} · +{activeForecastFrame.leadHours}h</span></div>
+      <time>{formatTimeWithYear(activeForecastFrame.forecastAt)} UTC+08</time>
+      <input type="range" min="0" max={forecastFrames.length - 1} value={Math.min(forecastFrameIndex, forecastFrames.length - 1)} onChange={(event) => setForecastSelection({ eventId: selected?.id ?? "", index: Number(event.target.value) })} aria-label="选择台风预报小时" />
+      <small>{activeForecastFrame.windFields.length ? activeForecastFrame.windFields.map((field) => `≥${field.thresholdKnots} kt 象限风圈`).join(" · ") : "本时次无可用官方风圈"} · {activeForecastFrame.uncertaintyRadiusKm || activeForecastFrame.uncertaintyGeometry ? "含分时不确定区" : selected?.cycloneForecast?.uncertaintyGeometry ? "显示本报次总体不确定区" : "无不确定区数据"}</small>
+    </div> : null}
+    {activeTask ? <div className="map-review-toolbar" role="group" aria-label="任务AOI地图复核">
+      <div><strong>{activeTask.title}</strong><span>{["polygon", "multi"].includes(activeTask.aoiType) ? `${customAoiPartCount(activeTask.customGeometry)} 块自定义 AOI` : "正在显示任务 AOI"}</span></div>
+      {["polygon", "multi"].includes(activeTask.aoiType) ? <>
+        <button onClick={() => { setDrawingTaskId(activeTask.taskId); setDrawing(true); setDraftVertices([]); setDrawingError(""); }}>{activeTask.aoiType === "multi" && activeTask.customGeometry ? "添加子区" : "开始绘制"}</button>
+        <button onClick={() => setDraftVertices((current) => current.slice(0, -1))} disabled={!activeDrawing || !activeDraftVertices.length}>撤销顶点</button>
+        <button onClick={finishCustomPolygon} disabled={!activeDrawing}>完成当前面</button>
+        <button onClick={() => { onCustomAoiChange(activeTask.taskId, undefined); setDraftVertices([]); setDrawing(false); }} disabled={!activeTask.customGeometry && !activeDraftVertices.length}>清空</button>
+      </> : null}
+      <button onClick={onReturnToTask}>返回任务单</button>
+      {activeDrawing ? <small>在地图依次点击边界顶点，完成后点击“完成当前面”。{activeDraftVertices.length} 个顶点。</small> : null}
+      {drawingError ? <small className="drawing-error" role="alert">{drawingError}</small> : null}
+    </div> : null}
     {mapError ? <div className="map-error" role="alert">{mapError}<button onClick={() => window.location.reload()}>重试</button></div> : null}
   </div>;
 }
@@ -805,11 +974,13 @@ function DetailPanel({ event, obscured, dispatchBlocked, locationZh, locationLoa
         <span><i className="track" />中心预报路径</span>
         <span><i className="impact" />{event.cycloneForecast.impactBasis === "forecast_wind_radii" ? event.cycloneForecast.impactThreshold || "预报风圈" : event.cycloneForecast.impactBasis === "current_wind_extent" ? event.cycloneForecast.impactThreshold || "当前强风范围" : "本报次无官方风圈"}</span>
         {event.cycloneForecast.uncertaintyGeometry ? <span><i className="uncertainty" />{event.cycloneForecast.uncertaintyLabel || "路径不确定区"}</span> : null}
+        {event.cycloneForecast.impactField ? <span><i className="impact" />{event.cycloneForecast.impactField.frames.length} 个逐时时间片</span> : null}
       </div>
       <div className="forecast-points" aria-label="台风中心预报节点">
         {event.cycloneForecast.track.map((point) => <div key={`${point.leadHours}-${point.forecastAt}`}><b>{point.leadHours === 0 ? "实况" : `+${point.leadHours}h`}</b><time>{formatTime(point.forecastAt)}</time><small>{point.latitude.toFixed(2)}°, {point.longitude.toFixed(2)}°{point.windSpeedKnots !== undefined ? ` · ${point.windSpeedKnots} kt` : ""}</small></div>)}
       </div>
       <p className="forecast-disclaimer">{event.cycloneForecast.note}</p>
+      {event.cycloneForecast.impactField ? <p className="forecast-disclaimer">{event.cycloneForecast.impactField.note}</p> : null}
       <a href={safeHttpUrl(event.cycloneForecast.sourceUrl)} target="_blank" rel="noreferrer">查看本报次官方预报 ↗</a>
     </section> : null}
     <section><h3>观测目标</h3><div className="target-list">{event.observationTargets.map((target) => <span key={target}>{target}</span>)}</div></section>
@@ -830,10 +1001,11 @@ function DetailPanel({ event, obscured, dispatchBlocked, locationZh, locationLoa
   </aside>;
 }
 
-function TaskPanel({ tasks, syncState, activeTaskId, onActivate, onUpdate, onRemove, onClose, onRetry }: { tasks: SatelliteTask[]; syncState: Record<string, TaskSyncState>; activeTaskId: string | null; onActivate: (taskId: string) => void; onUpdate: (taskId: string, patch: Partial<SatelliteTask>) => void; onRemove: (taskId: string) => void; onClose: () => void; onRetry: (task: SatelliteTask) => void }) {
+function TaskPanel({ tasks, syncState, storageMode, activeTaskId, onActivate, onUpdate, onRemove, onClose, onRetry }: { tasks: SatelliteTask[]; syncState: Record<string, TaskSyncState>; storageMode: TaskStorageMode; activeTaskId: string | null; onActivate: (taskId: string) => void; onUpdate: (taskId: string, patch: Partial<SatelliteTask>) => void; onRemove: (taskId: string) => void; onClose: () => void; onRetry: (task: SatelliteTask) => void }) {
   const [visibility, setVisibility] = useState<Record<string, VisibilityState>>({});
   const [copiedTaskId, setCopiedTaskId] = useState<string | null>(null);
   const [exportError, setExportError] = useState("");
+  const [aoiImportError, setAoiImportError] = useState<Record<string, string>>({});
   const panelRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
@@ -851,7 +1023,8 @@ function TaskPanel({ tasks, syncState, activeTaskId, onActivate, onUpdate, onRem
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
-  const exportable = tasks.length > 0 && tasks.every((task) => validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requireProvenance: true }).ok && syncState[task.taskId]?.state === "synced");
+  const exportableCount = tasks.filter((task) => validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requirePayload: true, requireProvenance: true }).ok && syncState[task.taskId]?.state === "synced").length;
+  const exportable = tasks.length > 0 && exportableCount === tasks.length;
   const exportValidated = async (format: ExportFormat) => {
     setExportError("");
     try {
@@ -892,7 +1065,8 @@ function TaskPanel({ tasks, syncState, activeTaskId, onActivate, onUpdate, onRem
       <button disabled={!exportable} title={exportable ? "" : "所有任务需通过校验、选择载荷并同步到业务数据库"} onClick={() => void exportValidated("csv")}>CSV</button>
       <button disabled={!exportable} title={exportable ? "" : "所有任务需通过校验、选择载荷并同步到业务数据库"} onClick={() => void exportValidated("geojson")}>GeoJSON</button>
     </div>
-    {!exportable && tasks.length ? <div className="task-export-hint" role="status">当前 0/{tasks.length} 项可导出。任务必须选择载荷、通过时间/AOI校验，并完成数据库同步；逐项错误显示在任务卡内。</div> : null}
+    {storageMode === "public-read-only" ? <div className="task-storage-banner" role="status"><strong>公网只读模式</strong><span>任务可在本机规划、导入和删除，但不会写入服务器；远程同步需启用 HTTPS 登录和任务权限。</span></div> : storageMode === "unavailable" ? <div className="task-storage-banner warning" role="alert"><strong>任务服务不可用</strong><span>当前修改仅保存在本机，恢复连接后可重试同步。</span></div> : null}
+    {!exportable && tasks.length ? <div className="task-export-hint" role="status">当前 {exportableCount}/{tasks.length} 项可导出。任务必须选择载荷、通过时间/AOI校验，并完成数据库同步；逐项错误显示在任务卡内。</div> : null}
     {exportError ? <div className="task-export-error" role="alert">{exportError}</div> : null}
     <div className="task-list">
       {!tasks.length ? <div className="task-empty"><strong>候选单为空</strong><p>从灾害详情中点击“加入卫星任务候选”，即可在这里设置AOI和成像时间窗。</p></div> : null}
@@ -900,15 +1074,29 @@ function TaskPanel({ tasks, syncState, activeTaskId, onActivate, onUpdate, onRem
         <div className="task-item-title">
           <i>{String(index + 1).padStart(2, "0")}</i>
           <div><h3>{task.title}</h3><p>{hazardMeta[task.hazard].label} · 优先级 {task.priority} · {task.observationPhase === "golden" ? "黄金观测期" : "后续观测期"}</p><time>发生时间 · {formatTimeWithYear(task.eventOccurredAt)}</time><button className="show-aoi" onClick={() => onActivate(task.taskId)}>在地图显示 AOI</button></div>
-          <button onClick={() => onRemove(task.taskId)} aria-label={`移除${task.title}`}>移除</button>
+          {canTransitionTask(task.status, "cancelled") ? <button onClick={() => onRemove(task.taskId)} aria-label={`取消${task.title}`}>{task.revision > 0 ? "取消" : "删除草稿"}</button> : null}
         </div>
         <div className="task-coordinates"><span>中心坐标</span><code>{task.latitude.toFixed(6)}, {task.longitude.toFixed(6)}</code><button onClick={() => void copyCoordinates(task).then((copied) => { if (copied) { setCopiedTaskId(task.taskId); window.setTimeout(() => setCopiedTaskId((current) => current === task.taskId ? null : current), 1800); } })}>{copiedTaskId === task.taskId ? "已复制" : "复制"}</button></div>
         <div className={`task-quality ${task.aoiApproval}`}><span>{locationQualityLabels[task.locationQuality]} · ±{task.locationAccuracyKm} km</span><b>{task.aoiApproval === "source_verified" ? "来源可下发" : "已人工核对"}</b><small>{task.evidenceCount} 条证据 · {task.masterEventId}</small></div>
-        {task.cycloneForecast ? <div className="task-forecast-summary"><strong>官方预报已随任务保存</strong><span>{task.cycloneForecast.track.length} 个中心节点 · 至 {formatTimeWithYear(task.cycloneForecast.forecastValidUntil)} UTC+08</span><small>{task.cycloneForecast.impactGeometry ? `${task.cycloneForecast.impactThreshold || "官方风圈"}已作为默认来源 AOI` : "本报次没有官方风圈；默认 AOI 仍以当前中心设置"}</small></div> : null}
+        {task.cycloneForecast ? <div className="task-forecast-summary"><strong>官方预报已随任务保存</strong><span>{task.cycloneForecast.track.length} 个官方中心节点{task.cycloneForecast.impactField ? ` · ${task.cycloneForecast.impactField.frames.length} 个逐时时间片` : ""} · 至 {formatTimeWithYear(task.cycloneForecast.forecastValidUntil)} UTC+08</span><small>{task.cycloneForecast.impactGeometry ? `${task.cycloneForecast.impactThreshold || "官方风圈"}已作为默认来源 AOI` : "本报次没有官方风圈；默认 AOI 仍以当前中心设置"}</small></div> : null}
         <div className={`task-sync ${syncState[task.taskId]?.state ?? "local"}`} role="status">{syncState[task.taskId]?.state === "saving" ? "正在同步…" : syncState[task.taskId]?.state === "synced" ? "已同步到业务数据库" : syncState[task.taskId]?.state === "error" ? <>同步失败：{syncState[task.taskId]?.message ?? "请重试"} <button onClick={() => onRetry(task)}>重试同步</button></> : "仅保存在本机"}</div>
     <div className="aoi-type-selector" aria-label="AOI目标类型">
-          {aoiOptions.filter((option) => option.id !== "source" || task.sourceGeometry).map((option) => <button key={option.id} aria-pressed={task.aoiType === option.id} className={task.aoiType === option.id ? "active" : ""} onClick={() => onUpdate(task.taskId, { aoiType: option.id })}>{option.label}</button>)}
+          {aoiOptions.filter((option) => option.id !== "source" || task.sourceGeometry).map((option) => <button key={option.id} aria-pressed={task.aoiType === option.id} className={task.aoiType === option.id ? "active" : ""} onClick={() => onUpdate(task.taskId, { aoiType: option.id, ...(["polygon", "multi"].includes(option.id) && task.customGeometry?.type !== (option.id === "polygon" ? "Polygon" : "MultiPolygon") ? { customGeometry: undefined } : {}) })}>{option.label}</button>)}
         </div>
+        {["polygon", "multi"].includes(task.aoiType) ? <div className="custom-aoi-tools">
+          <button onClick={() => onActivate(task.taskId)}>进入地图绘制</button>
+          <label>上传 GeoJSON<input type="file" accept=".geojson,.json,application/geo+json,application/json" onChange={(event) => {
+            const file = event.target.files?.[0];
+            event.currentTarget.value = "";
+            if (!file) return;
+            void readCustomAoiFile(file).then((geometry) => {
+              setAoiImportError((current) => { const next = { ...current }; delete next[task.taskId]; return next; });
+              onUpdate(task.taskId, { aoiType: geometry.type === "Polygon" ? "polygon" : "multi", customGeometry: geometry });
+            }).catch((error) => setAoiImportError((current) => ({ ...current, [task.taskId]: error instanceof Error ? error.message : "GeoJSON 导入失败" })));
+          }} /></label>
+          <span>{task.customGeometry ? `${task.customGeometry.type} · ${customAoiPartCount(task.customGeometry)} 块` : "尚未绘制或导入边界"}</span>
+          {aoiImportError[task.taskId] ? <small role="alert">{aoiImportError[task.taskId]}</small> : null}
+        </div> : null}
         <div className="task-fields">
           {task.aoiType === "point" ? <label>点目标缓冲（公里，可为0）<input type="number" min="0" max="100" value={task.aoiRadiusKm} onChange={(event) => onUpdate(task.taskId, { aoiRadiusKm: clampNumber(event.target.value, 0, 100) })} /></label> : null}
           {task.aoiType === "circle" ? <label>圆形面半径（公里）<input type="number" min="1" max="1000" value={task.aoiRadiusKm} onChange={(event) => onUpdate(task.taskId, { aoiRadiusKm: clampNumber(event.target.value, 1, 1000) })} /></label> : null}
@@ -916,7 +1104,7 @@ function TaskPanel({ tasks, syncState, activeTaskId, onActivate, onUpdate, onRem
           {task.aoiType === "corridor" ? <><label>走廊长度（公里）<input type="number" min="1" max="3000" value={task.aoiLengthKm} onChange={(event) => onUpdate(task.taskId, { aoiLengthKm: clampNumber(event.target.value, 1, 3000) })} /></label><label>走廊宽度（公里）<input type="number" min="1" max="500" value={task.aoiWidthKm} onChange={(event) => onUpdate(task.taskId, { aoiWidthKm: clampNumber(event.target.value, 1, 500) })} /></label><label>方位角（度）<input type="number" min="0" max="359" value={task.aoiBearingDeg} onChange={(event) => onUpdate(task.taskId, { aoiBearingDeg: clampNumber(event.target.value, 0, 359) })} /></label></> : null}
           <label>最早成像（Asia/Shanghai UTC+08）<input type="datetime-local" value={toLocalInput(task.imagingStart)} onChange={(event) => onUpdate(task.taskId, { imagingStart: fromLocalInput(event.target.value) })} /></label>
           <label>最晚成像（Asia/Shanghai UTC+08）<input type="datetime-local" min={toLocalInput(task.imagingStart)} value={toLocalInput(task.imagingEnd)} onChange={(event) => onUpdate(task.taskId, { imagingEnd: fromLocalInput(event.target.value) })} /></label>
-          <label>任务状态<select value={task.status} onChange={(event) => onUpdate(task.taskId, { status: event.target.value as SatelliteTask["status"] })}>{allowedTaskStatuses(task.status).map((status) => <option key={status} value={status}>{taskStatusLabel(status)}</option>)}</select></label>
+          <label>任务状态<select value={task.status} onChange={(event) => onUpdate(task.taskId, { status: event.target.value as SatelliteTask["status"] })}>{allowedTaskStatuses(task.status).filter((status) => status !== "cancelled").map((status) => <option key={status} value={status}>{taskStatusLabel(status)}</option>)}</select></label>
           <label>最低覆盖率（%）<input type="number" min="1" max="100" value={task.minimumCoveragePercent} onChange={(event) => onUpdate(task.taskId, { minimumCoveragePercent: clampNumber(event.target.value, 1, 100) })} /></label>
           <label>最大云量（%）<input type="number" min="0" max="100" value={task.maximumCloudPercent} onChange={(event) => onUpdate(task.taskId, { maximumCloudPercent: clampNumber(event.target.value, 0, 100) })} /></label>
           <label>目标分辨率（米）<input type="number" min="0.1" max="10000" step="0.1" value={task.spatialResolutionMeters} onChange={(event) => onUpdate(task.taskId, { spatialResolutionMeters: clampNumber(event.target.value, 0.1, 10000) })} /></label>
@@ -927,7 +1115,7 @@ function TaskPanel({ tasks, syncState, activeTaskId, onActivate, onUpdate, onRem
         </div>
         <fieldset className="payload-options"><legend>载荷选项（可多选）</legend>{payloadOptions.map((payload) => <label key={payload}><input type="checkbox" checked={task.sensors.includes(payload)} onChange={() => onUpdate(task.taskId, { sensors: toggleValue(task.sensors, payload) })} />{payload}</label>)}</fieldset>
         <div className="task-targets">观测目标：{task.observationTargets.join(" · ")}</div>
-        {(() => { const validation = validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requireProvenance: true }); return validation.ok ? null : <div className="task-validation" role="alert">{validation.errors.join("；")}</div>; })()}
+        {(() => { const validation = validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requirePayload: true, requireProvenance: true }); return validation.ok ? null : <div className="task-validation" role="alert">{validation.errors.join("；")}</div>; })()}
         <div className={`visibility-box ${visibility[task.taskId]?.state ?? "idle"}`}>
           <button onClick={() => void calculateVisibility(task)} disabled={visibility[task.taskId]?.state === "loading"}>{visibility[task.taskId]?.state === "loading" ? "正在请求仿真…" : "计算卫星可见窗口"}</button>
           {visibility[task.taskId]?.message ? <p>{visibility[task.taskId].message}</p> : null}
@@ -1109,6 +1297,8 @@ function downloadTasks(tasks: SatelliteTask[], format: ExportFormat) {
       cyclone_forecast_issued_at_utc: task.cycloneForecast?.issuedAt ?? "",
       cyclone_forecast_valid_until_utc: task.cycloneForecast?.forecastValidUntil ?? "",
       cyclone_forecast_point_count: task.cycloneForecast?.track.length ?? 0,
+      cyclone_impact_frame_count: task.cycloneForecast?.impactField?.frames.length ?? 0,
+      cyclone_impact_temporal_resolution_hours: task.cycloneForecast?.impactField?.temporalResolutionHours ?? "",
       cyclone_impact_basis: task.cycloneForecast?.impactBasis ?? "",
       cyclone_impact_threshold: task.cycloneForecast?.impactThreshold ?? "",
       cyclone_forecast_url: task.cycloneForecast?.sourceUrl ?? "",
@@ -1160,6 +1350,7 @@ function migrateSatelliteTask(task: Partial<SatelliteTask>): SatelliteTask {
     aoiLengthKm: task.aoiLengthKm ?? Math.max(20, radius * 3),
     aoiBearingDeg: task.aoiBearingDeg ?? 0,
     sourceGeometry: task.sourceGeometry,
+    customGeometry: task.customGeometry,
     cycloneForecast: task.cycloneForecast,
     minimumCoveragePercent: task.minimumCoveragePercent ?? 80,
     maximumCloudPercent: task.maximumCloudPercent ?? 30,
@@ -1225,6 +1416,20 @@ async function copyCoordinates(task: SatelliteTask) {
     window.prompt("复制失败，请手动复制坐标", value);
     return false;
   }
+}
+
+async function readCustomAoiFile(file: File) {
+  if (file.size > 2_000_000) throw new Error("GeoJSON 文件不能超过 2 MB");
+  let parsed: unknown;
+  try { parsed = JSON.parse(await file.text()); } catch { throw new Error("文件不是有效的 JSON"); }
+  const geometry = normalizeCustomAoiGeoJson(parsed);
+  if (!geometry) throw new Error("只支持有效的 Polygon、MultiPolygon 或包含这些面的 FeatureCollection（最多 10,000 个顶点）");
+  return geometry;
+}
+
+function customAoiPolygonParts(geometry: CustomAoiGeometry | undefined): number[][][][] {
+  if (!geometry || !Array.isArray(geometry.coordinates)) return [];
+  return geometry.type === "Polygon" ? [geometry.coordinates as number[][][]] : geometry.coordinates as number[][][][];
 }
 
 function taskGeometry(task: SatelliteTask) {

@@ -27,7 +27,7 @@ export async function POST(request: Request) {
     return Response.json({ state: "error", windows: [], message: "任务已有新版本，请刷新后重新计算" }, { status: 409 });
   }
   const task = storedTask as Record<string, unknown>;
-  const validation = validateSatelliteTask(task, { requireApproved: true, requireProvenance: true });
+  const validation = validateSatelliteTask(task, { requireApproved: true, requirePayload: true, requireProvenance: true });
   if (!validation.ok) return Response.json({ state: "error", windows: [], message: validation.errors.join("；") }, { status: 400 });
   const aoi = buildTaskAoi(task);
   if (!aoi) return Response.json({ state: "error", windows: [], message: "服务端无法重建任务 AOI" }, { status: 400 });

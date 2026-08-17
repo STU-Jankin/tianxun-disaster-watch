@@ -32,9 +32,26 @@ test("rejects impossible task coordinates and time windows", async () => {
 test("requires payload for visibility/export and accepts a complete task", async () => {
   const { validateSatelliteTask } = await contract();
   const task = validTask();
-  assert.deepEqual(validateSatelliteTask(task, { requireApproved: true }), { ok: true });
+  assert.deepEqual(validateSatelliteTask(task, { requireApproved: true, requirePayload: true }), { ok: true });
   task.sensors = [];
-  assert.equal(validateSatelliteTask(task, { requireApproved: true }).ok, false);
+  assert.equal(validateSatelliteTask(task, { requireApproved: true }).ok, true, "candidate drafts may be persisted before payload selection");
+  assert.equal(validateSatelliteTask(task, { requireApproved: true, requirePayload: true }).ok, false);
+  task.status = "reviewed";
+  assert.equal(validateSatelliteTask(task).ok, false, "reviewed tasks always require a payload");
+});
+
+test("accepts bounded custom Polygon and MultiPolygon AOIs", async () => {
+  const { validateSatelliteTask } = await contract();
+  const task = validTask();
+  task.aoiApproval = "operator_confirmed";
+  task.approvalReason = "操作员在地图核对并绘制灾害边界";
+  task.aoiType = "polygon";
+  task.customGeometry = { type: "Polygon", coordinates: [[[120, 31], [121, 31], [121, 32], [120, 31]]] };
+  assert.equal(validateSatelliteTask(task).ok, true);
+  task.aoiType = "multi";
+  assert.equal(validateSatelliteTask(task).ok, false);
+  task.customGeometry = { type: "MultiPolygon", coordinates: [[[[120, 31], [121, 31], [121, 32], [120, 31]]], [[[122, 31], [123, 31], [123, 32], [122, 31]]]] };
+  assert.equal(validateSatelliteTask(task).ok, true);
 });
 
 test("source-verified AOI cannot be replaced with operator geometry", async () => {

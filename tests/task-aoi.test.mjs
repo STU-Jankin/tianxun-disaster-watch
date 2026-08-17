@@ -44,3 +44,19 @@ test("keeps ordinary point and rectangle AOIs deterministic", async () => {
   assert.equal(geometry?.type, "Polygon");
   assert.equal(geometry?.coordinates[0].length, 5);
 });
+
+test("normalizes uploaded Polygon features and multiple AOI feature collections", async () => {
+  const { buildTaskAoi, normalizeCustomAoiGeoJson } = await taskAoi();
+  const polygon = normalizeCustomAoiGeoJson({ type: "Feature", properties: {}, geometry: { type: "Polygon", coordinates: [[[120, 31], [121, 31], [121, 32]]] } });
+  assert.equal(polygon?.type, "Polygon");
+  assert.deepEqual(polygon?.coordinates[0][0], polygon?.coordinates[0].at(-1), "open rings are safely closed");
+  assert.deepEqual(buildTaskAoi({ aoiType: "polygon", latitude: 0, longitude: 0, customGeometry: polygon }), polygon);
+
+  const multi = normalizeCustomAoiGeoJson({ type: "FeatureCollection", features: [
+    { type: "Feature", geometry: polygon },
+    { type: "Feature", geometry: { type: "Polygon", coordinates: [[[122, 31], [123, 31], [123, 32], [122, 31]]] } },
+  ] });
+  assert.equal(multi?.type, "MultiPolygon");
+  assert.equal(multi?.coordinates.length, 2);
+  assert.equal(normalizeCustomAoiGeoJson({ type: "LineString", coordinates: [[120, 31], [121, 32]] }), null);
+});

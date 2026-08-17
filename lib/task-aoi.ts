@@ -1,4 +1,5 @@
-type GeoGeometry = { type: "Point" | "Polygon" | "MultiPolygon" | "LineString"; coordinates: unknown };
+export type GeoGeometry = { type: "Point" | "Polygon" | "MultiPolygon" | "LineString"; coordinates: unknown };
+export type CustomAoiGeometry = { type: "Polygon" | "MultiPolygon"; coordinates: unknown };
 
 export function buildTaskAoi(task: Record<string, unknown>): GeoGeometry | null {
   const type = String(task.aoiType ?? "");
@@ -6,6 +7,8 @@ export function buildTaskAoi(task: Record<string, unknown>): GeoGeometry | null 
   const longitude = Number(task.longitude);
   if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
   if (type === "source") return isGeometry(task.sourceGeometry) ? task.sourceGeometry as GeoGeometry : null;
+  if (type === "polygon" && isGeometry(task.customGeometry) && (task.customGeometry as GeoGeometry).type === "Polygon") return task.customGeometry as GeoGeometry;
+  if (type === "multi" && isGeometry(task.customGeometry) && (task.customGeometry as GeoGeometry).type === "MultiPolygon") return task.customGeometry as GeoGeometry;
   const radius = Number(task.aoiRadiusKm);
   if (type === "point" && radius <= 0) return { type: "Point", coordinates: [longitude, latitude] };
   if (type === "point" || type === "circle") return splitDateLine(aoiCircle(latitude, longitude, Math.max(0.01, radius)));
@@ -16,6 +19,57 @@ export function buildTaskAoi(task: Record<string, unknown>): GeoGeometry | null 
     return splitDateLine(aoiRectangle(latitude, longitude, width, height, bearing));
   }
   return null;
+}
+
+export function normalizeCustomAoiGeoJson(value: unknown): CustomAoiGeometry | null {
+  const polygons: number[][][][] = [];
+  let vertices = 0;
+  const addGeometry = (candidate: unknown) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return;
+    const geometry = candidate as { type?: unknown; coordinates?: unknown; geometry?: unknown; features?: unknown };
+    if (geometry.type === "Feature") {
+      addGeometry(geometry.geometry);
+      return;
+    }
+    if (geometry.type === "FeatureCollection" && Array.isArray(geometry.features) && geometry.features.length <= 100) {
+      geometry.features.forEach(addGeometry);
+      return;
+    }
+    const candidates = geometry.type === "Polygon" ? [geometry.coordinates] : geometry.type === "MultiPolygon" ? geometry.coordinates : null;
+    if (!Array.isArray(candidates)) return;
+    candidates.forEach((polygon) => {
+      if (!Array.isArray(polygon) || !polygon.length || polygon.length > 100) return;
+      const rings: number[][][] = [];
+      for (const rawRing of polygon) {
+        if (!Array.isArray(rawRing) || rawRing.length < 3 || rawRing.length > 10_000) return;
+        const ring: number[][] = [];
+        for (const rawCoordinate of rawRing) {
+          if (!Array.isArray(rawCoordinate) || rawCoordinate.length < 2) return;
+          const longitude = Number(rawCoordinate[0]);
+          const latitude = Number(rawCoordinate[1]);
+          if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180 || !Number.isFinite(latitude) || latitude < -90 || latitude > 90) return;
+          vertices += 1;
+          if (vertices > 10_000) return;
+          ring.push([Number(longitude.toFixed(7)), Number(latitude.toFixed(7))]);
+        }
+        if (ring.length < 3) return;
+        if (ring[0][0] !== ring[ring.length - 1][0] || ring[0][1] !== ring[ring.length - 1][1]) ring.push([...ring[0]]);
+        if (ring.length < 4) return;
+        rings.push(ring);
+      }
+      if (rings.length === polygon.length) polygons.push(rings);
+    });
+  };
+  addGeometry(value);
+  if (!polygons.length || vertices > 10_000) return null;
+  return polygons.length === 1
+    ? { type: "Polygon", coordinates: polygons[0] }
+    : { type: "MultiPolygon", coordinates: polygons };
+}
+
+export function customAoiPartCount(geometry: CustomAoiGeometry | undefined) {
+  if (!geometry) return 0;
+  return geometry.type === "Polygon" ? 1 : Array.isArray(geometry.coordinates) ? geometry.coordinates.length : 0;
 }
 
 function aoiRectangle(latitude: number, longitude: number, widthKm: number, heightKm: number, bearingDeg: number) {

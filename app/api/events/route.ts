@@ -13,7 +13,7 @@ import {
 import { listRetainedCanonicalEvents, persistCanonicalEvents, resolveCanonicalEventsByReferences } from "../../../db/operational";
 import { circularGeometryCenter, cycloneSeverityFromKnots, firmsConfidenceScore, firmsHeatSeverity, latestTrackPoint } from "../../../lib/source-normalization";
 import { authorizeApiRequest } from "../../../lib/api-security";
-import { buildJmaCycloneForecast, extractKmlFromKmz, parseNhcConeKml, parseNhcTrackKml, parseNhcWindRadiiKml } from "../../../lib/cyclone-forecast";
+import { buildHourlyCycloneImpactField, buildJmaCycloneForecast, extractKmlFromKmz, parseNhcConeKml, parseNhcTrackKml, parseNhcWindRadiiKml } from "../../../lib/cyclone-forecast";
 import { eventHasInvalidIdentity, firstValidSourceEventId, isValidSourceEventId } from "../../../lib/event-integrity";
 import { updateIngestionHealth } from "../../../lib/runtime-health";
 import { floodProcessEntityKey, sameFloodRegion } from "../../../lib/process-identity";
@@ -799,7 +799,9 @@ async function fetchNhc(): Promise<DisasterEvent[]> {
             typeof forecastWindRadii.kmzFile === "string" ? fetchKmzKml(forecastWindRadii.kmzFile) : Promise.reject(new Error("无预报风圈")),
           ]);
           const uncertaintyGeometry = coneResult.status === "fulfilled" ? parseNhcConeKml(coneResult.value) : undefined;
-          const windRadii = windResult.status === "fulfilled" ? parseNhcWindRadiiKml(windResult.value) : {};
+          const windRadii = windResult.status === "fulfilled"
+            ? parseNhcWindRadiiKml(windResult.value, parsedTrack.track)
+            : { timeSlices: [], geometry: undefined, thresholdKnots: undefined };
           cycloneForecast = {
             official: true,
             source: "NOAA NHC",
@@ -812,6 +814,7 @@ async function fetchNhc(): Promise<DisasterEvent[]> {
             uncertaintyGeometry,
             uncertaintyLabel: uncertaintyGeometry ? "NHC 官方路径概率锥（约 60%–70% 的中心路径落入）" : undefined,
             impactGeometry: windRadii.geometry,
+            impactField: buildHourlyCycloneImpactField(parsedTrack.track, windRadii.timeSlices, uncertaintyGeometry),
             impactBasis: windRadii.geometry ? "forecast_wind_radii" : "uncertainty_only",
             impactThreshold: windRadii.thresholdKnots ? `预报 ≥${windRadii.thresholdKnots} kt 风圈` : undefined,
             note: "预报路径、概率锥和风圈会随每个报次更新；概率锥只表示中心路径不确定性，不代表风雨影响边界。",

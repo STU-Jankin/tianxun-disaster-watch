@@ -90,14 +90,17 @@ export async function DELETE(request: Request) {
   if (unauthorized) return unauthorized;
   const limited = enforceRateLimit(request, "task-delete", 30);
   if (limited) return limited;
-  const taskId = new URL(request.url).searchParams.get("taskId");
-  if (!taskId) return Response.json({ error: "缺少 taskId" }, { status: 400 });
+  const parameters = new URL(request.url).searchParams;
+  const taskId = parameters.get("taskId");
+  const revisionValue = parameters.get("revision");
+  const revision = revisionValue === null ? undefined : Number(revisionValue);
+  if (!taskId || taskId.length > 220) return Response.json({ error: "缺少或无效 taskId" }, { status: 400 });
+  if (revision !== undefined && (!Number.isInteger(revision) || revision < 1)) return Response.json({ error: "revision 必须是正整数" }, { status: 400 });
   try {
-    const found = await deleteSatelliteTask(taskId);
-    if (!found) return Response.json({ error: "任务不存在" }, { status: 404 });
-    return Response.json({ deleted: taskId });
+    const result = await deleteSatelliteTask(taskId, revision, apiActor(request));
+    return Response.json({ deleted: taskId, ...result });
   } catch (error) {
-    if (error instanceof Error && /不允许取消|任务已被其他请求更新/.test(error.message)) return Response.json({ error: error.message }, { status: 409 });
+    if (error instanceof Error && /不允许取消|任务已被其他请求更新|任务版本冲突/.test(error.message)) return Response.json({ error: error.message }, { status: 409 });
     console.error("task delete unavailable", error);
     return Response.json({ error: "任务删除失败", requestId: crypto.randomUUID() }, { status: 503 });
   }

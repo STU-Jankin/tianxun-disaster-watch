@@ -44,6 +44,38 @@ export type CycloneForecastPoint = {
   category?: string;
 };
 
+export type CycloneQuadrantRadiiKm = {
+  northeast: number;
+  southeast: number;
+  southwest: number;
+  northwest: number;
+};
+
+export type CycloneWindField = {
+  thresholdKnots: number;
+  quadrantsKm: CycloneQuadrantRadiiKm;
+  basis: "official_quadrants" | "derived_official_polygon" | "official_circular_extent" | "interpolated_official_fields";
+};
+
+export type CycloneImpactFrame = {
+  forecastAt: string;
+  leadHours: number;
+  latitude: number;
+  longitude: number;
+  centerBasis: "official_node" | "interpolated_official_track";
+  uncertaintyRadiusKm?: number;
+  uncertaintyGeometry?: EventGeometry;
+  windFields: CycloneWindField[];
+};
+
+export type CycloneImpactField = {
+  temporalResolutionHours: 1;
+  frames: CycloneImpactFrame[];
+  interpolation: "linear_between_official_nodes";
+  uncertaintyBasis: "time_sliced_official" | "official_advisory_envelope" | "not_available";
+  note: string;
+};
+
 export type CycloneForecast = {
   official: true;
   source: string;
@@ -56,6 +88,7 @@ export type CycloneForecast = {
   uncertaintyGeometry?: EventGeometry;
   uncertaintyLabel?: string;
   impactGeometry?: EventGeometry;
+  impactField?: CycloneImpactField;
   impactBasis: "forecast_wind_radii" | "current_wind_extent" | "uncertainty_only";
   impactThreshold?: string;
   note: string;

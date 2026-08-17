@@ -46,8 +46,11 @@ type NodePreparedStatement = {
 
 class NodeStatement implements DatabaseStatement {
   private values: unknown[] = [];
+  private readonly prepareStatement: () => NodePreparedStatement;
 
-  constructor(private readonly prepareStatement: () => NodePreparedStatement) {}
+  constructor(prepareStatement: () => NodePreparedStatement) {
+    this.prepareStatement = prepareStatement;
+  }
 
   bind(...values: unknown[]) {
     this.values = values;
@@ -284,17 +287,25 @@ async function reconcileCanonicalMasters(db: DatabaseLike, masterIds: string[], 
 export async function listSatelliteTasks() {
   await ensureOperationalSchema();
   const db = await database();
-  const result = await db.prepare(`SELECT payload_json FROM satellite_tasks WHERE status != 'cancelled' ORDER BY priority DESC, updated_at DESC LIMIT 500`).all<{ payload_json: string }>();
-  return result.results.map((row) => JSON.parse(row.payload_json) as TaskRecord);
+  const result = await db.prepare(`SELECT status, revision, event_revision, aoi_hash, updated_at, payload_json FROM satellite_tasks WHERE status != 'cancelled' ORDER BY priority DESC, updated_at DESC LIMIT 500`).all<{ status: string; revision: number; event_revision: string; aoi_hash: string; updated_at: string; payload_json: string }>();
+  return result.results.flatMap((row): TaskRecord[] => {
+    try {
+      const payload = JSON.parse(row.payload_json) as TaskRecord;
+      return [{ ...payload, status: row.status, revision: row.revision, eventRevision: row.event_revision, aoiHash: row.aoi_hash, updatedAt: row.updated_at }];
+    } catch { return []; }
+  });
 }
 
 export async function getSatelliteTask(taskId: string) {
   await ensureOperationalSchema();
   const db = await database();
-  const row = await db.prepare(`SELECT payload_json FROM satellite_tasks WHERE task_id = ? AND status != 'cancelled'`)
-    .bind(taskId).first<{ payload_json: string }>();
+  const row = await db.prepare(`SELECT status, revision, event_revision, aoi_hash, updated_at, payload_json FROM satellite_tasks WHERE task_id = ? AND status != 'cancelled'`)
+    .bind(taskId).first<{ status: string; revision: number; event_revision: string; aoi_hash: string; updated_at: string; payload_json: string }>();
   if (!row) return null;
-  try { return JSON.parse(row.payload_json) as TaskRecord; } catch { return null; }
+  try {
+    const payload = JSON.parse(row.payload_json) as TaskRecord;
+    return { ...payload, status: row.status, revision: row.revision, eventRevision: row.event_revision, aoiHash: row.aoi_hash, updatedAt: row.updated_at };
+  } catch { return null; }
 }
 
 export async function listSatelliteTaskCancellationIds() {
@@ -353,7 +364,7 @@ export async function upsertSatelliteTask(task: TaskRecord) {
   const updatedAt = new Date().toISOString();
   const revision = existing ? existing.revision + 1 : 1;
   const payload = { ...task, revision, updatedAt };
-  const aoi = JSON.stringify({ type: task.aoiType, sourceGeometry: task.sourceGeometry, radiusKm: task.aoiRadiusKm, widthKm: task.aoiWidthKm, heightKm: task.aoiHeightKm, lengthKm: task.aoiLengthKm, bearingDeg: task.aoiBearingDeg });
+  const aoi = JSON.stringify({ type: task.aoiType, sourceGeometry: task.sourceGeometry, customGeometry: task.customGeometry, radiusKm: task.aoiRadiusKm, widthKm: task.aoiWidthKm, heightKm: task.aoiHeightKm, lengthKm: task.aoiLengthKm, bearingDeg: task.aoiBearingDeg });
   const save = existing
     ? db.prepare(`UPDATE satellite_tasks SET event_id=?, master_event_id=?, title=?, status=?, priority=?, latitude=?, longitude=?, aoi_type=?, aoi_json=?, sensors_json=?, imaging_start=?, imaging_end=?, aoi_approval=?, payload_json=?, updated_at=?, revision=?, event_revision=?, aoi_hash=? WHERE task_id=? AND status=? AND revision=?`)
       .bind(task.eventId, task.masterEventId, task.title, task.status, task.priority, task.latitude, task.longitude, task.aoiType, aoi, JSON.stringify(task.sensors ?? []), task.imagingStart, task.imagingEnd, task.aoiApproval, JSON.stringify(payload), updatedAt, revision, task.eventRevision ?? "", task.aoiHash ?? "", task.taskId, existing.status, existing.revision)
@@ -364,15 +375,29 @@ export async function upsertSatelliteTask(task: TaskRecord) {
   return payload;
 }
 
-export async function deleteSatelliteTask(taskId: string) {
+export async function deleteSatelliteTask(taskId: string, expectedRevision?: number, actor = "api", reason = "操作员取消任务") {
   await ensureOperationalSchema();
   const db = await database();
-  const existing = await db.prepare(`SELECT status FROM satellite_tasks WHERE task_id = ?`).bind(taskId).first<{ status: string }>();
-  if (!existing) return false;
+  const existing = await db.prepare(`SELECT status, revision, master_event_id, payload_json FROM satellite_tasks WHERE task_id = ?`).bind(taskId).first<{ status: string; revision: number; master_event_id: string; payload_json: string }>();
+  if (!existing) return { state: "already_absent" as const, revision: null };
+  if (existing.status === "cancelled") return { state: "already_cancelled" as const, revision: existing.revision };
+  if (expectedRevision !== undefined && expectedRevision !== existing.revision) throw new Error(`任务版本冲突：当前为 ${existing.revision}，请求为 ${expectedRevision}`);
   if (!canTransitionTask(existing.status, "cancelled")) throw new Error(`不允许取消状态为 ${existing.status} 的任务`);
-  const result = await db.prepare(`UPDATE satellite_tasks SET status = 'cancelled', updated_at = ? WHERE task_id = ? AND status = ?`).bind(new Date().toISOString(), taskId, existing.status).run();
+  const cancelledAt = new Date().toISOString();
+  const revision = existing.revision + 1;
+  let previousPayload: Record<string, unknown> = {};
+  try { previousPayload = JSON.parse(existing.payload_json) as Record<string, unknown>; } catch { /* 旧数据仍按规范化列完成取消。 */ }
+  const payload = { ...previousPayload, status: "cancelled", revision, updatedAt: cancelledAt, cancelledAt, cancelledBy: actor, cancellationReason: reason };
+  const statements = [
+    db.prepare(`UPDATE satellite_tasks SET status = 'cancelled', payload_json = ?, updated_at = ?, revision = ? WHERE task_id = ? AND status = ? AND revision = ?`)
+      .bind(JSON.stringify(payload), cancelledAt, revision, taskId, existing.status, existing.revision),
+    db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at)
+      SELECT ?, 'task_cancelled', ?, ?, ? WHERE changes() > 0`)
+      .bind(`task_cancelled:${taskId}:${revision}`, existing.master_event_id, JSON.stringify({ taskId, previousStatus: existing.status, revision, actor, reason }), cancelledAt),
+  ];
+  const [result] = await db.batch(statements);
   if (affectedRows(result) === 0) throw new Error("任务已被其他请求更新，请刷新后重试");
-  return true;
+  return { state: "cancelled" as const, revision };
 }
 
 export async function resolveCanonicalEventsByReferences(references: Array<{ source: string; sourceEventId: string }>, reason: string) {
