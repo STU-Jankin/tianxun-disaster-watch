@@ -10,7 +10,7 @@ function validTask() {
   const end = new Date(Date.now() + 7_200_000).toISOString();
   return {
     taskId: "TASK-1", eventId: "EV-1", masterEventId: "ME-1", title: "test", status: "candidate", priority: 80,
-    latitude: 31.5, longitude: 120.3, aoiType: "circle", aoiRadiusKm: 20, aoiWidthKm: 40, aoiHeightKm: 40,
+    latitude: 31.5, longitude: 120.3, aoiType: "source", sourceGeometry: { type: "Point", coordinates: [120.3, 31.5] }, aoiRadiusKm: 20, aoiWidthKm: 40, aoiHeightKm: 40,
     aoiLengthKm: 60, aoiBearingDeg: 0, imagingStart: start, imagingEnd: end, deliveryDeadline: new Date(Date.now() + 10_800_000).toISOString(),
     sensors: ["SAR"], observationTargets: ["淹没范围"], aoiApproval: "source_verified", source: "USGS", createdAt: new Date().toISOString(),
     minimumCoveragePercent: 80, maximumCloudPercent: 30, spatialResolutionMeters: 10, incidenceAngleMinDeg: 20, incidenceAngleMaxDeg: 45, revisitCount: 1,
@@ -35,6 +35,16 @@ test("requires payload for visibility/export and accepts a complete task", async
   assert.deepEqual(validateSatelliteTask(task, { requireApproved: true }), { ok: true });
   task.sensors = [];
   assert.equal(validateSatelliteTask(task, { requireApproved: true }).ok, false);
+});
+
+test("source-verified AOI cannot be replaced with operator geometry", async () => {
+  const { validateSatelliteTask } = await contract();
+  const task = validTask();
+  task.aoiType = "circle";
+  assert.equal(validateSatelliteTask(task, { requireApproved: true }).ok, false);
+  task.aoiApproval = "operator_confirmed";
+  task.approvalReason = "值班员依据洪水范围图扩大观测区";
+  assert.equal(validateSatelliteTask(task, { requireApproved: true }).ok, true);
 });
 
 test("accepts bounded official cyclone forecasts and rejects malformed forecast coordinates", async () => {

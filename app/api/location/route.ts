@@ -1,16 +1,24 @@
+import { authorizeApiRequest, enforceRateLimit } from "../../../lib/api-security";
+
 export const dynamic = "force-dynamic";
 
-type CachedLocation = { locationZh: string; source: "Nominatim" | "fallback"; cachedAt: number };
+type CachedLocation = { locationZh: string; source: "Nominatim"; cachedAt: number };
 
 const globalCache = globalThis as typeof globalThis & {
   __tianxunLocationCache?: Map<string, CachedLocation>;
   __tianxunLastGeocodeAt?: number;
+  __tianxunGeocodeQueue?: Promise<void>;
 };
 
 const cache = globalCache.__tianxunLocationCache ??= new Map<string, CachedLocation>();
 const CACHE_TTL = 30 * 24 * 60 * 60 * 1000;
+const CACHE_LIMIT = 500;
 
 export async function GET(request: Request) {
+  const unauthorized = authorizeApiRequest(request);
+  if (unauthorized) return unauthorized;
+  const limited = enforceRateLimit(request, "location", 30);
+  if (limited) return limited;
   const url = new URL(request.url);
   const latitude = Number(url.searchParams.get("lat"));
   const longitude = Number(url.searchParams.get("lon"));
@@ -25,11 +33,15 @@ export async function GET(request: Request) {
     return Response.json({ locationZh: cached.locationZh, source: cached.source, cached: true });
   }
 
-  const minimumWait = 1_050 - (Date.now() - (globalCache.__tianxunLastGeocodeAt ?? 0));
-  if (minimumWait > 0) await new Promise((resolve) => setTimeout(resolve, minimumWait));
-  globalCache.__tianxunLastGeocodeAt = Date.now();
+  const previous = globalCache.__tianxunGeocodeQueue ?? Promise.resolve();
+  let release = () => {};
+  globalCache.__tianxunGeocodeQueue = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
 
   try {
+    const minimumWait = 1_050 - (Date.now() - (globalCache.__tianxunLastGeocodeAt ?? 0));
+    if (minimumWait > 0) await new Promise((resolve) => setTimeout(resolve, minimumWait));
+    globalCache.__tianxunLastGeocodeAt = Date.now();
     const endpoint = new URL("https://nominatim.openstreetmap.org/reverse");
     endpoint.searchParams.set("format", "jsonv2");
     endpoint.searchParams.set("lat", String(latitude));
@@ -41,7 +53,6 @@ export async function GET(request: Request) {
       headers: {
         "User-Agent": "Tianxun-Disaster-Watch/0.1 (disaster location display)",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5",
-        Referer: new URL(request.url).origin,
       },
       signal: AbortSignal.timeout(7_000),
     });
@@ -50,15 +61,17 @@ export async function GET(request: Request) {
       display_name?: string;
       address?: Record<string, string>;
     };
-    const locationZh = formatChineseAddress(data.address, data.display_name) || fallbackLocation(fallback, latitude, longitude);
+    const locationZh = formatChineseAddress(data.address, data.display_name);
+    if (!locationZh) throw new Error("reverse geocode returned no address");
     const result: CachedLocation = { locationZh, source: "Nominatim", cachedAt: Date.now() };
+    if (cache.size >= CACHE_LIMIT && !cache.has(key)) cache.delete(cache.keys().next().value as string);
     cache.set(key, result);
     return Response.json({ locationZh, source: result.source, cached: false });
   } catch {
     const locationZh = fallbackLocation(fallback, latitude, longitude);
-    const result: CachedLocation = { locationZh, source: "fallback", cachedAt: Date.now() };
-    cache.set(key, result);
-    return Response.json({ locationZh, source: result.source, cached: false });
+    return Response.json({ locationZh, source: "fallback", cached: false });
+  } finally {
+    release();
   }
 }
 

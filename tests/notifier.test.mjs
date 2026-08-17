@@ -147,7 +147,14 @@ test("end-to-end baseline is delivered once and only material changes repeat", a
         fetchedAt: "2026-08-13T00:00:00.000Z",
       });
     }
-    sent.push({ body: options.body, signature: options.headers["X-Webhook-Signature"] });
+    if (String(url).includes("/api/changes")) {
+      return Response.json({ changes: [], cursor: "1970-01-01T00:00:00.000Z" });
+    }
+    sent.push({
+      body: options.body,
+      signature: options.headers["X-Webhook-Signature-V2"],
+      timestamp: options.headers["X-Webhook-Timestamp"],
+    });
     return Response.json({ status: "delivered" });
   };
   const runtime = {
@@ -167,7 +174,8 @@ test("end-to-end baseline is delivered once and only material changes repeat", a
   assert.equal(baseline.delivered, 1);
   assert.equal(sent.length, 1);
   assert.match(JSON.parse(sent[0].body).message, /已建立运行基线/);
-  assert.equal(sent[0].signature, signPayload("test-secret", sent[0].body));
+  assert.match(sent[0].timestamp, /^\d{10,13}$/);
+  assert.equal(sent[0].signature, signPayload("test-secret", sent[0].body, sent[0].timestamp));
 
   const unchanged = await runOnce(runtime, fetchImpl);
   assert.equal(unchanged.delivered, 0);

@@ -17,7 +17,21 @@ const transitions: Record<TaskStatus, TaskStatus[]> = {
 
 export type TaskValidationResult = { ok: true } | { ok: false; errors: string[] };
 
-export function validateSatelliteTask(task: Record<string, unknown>, options: { requireApproved?: boolean } = {}): TaskValidationResult {
+const allowedTaskFields = new Set([
+  "taskId", "eventId", "masterEventId", "entityKey", "title", "hazard", "priority", "latitude", "longitude",
+  "eventOccurredAt", "eventUpdatedAt", "aoiType", "aoiRadiusKm", "aoiWidthKm", "aoiHeightKm", "aoiLengthKm",
+  "aoiBearingDeg", "sourceGeometry", "cycloneForecast", "minimumCoveragePercent", "maximumCloudPercent",
+  "spatialResolutionMeters", "incidenceAngleMinDeg", "incidenceAngleMaxDeg", "revisitCount", "deliveryDeadline",
+  "imagingStart", "imagingEnd", "sensors", "observationTargets", "observationPhase", "source", "sourceUrl",
+  "locationQuality", "locationAccuracyKm", "evidenceCount", "aoiApproval", "approvedAt", "approvedBy",
+  "approvalReason", "createdAt", "updatedAt", "status", "revision", "eventRevision", "aoiHash",
+]);
+
+export function unknownTaskFields(task: Record<string, unknown>) {
+  return Object.keys(task).filter((key) => !allowedTaskFields.has(key));
+}
+
+export function validateSatelliteTask(task: Record<string, unknown>, options: { requireApproved?: boolean; requireProvenance?: boolean } = {}): TaskValidationResult {
   const errors: string[] = [];
   for (const key of ["taskId", "eventId", "masterEventId", "title", "status", "aoiType", "imagingStart", "imagingEnd", "aoiApproval", "createdAt"]) {
     if (typeof task[key] !== "string" || !String(task[key]).trim()) errors.push(`缺少或无效字段：${key}`);
@@ -57,6 +71,14 @@ export function validateSatelliteTask(task: Record<string, unknown>, options: { 
   if (task.cycloneForecast !== undefined && !isValidCycloneForecast(task.cycloneForecast)) errors.push("台风官方预报字段无效或超出安全范围");
   if (!isValidApproval(task.aoiApproval)) errors.push("AOI 审批状态无效");
   if (options.requireApproved && task.aoiApproval !== "source_verified" && task.aoiApproval !== "operator_confirmed") errors.push("任务尚未通过 AOI 审批");
+  if (options.requireApproved && task.aoiApproval === "source_verified" && task.aoiType !== "source") errors.push("来源核验任务必须使用不可修改的来源几何");
+  if (options.requireApproved && task.aoiApproval === "operator_confirmed" && (typeof task.approvalReason !== "string" || !task.approvalReason.trim() || task.approvalReason.length > 500)) errors.push("人工核对任务必须填写审批理由");
+  const revision = Number(task.revision ?? 0);
+  if (!Number.isInteger(revision) || revision < 0) errors.push("任务 revision 必须是非负整数");
+  if (options.requireProvenance) {
+    if (typeof task.eventRevision !== "string" || !/^[a-f0-9]{16}$/.test(task.eventRevision)) errors.push("缺少有效事件版本指纹");
+    if (typeof task.aoiHash !== "string" || !/^[a-f0-9]{16}$/.test(task.aoiHash)) errors.push("缺少有效 AOI 指纹");
+  }
   if (task.source === "演示数据") errors.push("演示事件禁止进入任务流");
   return errors.length ? { ok: false, errors } : { ok: true };
 }
@@ -76,7 +98,7 @@ export function allowedTaskStatuses(from: string): TaskStatus[] {
 export function safeHttpUrl(value: unknown, fallback = "#") {
   try {
     const url = new URL(String(value));
-    return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : fallback;
+    return url.protocol === "https:" || (url.protocol === "http:" && ["localhost", "127.0.0.1", "::1"].includes(url.hostname)) ? url.toString() : fallback;
   } catch {
     return fallback;
   }

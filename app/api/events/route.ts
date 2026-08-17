@@ -14,6 +14,9 @@ import { listRetainedCanonicalEvents, persistCanonicalEvents, resolveCanonicalEv
 import { circularGeometryCenter, cycloneSeverityFromKnots, firmsConfidenceScore, firmsHeatSeverity, latestTrackPoint } from "../../../lib/source-normalization";
 import { authorizeApiRequest } from "../../../lib/api-security";
 import { buildJmaCycloneForecast, extractKmlFromKmz, parseNhcConeKml, parseNhcTrackKml, parseNhcWindRadiiKml } from "../../../lib/cyclone-forecast";
+import { eventHasInvalidIdentity, firstValidSourceEventId, isValidSourceEventId } from "../../../lib/event-integrity";
+import { updateIngestionHealth } from "../../../lib/runtime-health";
+import { floodProcessEntityKey, sameFloodRegion } from "../../../lib/process-identity";
 
 export const dynamic = "force-dynamic";
 
@@ -68,6 +71,7 @@ type CancellationReference = { source: string; sourceEventId: string; reason: st
 const cancellationBuffer: CancellationReference[] = [];
 let eventsCache: { body: string; status: number; contentType: string; expiresAt: number; etag: string } | null = null;
 let eventsRefresh: Promise<NonNullable<typeof eventsCache>> | null = null;
+let lastSuccessfulFetchAt: string | null = null;
 
 export async function GET(request: Request) {
   const unauthorized = authorizeApiRequest(request);
@@ -222,14 +226,11 @@ async function refreshEvents() {
     },
   ];
   const runs = await Promise.all(connectors.map(runConnector));
+  const refreshCompletedAt = new Date().toISOString();
+  if (runs.some((run) => run.online)) lastSuccessfulFetchAt = refreshCompletedAt;
   const cancellations = cancellationBuffer.splice(0);
-  if (cancellations.length) {
-    const byReason = new Map<string, CancellationReference[]>();
-    cancellations.forEach((item) => byReason.set(item.reason, [...(byReason.get(item.reason) ?? []), item]));
-    for (const [reason, items] of byReason) await resolveCanonicalEventsByReferences(items, reason);
-  }
   const collected = runs.flatMap((run) => run.events);
-  const normalized = canonicalizeEvents(collected).map(finalize);
+  const normalized = canonicalizeEvents(collected.filter((event) => !eventHasInvalidIdentity(event))).map(finalize);
   const allSourcesUnavailable = runs.every((source) => !source.online);
   const sourceCounts = runs.map((run) => ({
     name: run.name,
@@ -242,8 +243,21 @@ async function refreshEvents() {
     producing: run.producing,
     count: normalized.filter((event) => event.evidence.some((item) => item.source.startsWith(run.name))).length,
   }));
-  if (!allSourcesUnavailable) await persistCanonicalEvents(normalized);
+  let persistenceAvailable = true;
+  if (!allSourcesUnavailable) persistenceAvailable = await persistCanonicalEvents(normalized);
+  if (cancellations.length) {
+    const byReason = new Map<string, CancellationReference[]>();
+    cancellations.forEach((item) => byReason.set(item.reason, [...(byReason.get(item.reason) ?? []), item]));
+    for (const [reason, items] of byReason) await resolveCanonicalEventsByReferences(items, reason);
+  }
   const retained = await listRetainedEventsSafely();
+  updateIngestionHealth({
+    lastAttemptAt: refreshCompletedAt,
+    lastSuccessAt: lastSuccessfulFetchAt,
+    onlineSources: runs.filter((run) => run.online).length,
+    producingSources: runs.filter((run) => run.producing).length,
+    persistenceAvailable,
+  });
   const liveEvidence = new Set(normalized.flatMap((event) => event.evidence.map((item) => `${sourceFamily(item.source)}|${item.sourceEventId}`)));
   const operationalEvents = canonicalizeEvents([...normalized, ...retained]).map((event) => {
     const presentInCurrentFeeds = event.evidence.some((item) => liveEvidence.has(`${sourceFamily(item.source)}|${item.sourceEventId}`));
@@ -268,11 +282,14 @@ async function refreshEvents() {
       events: allSourcesUnavailable ? (events.length ? events : fallback) : events,
       sourceStatus: fallbackSourceCounts,
       hazardCounts,
-      fetchedAt: new Date().toISOString(),
+      fetchedAt: refreshCompletedAt,
+      lastSuccessfulFetchAt,
+      producingSourceCount: runs.filter((run) => run.producing).length,
       fallback: allSourcesUnavailable,
       expiredCount: normalized.filter((event) => event.observationStatus === "expired").length,
       processedCount: normalized.length,
       retainedCount,
+      persistenceAvailable,
       selectionPolicy: { limit: 250, reservedPerHazard: 20, wildfireCap: 100, perSourceCap: 80 },
       windowPolicyVersion: "2026.08-phased-v3",
     },
@@ -294,7 +311,14 @@ async function runConnector(connector: SourceConnector): Promise<SourceRun> {
     return { ...connector, state: "needs_config", online: false, producing: false, count: 0, message: connector.config.message, events: [] };
   }
   try {
-    const events = await connector.fetcher();
+    let events: DisasterEvent[];
+    try {
+      events = await connector.fetcher();
+    } catch (firstError) {
+      if (!isTransientConnectorError(firstError)) throw firstError;
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      events = await connector.fetcher();
+    }
     return {
       ...connector,
       state: "online",
@@ -310,36 +334,118 @@ async function runConnector(connector: SourceConnector): Promise<SourceRun> {
   }
 }
 
+function isTransientConnectorError(error: unknown) {
+  const message = error instanceof Error ? `${error.name} ${error.message}` : String(error);
+  return /abort|timeout|timed out|fetch failed|econnreset|econnrefused|enotfound|eai_again|HTTP (?:408|425|429|5\d\d)|\b(?:408|425|429|5\d\d)\b/i.test(message);
+}
+
 async function fetchJson(url: string) {
-  const response = await fetch(url, {
+  const safeUrl = validateExternalFeedUrl(url);
+  const response = await fetch(safeUrl, {
     headers: { "User-Agent": "Tianxun-Disaster-Watch/0.1" },
     signal: AbortSignal.timeout(8_000),
+    redirect: "manual",
   });
-  if (!response.ok) throw new Error(`${response.status} ${url}`);
-  return response.json();
+  if (!response.ok) throw new Error(`上游返回 HTTP ${response.status}`);
+  return JSON.parse(await readLimitedText(response, 5_000_000, "JSON"));
 }
 
 async function fetchText(url: string) {
-  const response = await fetch(url, {
+  const safeUrl = validateExternalFeedUrl(url);
+  const response = await fetch(safeUrl, {
     headers: {
       Accept: "text/html,application/xml,text/xml;q=0.9,*/*;q=0.8",
       "User-Agent": "Tianxun-Disaster-Watch/0.1",
     },
     signal: AbortSignal.timeout(12_000),
+    redirect: "manual",
   });
-  if (!response.ok) throw new Error(`${response.status} ${url}`);
-  return response.text();
+  if (!response.ok) throw new Error(`上游返回 HTTP ${response.status}`);
+  return readLimitedText(response, 5_000_000, "文本");
 }
 
 async function fetchKmzKml(url: string) {
-  const response = await fetch(url, {
+  const safeUrl = validateExternalFeedUrl(url, ["nhc.noaa.gov", "www.nhc.noaa.gov"]);
+  const response = await fetch(safeUrl, {
     headers: { Accept: "application/vnd.google-earth.kmz,application/zip", "User-Agent": "Tianxun-Disaster-Watch/0.1" },
     signal: AbortSignal.timeout(12_000),
+    redirect: "manual",
   });
   if (!response.ok) throw new Error(`${response.status} ${url}`);
   const contentLength = Number(response.headers.get("content-length") ?? 0);
   if (contentLength > 6_000_000) throw new Error("KMZ 文件超过安全上限");
-  return extractKmlFromKmz(await response.arrayBuffer());
+  return extractKmlFromKmz(await readLimitedBytes(response, 6_000_000, "KMZ"));
+}
+
+async function readLimitedBytes(response: Response, maximumBytes: number, label: string) {
+  if (!response.body) return new ArrayBuffer(0);
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maximumBytes) { await reader.cancel(); throw new Error(`${label}响应超过安全上限`); }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return bytes.buffer;
+}
+
+async function readLimitedText(response: Response, maximumBytes: number, label: string) {
+  const declared = Number(response.headers.get("content-length") ?? 0);
+  if (Number.isFinite(declared) && declared > maximumBytes) throw new Error(`${label}响应超过安全上限`);
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maximumBytes) {
+      await reader.cancel();
+      throw new Error(`${label}响应超过安全上限`);
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder().decode(bytes);
+}
+
+function validateExternalFeedUrl(value: string, allowedHosts: string[] = []) {
+  const url = new URL(value);
+  if (url.protocol !== "https:" || url.username || url.password) throw new Error("上游地址必须是不含凭据的 HTTPS URL");
+  const host = url.hostname.toLowerCase();
+  if (allowedHosts.length && !allowedHosts.some((allowed) => host === allowed || host.endsWith(`.${allowed}`))) throw new Error("上游地址不在允许域名中");
+  if (host === "localhost" || host.endsWith(".local") || host === "0.0.0.0" || host === "::1" || isPrivateIpv4(host)) throw new Error("禁止访问本机或内网地址");
+  return url.toString();
+}
+
+function isPrivateIpv4(host: string) {
+  const parts = host.split(".").map(Number);
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+  return parts[0] === 10 || parts[0] === 127 || parts[0] === 0 || (parts[0] === 169 && parts[1] === 254)
+    || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) || (parts[0] === 192 && parts[1] === 168);
+}
+
+function publicSourceUrl(value: string, fallback: string) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:") return fallback;
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return fallback;
+  }
 }
 
 async function fetchCenc(): Promise<DisasterEvent[]> {
@@ -464,13 +570,16 @@ async function fetchJiangsuWater(): Promise<DisasterEvent[]> {
 async function fetchCma(): Promise<DisasterEvent[]> {
   const url = process.env.CMA_EVENT_FEED_URL;
   if (!url) return [];
-  const response = await fetch(url, {
-    headers: { Accept: "application/geo+json,application/json,application/xml,text/xml", "User-Agent": "Tianxun-Disaster-Watch/0.1" },
+  const safeUrl = validateExternalFeedUrl(url);
+  const authorization = process.env.CMA_EVENT_FEED_AUTHORIZATION?.trim();
+  const response = await fetch(safeUrl, {
+    headers: { Accept: "application/geo+json,application/json,application/xml,text/xml", "User-Agent": "Tianxun-Disaster-Watch/0.1", ...(authorization ? { Authorization: authorization } : {}) },
     signal: AbortSignal.timeout(12_000),
+    redirect: "manual",
   });
   if (!response.ok) throw new Error(`${response.status} CMA`);
-  const body = await response.text();
-  if (/^\s*</.test(body)) return parseCapFeed(body, "中国气象数据网 CMA", url);
+  const body = await readLimitedText(response, 5_000_000, "CMA");
+  if (/^\s*</.test(body)) return parseCapFeed(body, "中国气象数据网 CMA", publicSourceUrl(url, "https://data.cma.cn/"));
   const data = JSON.parse(body) as { features?: Array<{ id?: string | number; geometry?: { type?: string; coordinates?: unknown }; properties?: Record<string, unknown> }> };
   const now = new Date().toISOString();
   return (data.features ?? []).flatMap((feature, index) => {
@@ -534,7 +643,7 @@ async function fetchUsgs(): Promise<DisasterEvent[]> {
 async function fetchEonet(): Promise<DisasterEvent[]> {
   const data = await fetchJson(endpoints.eonet) as {
     features: Array<{
-      id: string;
+      id?: string;
       geometry: { type: string; coordinates: unknown };
       properties: Record<string, unknown>;
     }>;
@@ -544,6 +653,8 @@ async function fetchEonet(): Promise<DisasterEvent[]> {
     const coords = pointFromGeometry(feature.geometry, geometryDates);
     if (!coords) return [];
     const p = feature.properties;
+    const sourceEventId = firstValidSourceEventId(p.id, feature.id);
+    if (!sourceEventId) return [];
     const categories = (p.categories as Array<{ id?: string; title?: string }> | undefined) ?? [];
     const hazard = eonetHazard(categories[0]?.id ?? categories[0]?.title ?? "");
     if (!hazard) return [];
@@ -551,7 +662,7 @@ async function fetchEonet(): Promise<DisasterEvent[]> {
     const magnitude = Number(p.magnitudeValue ?? 0) || undefined;
     const occurredAt = String(p.date ?? new Date().toISOString());
     return [baseEvent({
-      id: `eonet-${feature.id}`,
+      id: `eonet-${sourceEventId}`,
       title: String(p.title ?? categories[0]?.title ?? "自然灾害事件"),
       hazard,
       latitude: coords[1],
@@ -574,9 +685,10 @@ async function fetchGdacs(): Promise<DisasterEvent[]> {
   const response = await fetch(endpoints.gdacs, {
     headers: { "User-Agent": "Tianxun-Disaster-Watch/0.1" },
     signal: AbortSignal.timeout(8_000),
+    redirect: "manual",
   });
   if (!response.ok) throw new Error(`${response.status} GDACS`);
-  const xml = await response.text();
+  const xml = await readLimitedText(response, 5_000_000, "GDACS");
   return [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)].flatMap((match, index) => {
     const item = match[1];
     const typeCode = tag(item, "gdacs:eventtype");
@@ -610,9 +722,10 @@ async function fetchFirms(): Promise<DisasterEvent[]> {
   const response = await fetch(url, {
     headers: { "User-Agent": "Tianxun-Disaster-Watch/0.1" },
     signal: AbortSignal.timeout(15_000),
+    redirect: "manual",
   });
   if (!response.ok) throw new Error(`${response.status} FIRMS`);
-  const rows = parseCsv(await response.text());
+  const rows = parseCsv(await readLimitedText(response, 8_000_000, "FIRMS"));
   const cells = new Map<string, Array<Record<string, string>>>();
   rows.forEach((row) => {
     const latitude = Number(row.latitude);
@@ -647,7 +760,7 @@ async function fetchFirms(): Promise<DisasterEvent[]> {
         description: `同一0.25°网格聚合 ${detections.length} 个VIIRS近实时热异常（置信度 ${confidenceCode || "未知"}）；它不是已确认森林火灾，必须结合地表覆盖、常年热源和其他证据复核。`,
       });
       const detectionConfidence = Math.min(event.confidenceScore, confidence);
-      return { ...event, confidenceScore: detectionConfidence, confidenceLevel: confidenceLevel(detectionConfidence) };
+      return { ...event, confidenceScore: detectionConfidence, confidenceLevel: confidenceLevel(detectionConfidence), observable: "conditional" as const, dispatchEligibility: "review_required" as const, aoiApprovalRequired: true };
     });
 }
 
@@ -913,7 +1026,7 @@ async function fetchGeonetVolcanoes(): Promise<DisasterEvent[]> {
     signal: AbortSignal.timeout(12_000),
   });
   if (!response.ok) throw new Error(`${response.status} GeoNet`);
-  const data = await response.json() as { type?: string; features?: unknown[] };
+  const data = JSON.parse(await readLimitedText(response, 2_000_000, "GeoNet")) as { type?: string; features?: unknown[] };
   if (data.type !== "FeatureCollection" || !Array.isArray(data.features)) throw new Error("GeoNet 返回结构异常");
   // 该端点提供当前警戒状态，但不提供警戒开始/更新时间。这里仅验证数据可用性，
   // 不把响应时间伪造成灾害发生时间，也不生成卫星任务坐标。
@@ -926,7 +1039,7 @@ async function fetchSmithsonianVolcanoes(): Promise<DisasterEvent[]> {
     signal: AbortSignal.timeout(8_000),
   });
   if (!response.ok) throw new Error(`${response.status} Smithsonian GVP`);
-  await response.text();
+  await readLimitedText(response, 2_000_000, "Smithsonian GVP");
   return [];
 }
 
@@ -949,10 +1062,11 @@ async function fetchLhasa(): Promise<DisasterEvent[]> {
 async function fetchWmoCap(): Promise<DisasterEvent[]> {
   const url = process.env.WMO_CAP_FEED_URL;
   if (!url) return [];
-  const response = await fetch(url, { headers: { "User-Agent": "Tianxun-Disaster-Watch/0.1" }, signal: AbortSignal.timeout(10_000) });
+  const safeUrl = validateExternalFeedUrl(url);
+  const response = await fetch(safeUrl, { headers: { "User-Agent": "Tianxun-Disaster-Watch/0.1" }, signal: AbortSignal.timeout(10_000), redirect: "manual" });
   if (!response.ok) throw new Error(`${response.status} WMO CAP`);
-  const xml = await response.text();
-  return parseCapFeed(xml, "WMO SWIC/CAP", url);
+  const xml = await readLimitedText(response, 5_000_000, "WMO CAP");
+  return parseCapFeed(xml, "WMO SWIC/CAP", publicSourceUrl(url, "https://severeweather.wmo.int/feeds.html"));
 }
 
 async function fetchGlofas(): Promise<DisasterEvent[]> {
@@ -1043,7 +1157,7 @@ function baseEvent(input: Omit<DisasterEvent, "masterEventId" | "entityKey" | "l
     recommendedSensors: meta.sensors,
     scope: "global",
     priority: 0,
-    priorityBreakdown: { severity: 0, scope: 0, observability: 0, time: 0 },
+    priorityBreakdown: { severity: 0, scope: 0, observability: 0, time: 0, confidence: 0 },
     observationGoldenHours: 0,
     observationWindowHours: 0,
     observationReviewAt: input.updatedAt,
@@ -1054,14 +1168,14 @@ function baseEvent(input: Omit<DisasterEvent, "masterEventId" | "entityKey" | "l
 }
 
 function finalize(event: DisasterEvent): DisasterEvent {
-  const scope = classifyScope(event.latitude, event.longitude);
+  const scope = classifyScope(event.latitude, event.longitude, `${event.country ?? ""} ${event.title}`);
   const timeline = getObservationTimeline(
     event.occurredAt,
     event.activityAt,
     event.hazard,
     event.severity,
   );
-  const priority = calculatePriority(event.severity, scope, event.hazard, event.activityAt, event.observable);
+  const priority = calculatePriority(event.severity, scope, event.hazard, event.activityAt, event.observable, event.confidenceScore);
   return {
     ...event,
     scope,
@@ -1071,6 +1185,7 @@ function finalize(event: DisasterEvent): DisasterEvent {
       scope: priority.scope,
       observability: priority.observability,
       time: priority.time,
+      confidence: priority.confidence,
     },
     observationGoldenHours: timeline.goldenHours,
     observationWindowHours: timeline.followupHours,
@@ -1096,7 +1211,7 @@ function canonicalizeEvents(events: DisasterEvent[]) {
     const primary = [...candidates].sort((a, b) => eventAuthority(b) - eventAuthority(a) || +new Date(b.updatedAt) - +new Date(a.updatedAt))[0];
     const evidence = [...new Map(candidates.flatMap((event) => event.evidence)
       .sort((a, b) => +new Date(b.observedAt) - +new Date(a.observedAt))
-      .map((item) => [sourceFamily(item.source), item])).values()];
+      .map((item) => [`${sourceFamily(item.source)}|${item.sourceEventId}`, item])).values()];
     const updateHistory = [...new Map(candidates.flatMap((event) => event.updateHistory?.length ? event.updateHistory : event.evidence.map((item) => ({
       ...item,
       title: event.title,
@@ -1107,7 +1222,9 @@ function canonicalizeEvents(events: DisasterEvent[]) {
     const location = [...candidates].sort((a, b) => locationRank(b.locationQuality) - locationRank(a.locationQuality) || a.locationAccuracyKm - b.locationAccuracyKm)[0];
     const cycloneForecast = candidates.flatMap((event) => event.cycloneForecast ? [event.cycloneForecast] : [])
       .sort((a, b) => +new Date(b.issuedAt) - +new Date(a.issuedAt) || b.track.length - a.track.length)[0];
-    const confidenceScore = Math.min(99, primary.confidenceScore + Math.min(18, (evidence.length - 1) * 6));
+    const independentEvidenceCount = new Set(evidence.filter((item) => sourceTrust(item.source) >= 85).map((item) => sourceFamily(item.source))).size;
+    const confidenceScore = Math.min(99, primary.confidenceScore + Math.min(18, Math.max(0, independentEvidenceCount - 1) * 6));
+    const strongestSeverity = [...candidates].sort((a, b) => severityRank(b.severity) - severityRank(a.severity) || +new Date(b.updatedAt) - +new Date(a.updatedAt))[0];
     const entityKey = candidates.map((event) => event.entityKey || processEntityKey(event)).sort((a, b) => entityKeySpecificity(b) - entityKeySpecificity(a))[0];
     return {
       ...primary,
@@ -1116,6 +1233,8 @@ function canonicalizeEvents(events: DisasterEvent[]) {
       entityKey,
       evidence,
       evidenceCount: evidence.length,
+      severity: strongestSeverity.severity,
+      sourceSeverity: strongestSeverity.sourceSeverity,
       updateHistory,
       updateCount: updateHistory.length,
       confidenceScore,
@@ -1136,6 +1255,10 @@ function canonicalizeEvents(events: DisasterEvent[]) {
   });
 }
 
+function severityRank(value: DisasterEvent["severity"]) {
+  return { blue: 1, yellow: 2, orange: 3, red: 4 }[value];
+}
+
 const mergePolicy: Record<HazardType, { hours: number; kilometers: number }> = {
   earthquake: { hours: 0.5, kilometers: 12 },
   tsunami: { hours: 12, kilometers: 100 },
@@ -1150,16 +1273,28 @@ const mergePolicy: Record<HazardType, { hours: number; kilometers: number }> = {
 };
 
 function isSamePhysicalEvent(a: DisasterEvent, b: DisasterEvent) {
-  if (a.id === b.id) return true;
   if (a.hazard !== b.hazard) return false;
+  if (a.id === b.id && isValidSourceEventId(a.id)) return true;
   const entityA = a.entityKey || processEntityKey(a);
   const entityB = b.entityKey || processEntityKey(b);
   if (sameNamedProcess(entityA, entityB)) return true;
+  // Bulletins from the same flood process often change their title as the
+  // situation develops (for example, "No. 1 flood" -> "basin-wide flood").
+  // Join them before the same-source stable-id guard, but only inside a narrow
+  // spatiotemporal window so unrelated annual floods cannot be collapsed.
+  if (a.hazard === "flood" && sameFloodRegion(entityA, entityB)) {
+    const floodTimeDifference = Math.abs(+new Date(a.occurredAt) - +new Date(b.occurredAt)) / 3_600_000;
+    if (floodTimeDifference <= 14 * 24 && distanceKm(a.latitude, a.longitude, b.latitude, b.longitude) <= mergePolicy.flood.kilometers) return true;
+  }
   if (sourceFamily(a.source) === sourceFamily(b.source)) {
     const stableA = stablePrimaryId(a.id);
     const stableB = stablePrimaryId(b.id);
     if (stableA === a.id || stableB === b.id || stableA !== stableB) return false;
   }
+  // Floods in adjacent rivers can start on the same day and be closer than a
+  // coarse AOI accuracy radius. Spatial proximity alone is not an identity
+  // signal; require the regional/process identity above.
+  if (a.hazard === "flood") return false;
   const policy = mergePolicy[a.hazard];
   const timeDifference = Math.abs(+new Date(a.occurredAt) - +new Date(b.occurredAt)) / 3_600_000;
   return timeDifference <= policy.hours && distanceKm(a.latitude, a.longitude, b.latitude, b.longitude) <= policy.kilometers;
@@ -1220,16 +1355,16 @@ function processEntityKey(event: Pick<DisasterEvent, "hazard" | "title" | "sourc
   const year = new Date(event.occurredAt).getUTCFullYear();
   const title = normalizeEntityText(event.title);
   if (event.hazard === "cyclone") {
+    const nhcIdentifier = event.id.match(/^nhc-([a-z]{2})(\d{2})(\d{4})(?:-|$)/i);
+    if (nhcIdentifier) return `cyclone:${Number(nhcIdentifier[3])}:${nhcIdentifier[1].toLowerCase()}:${Number(nhcIdentifier[2])}`;
     const numbered = event.title.match(/第\s*0?(\d{1,2})\s*号台风\s*[“"'‘]?([^”"'’\s（(，。]{2,20})?/i);
-    if (numbered) return `cyclone:${year}:wp:${Number(numbered[1])}${numbered[2] ? `:${normalizeEntityText(numbered[2])}` : ""}`;
-    const international = event.title.match(/(?:tropical\s+cyclone|typhoon|hurricane)\s+[“"']?([a-z][a-z-]{2,})(?:-(\d{2,4}))?/i);
-    if (international) return `cyclone:${international[2] ? normalizeYear(international[2], year) : year}:name:${normalizeEntityText(international[1])}`;
+    if (numbered) return `cyclone:${year}:wp:${Number(numbered[1])}${numbered[2] ? `:${cycloneNameAlias(numbered[2])}` : ""}`;
+    const international = event.title.match(/(?:tropical\s+(?:cyclone|storm|depression)|typhoon|hurricane|\bTS|\bTD|\bTC|\bPC)\s+[“"']?([a-z][a-z-]{2,}?)(?:-(\d{2,4}))?(?:\s|$)/i);
+    if (international) return `cyclone:${international[2] ? normalizeYear(international[2], year) : year}:name:${cycloneNameAlias(international[1])}`;
   }
   if (event.hazard === "flood") {
-    const numberedFlood = event.title.match(/(.{0,20}?)(\d{4})年第\s*(\d+)\s*号洪水/);
-    if (numberedFlood) return `flood:${numberedFlood[2]}:${normalizeEntityText(numberedFlood[1] || event.country || "region")}:${Number(numberedFlood[3])}`;
-    const warningTarget = event.title.match(/([^，。；]{2,30}?)洪水(?:红色|橙色|黄色|蓝色)?预警/);
-    if (warningTarget) return `flood:${year}:${Math.floor(+new Date(event.occurredAt) / (14 * 86_400_000))}:${normalizeEntityText(warningTarget[1])}`;
+    const floodKey = floodProcessEntityKey(event);
+    if (floodKey) return floodKey;
   }
   if (event.hazard === "volcano") {
     const volcano = event.title.match(/^(.{2,50}?)(?:活动等级升高|火山|\s+volcanic|\s+eruption)/i);
@@ -1241,6 +1376,11 @@ function processEntityKey(event: Pick<DisasterEvent, "hazard" | "title" | "sourc
 
 function normalizeEntityText(value: string) {
   return value.toLowerCase().normalize("NFKC").replace(/[“”‘’"'`]/g, "").replace(/[\s·_—–-]+/g, "-").replace(/[^\p{L}\p{N}-]+/gu, "").replace(/^-|-$/g, "").slice(0, 80);
+}
+
+function cycloneNameAlias(value: string) {
+  const normalized = normalizeEntityText(value);
+  return ({ "白海豚": "dolphin", "dolphin-26": "dolphin" } as Record<string, string>)[normalized] ?? normalized;
 }
 
 function normalizeYear(value: string, fallback: number) {
@@ -1326,8 +1466,33 @@ function coordinatePair(value: unknown): [number, number] | null {
 }
 
 function sanitizeGeometry(geometry: { type: string; coordinates: unknown }): DisasterEvent["geometry"] {
-  const type = ["Point", "LineString", "Polygon", "MultiPolygon"].includes(geometry.type) ? geometry.type as DisasterEvent["geometryType"] : "Point";
-  return { type, coordinates: geometry.coordinates };
+  let vertices = 0;
+  const pair = (value: unknown): [number, number] => {
+    const parsed = coordinatePair(value);
+    if (!parsed || ++vertices > 10_000) throw new Error("几何坐标无效或顶点超过上限");
+    return parsed;
+  };
+  const line = (value: unknown, closed = false) => {
+    if (!Array.isArray(value) || value.length < (closed ? 3 : 2) || value.length > 10_000) throw new Error("几何线环结构无效");
+    const coordinates = value.map(pair);
+    if (closed && (coordinates[0][0] !== coordinates.at(-1)?.[0] || coordinates[0][1] !== coordinates.at(-1)?.[1])) coordinates.push([...coordinates[0]]);
+    if (closed && coordinates.length < 4) throw new Error("多边形环顶点不足");
+    return coordinates;
+  };
+  if (geometry.type === "Point") return { type: "Point", coordinates: pair(geometry.coordinates) };
+  if (geometry.type === "LineString") return { type: "LineString", coordinates: line(geometry.coordinates) };
+  if (geometry.type === "Polygon") {
+    if (!Array.isArray(geometry.coordinates) || !geometry.coordinates.length || geometry.coordinates.length > 100) throw new Error("多边形结构无效");
+    return { type: "Polygon", coordinates: geometry.coordinates.map((ring) => line(ring, true)) };
+  }
+  if (geometry.type === "MultiPolygon") {
+    if (!Array.isArray(geometry.coordinates) || !geometry.coordinates.length || geometry.coordinates.length > 100) throw new Error("复合多边形结构无效");
+    return { type: "MultiPolygon", coordinates: geometry.coordinates.map((polygon) => {
+      if (!Array.isArray(polygon) || !polygon.length || polygon.length > 100) throw new Error("复合多边形结构无效");
+      return polygon.map((ring) => line(ring, true));
+    }) };
+  }
+  throw new Error("不支持的几何类型");
 }
 
 function pointOnGeometry(geometry: DisasterEvent["geometry"]): [number, number] | null {

@@ -105,6 +105,7 @@ export type DisasterEvent = {
     scope: number;
     observability: number;
     time: number;
+    confidence: number;
   };
   observationGoldenHours: number;
   observationWindowHours: number;
@@ -184,10 +185,14 @@ export const hazardMeta: Record<
   ice: { label: "冰雪", symbol: "冰", targets: ["海冰", "冰湖", "雪崩堆积"], sensors: ["SAR", "多光谱"], observable: "direct" },
 };
 
-export function classifyScope(latitude: number, longitude: number): ScopeId {
-  if (inside(latitude, longitude, scopes.wuxi.bbox)) return "wuxi";
-  if (inside(latitude, longitude, scopes.jiangsu.bbox)) return "jiangsu";
-  if (inside(latitude, longitude, scopes.china.bbox)) return "china";
+export function classifyScope(latitude: number, longitude: number, locationText = ""): ScopeId {
+  const location = locationText.toLowerCase();
+  const inWuxi = /无锡|wuxi|太湖|taihu/.test(location);
+  const inJiangsu = inWuxi || /江苏|jiangsu|南京|nanjing|苏州|suzhou|常州|changzhou|南通|nantong|扬州|yangzhou|镇江|zhenjiang|泰州|taizhou|盐城|yancheng|淮安|huai'an|huaian|宿迁|suqian|徐州|xuzhou|连云港|lianyungang/.test(location);
+  const inChina = inJiangsu || /中国|china|北京|天津|上海|重庆|河北|山西|辽宁|吉林|黑龙江|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|海南|四川|贵州|云南|陕西|甘肃|青海|台湾|内蒙古|广西|西藏|宁夏|新疆|香港|澳门/.test(location);
+  if (inWuxi && inside(latitude, longitude, scopes.wuxi.bbox)) return "wuxi";
+  if (inJiangsu && inside(latitude, longitude, scopes.jiangsu.bbox)) return "jiangsu";
+  if (inChina && inside(latitude, longitude, scopes.china.bbox)) return "china";
   return "global";
 }
 
@@ -230,15 +235,18 @@ export function calculatePriority(
   hazard: HazardType,
   occurredAt: string,
   observable: DisasterEvent["observable"] = hazardMeta[hazard].observable,
+  confidenceScore = 100,
 ) {
   const severityScore = { red: 35, orange: 30, yellow: 24, blue: 18 }[severity];
   const timeScore = calculateTimeScore(occurredAt);
   const observability = observable === "direct" ? 10 : observable === "consequence" ? 8 : 6;
+  const confidence = confidenceScore >= 85 ? 0 : confidenceScore >= 70 ? -8 : -20;
   const breakdown = {
     severity: severityScore,
     scope: scopes[scope].weight,
     observability,
     time: timeScore,
+    confidence,
   };
   return {
     total: Math.min(100, Object.values(breakdown).reduce((sum, value) => sum + value, 0)),

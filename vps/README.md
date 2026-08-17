@@ -55,12 +55,14 @@ sudo bash vps/scripts/install.sh
 
 安装脚本会：
 
-- 创建不可登录的 `tianxun` 系统用户；
+- 创建相互隔离、不可登录的 `tianxun-engine` 与 `tianxun-notifier` 系统用户；
 - 将带时间戳的发行版安装到 `/opt/tianxun/releases/`；
 - 构建生产包，原子切换 `/opt/tianxun/current`；
 - 创建 `/etc/tianxun/*.env`，权限为 `0640 root:tianxun`；
 - 启用后台引擎和五分钟通知定时器；
 - 不修改 UFW，不开放 3000/8644 端口。
+
+安装器会生成 64 位十六进制 API 令牌，并同步写入引擎和通知器的受限环境文件，不会把令牌打印到终端。已有强令牌会保留，示例占位值不会被当作有效凭据。
 
 ## 3. 填写数据源和通知策略
 
@@ -79,6 +81,7 @@ sudo systemctl restart tianxun-engine
 - 独立证据增加、定位质量改善、AOI 达到可规划条件；
 - 台风中心移动超过 150 km；
 - 连续三次采集失败的数据源及恢复通知。
+- 权威撤销、事件身份隔离以及由此自动取消的卫星任务。
 
 同一台风的日常报文只更新主事件，不重复推送；只有重要变化才通知。
 
@@ -100,6 +103,9 @@ bash /opt/tianxun/current/vps/scripts/configure-hermes.sh
 脚本会生成强随机 HMAC 密钥并创建 `tianxun-alerts` 路由。把输出的
 `HERMES_WEBHOOK_SECRET=...` 写入 `/etc/tianxun/notifier.env`。该路由使用
 `deliver_only`：不唤醒模型、不消耗 token，直接向飞书 home channel 投递。
+通知器使用 Hermes 推荐的 Generic V2 签名：`X-Webhook-Signature-V2` 为
+`HMAC-SHA256(timestamp.body)`，并发送 `X-Webhook-Timestamp` 与稳定的
+`X-Request-ID`，同时获得五分钟重放窗口和批次幂等保护。
 
 如果 Hermes 已使用用户级服务，应让 `tianxun-notifier.service` 的 `After=` 与实际
 服务名保持一致；即使没有该依赖，通知器也会把失败投递留在 SQLite 中指数退避重试。
@@ -138,3 +144,7 @@ sudo bash /opt/tianxun/current/vps/scripts/backup.sh
 - 建议保留现有 1 GB swap，并至少留出 8 GB 可用磁盘。
 
 此版本没有把后台 API 暴露给本地网页。将来如需让本地前端访问 VPS，应另行增加 HTTPS、认证、只读 API 和防火墙规则，不能直接开放 3000 端口。
+
+## 安全换钥
+
+任何曾出现在聊天、截图、Shell 历史或工单里的 VPS 密码、FIRMS key、飞书密钥和 Webhook 密钥都应视为已经泄露并立即轮换。VPS 应改用 SSH key，禁用 root 密码登录；应用密钥只保存在 `/etc/tianxun/*.env`，不要写入仓库或 URL。轮换 `TIANXUN_API_TOKEN` 时必须同时更新 `engine.env` 与 `notifier.env` 后重启两个服务。

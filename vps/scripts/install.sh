@@ -31,7 +31,7 @@ if [[ -z "$node_major" || "$node_major" -lt 22 || ( "$node_major" -eq 22 && "${n
   exit 1
 fi
 
-for required_command in sqlite3 curl; do
+for required_command in sqlite3 curl openssl; do
   if ! command -v "$required_command" >/dev/null 2>&1; then
     echo "Missing required command: $required_command" >&2
     exit 1
@@ -73,6 +73,12 @@ fi
 if [[ ! -f /etc/tianxun/notifier.env ]]; then
   install -o root -g tianxun-notifier -m 0640 "$release_dir/vps/notifier.env.example" /etc/tianxun/notifier.env
 fi
+engine_token="$(sed -n 's/^TIANXUN_API_TOKEN=//p' /etc/tianxun/engine.env | head -n1)"
+if [[ ! "$engine_token" =~ ^[a-fA-F0-9]{64}$ ]]; then
+  engine_token="$(openssl rand -hex 32)"
+fi
+sed -i -E "s|^TIANXUN_API_TOKEN=.*$|TIANXUN_API_TOKEN=$engine_token|" /etc/tianxun/engine.env
+sed -i -E "s|^TIANXUN_API_TOKEN=.*$|TIANXUN_API_TOKEN=$engine_token|" /etc/tianxun/notifier.env
 chown root:tianxun-engine /etc/tianxun/engine.env
 chmod 0640 /etc/tianxun/engine.env
 chown root:tianxun-notifier /etc/tianxun/notifier.env
@@ -103,6 +109,13 @@ if [[ "$engine_ready" != true ]]; then
   fi
   exit 1
 fi
+mapfile -t old_releases < <(find "$install_root/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -nr | tail -n +4 | cut -d' ' -f2-)
+for old_release in "${old_releases[@]}"; do
+  case "$old_release" in
+    /opt/tianxun/releases/*) rm -rf -- "$old_release" ;;
+    *) echo "Skipping unsafe release cleanup target: $old_release" >&2 ;;
+  esac
+done
 systemctl enable tianxun-notifier.timer
 systemctl enable --now tianxun-backup.timer
 
@@ -110,7 +123,7 @@ echo
 echo "Tianxun backend installed at $release_dir."
 echo "Before the first alert test:"
 echo "  1. Fill /etc/tianxun/engine.env and /etc/tianxun/notifier.env."
-echo "     Use the same random TIANXUN_API_TOKEN in both files."
+echo "     A shared random TIANXUN_API_TOKEN was generated without printing it."
 echo "  2. Configure Hermes Feishu/Webhooks and create the tianxun-alerts route."
 echo "  3. Run: systemctl restart tianxun-engine.service"
 echo "  4. Run: systemctl start tianxun-notifier.service"

@@ -52,7 +52,10 @@ CREATE TABLE `satellite_tasks` (
 	`aoi_approval` text NOT NULL,
 	`payload_json` text NOT NULL,
 	`created_at` text NOT NULL,
-	`updated_at` text NOT NULL
+	`updated_at` text NOT NULL,
+	`revision` integer DEFAULT 1 NOT NULL,
+	`event_revision` text DEFAULT '' NOT NULL,
+	`aoi_hash` text DEFAULT '' NOT NULL
 );
 --> statement-breakpoint
 CREATE INDEX `satellite_tasks_status_priority_idx` ON `satellite_tasks` (`status`,`priority`);
@@ -81,3 +84,29 @@ CREATE TABLE `event_tombstones` (
 	`resolved_at` text NOT NULL,
 	PRIMARY KEY(`source`,`source_event_id`)
 );
+--> statement-breakpoint
+CREATE TABLE `event_source_claims` (
+	`source` text NOT NULL,
+	`source_event_id` text NOT NULL,
+	`master_event_id` text NOT NULL,
+	`hazard` text NOT NULL,
+	`claimed_at` text NOT NULL,
+	PRIMARY KEY(`source`,`source_event_id`)
+);
+--> statement-breakpoint
+CREATE TABLE `event_quarantine` (
+	`master_event_id` text PRIMARY KEY NOT NULL,
+	`reason` text NOT NULL,
+	`payload_json` text NOT NULL,
+	`quarantined_at` text NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE `operational_changes` (
+	`id` text PRIMARY KEY NOT NULL,
+	`change_type` text NOT NULL,
+	`master_event_id` text NOT NULL,
+	`payload_json` text NOT NULL,
+	`created_at` text NOT NULL
+);
+--> statement-breakpoint
+CREATE INDEX `operational_changes_created_idx` ON `operational_changes` (`created_at`,`id`);

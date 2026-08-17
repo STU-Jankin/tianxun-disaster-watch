@@ -12,6 +12,7 @@ import {
 } from "../lib/disasters";
 import { allowedTaskStatuses, safeHttpUrl, validateSatelliteTask } from "../lib/task-contract";
 import { buildTaskAoi } from "../lib/task-aoi";
+import { aoiFingerprint, eventRevisionFingerprint } from "../lib/event-integrity";
 
 type ApiResponse = {
   events: DisasterEvent[];
@@ -24,13 +25,16 @@ type ApiResponse = {
   retainedCount: number;
   selectionPolicy: { limit: number; reservedPerHazard: number; wildfireCap: number; perSourceCap: number };
   windowPolicyVersion: string;
+  persistenceAvailable?: boolean;
+  lastSuccessfulFetchAt?: string | null;
+  producingSourceCount?: number;
 };
 
 const scopeOrder: ScopeId[] = ["wuxi", "jiangsu", "china", "global"];
 const severityLabels = { red: "红色", orange: "橙色", yellow: "黄色", blue: "蓝色" };
 const locationQualityLabels: Record<DisasterEvent["locationQuality"], string> = { precise: "精确点位", estimated: "估算点位", representative: "区域代表点", unknown: "位置待核验" };
 const confidenceLabels: Record<DisasterEvent["confidenceLevel"], string> = { high: "高可信", medium: "中可信", low: "低可信" };
-type SortMode = "priority" | "recent";
+type SortMode = "priority" | "occurred" | "updated";
 type ExportFormat = "json" | "csv" | "geojson";
 type SourceStatus = {
   name: string;
@@ -88,6 +92,10 @@ type SatelliteTask = {
   createdAt: string;
   updatedAt: string;
   status: "candidate" | "reviewed" | "scheduled" | "submitted" | "acquired" | "completed" | "failed" | "cancelled";
+  revision: number;
+  eventRevision: string;
+  aoiHash: string;
+  approvalReason?: string;
 };
 
 type TaskSyncState = { state: "saving" | "synced" | "local" | "error"; message?: string };
@@ -152,7 +160,9 @@ export function Dashboard() {
   const [clock, setClock] = useState(() => Date.now());
   const taskTriggerRef = useRef<HTMLButtonElement>(null);
   const previousTaskPanelOpen = useRef(false);
-  const closeTaskPanel = useCallback(() => setTaskPanelOpen(false), []);
+  const taskSaveTimers = useRef(new Map<string, number>());
+  const tasksRef = useRef<SatelliteTask[]>([]);
+  const closeTaskPanel = useCallback(() => { setTaskPanelOpen(false); setActiveTaskId(null); }, []);
   const selectEvent = useCallback((event: DisasterEvent) => {
     setSelected(event);
     if (window.matchMedia("(max-width: 720px)").matches) setListOpen(false);
@@ -182,6 +192,9 @@ export function Dashboard() {
       window.clearInterval(timer);
     };
   }, [refresh]);
+
+  useEffect(() => { tasksRef.current = tasks; }, [tasks]);
+  useEffect(() => () => { taskSaveTimers.current.forEach((timer) => window.clearTimeout(timer)); }, []);
 
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 30_000);
@@ -229,8 +242,12 @@ export function Dashboard() {
     setTaskSync((current) => ({ ...current, [task.taskId]: { state: "saving" } }));
     try {
       const response = await fetch("/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(task) });
-      const result = await response.json() as { error?: string; errors?: string[] };
+      const result = await response.json() as { task?: Partial<SatelliteTask>; error?: string; errors?: string[] };
       if (!response.ok) throw new Error(result.errors?.join("；") || result.error || "保存失败");
+      if (result.task) {
+        const serverTask = migrateSatelliteTask(result.task);
+        setTasks((current) => current.map((item) => item.taskId !== task.taskId ? item : item.updatedAt === task.updatedAt ? serverTask : { ...item, revision: serverTask.revision, eventRevision: serverTask.eventRevision, aoiHash: serverTask.aoiHash }));
+      }
       setTaskSync((current) => ({ ...current, [task.taskId]: { state: "synced" } }));
       return true;
     } catch (saveError) {
@@ -253,23 +270,19 @@ export function Dashboard() {
   }, [saveTask]);
 
   const updateTask = useCallback((taskId: string, patch: Partial<SatelliteTask>) => {
-    let previousTask: SatelliteTask | null = null;
-    let pendingTask: SatelliteTask | null = null;
+    const aoiKeys = ["aoiType", "aoiRadiusKm", "aoiWidthKm", "aoiHeightKm", "aoiLengthKm", "aoiBearingDeg"];
+    const touchesAoi = Object.keys(patch).some((key) => aoiKeys.includes(key));
     setTasks((current) => current.map((task) => {
       if (task.taskId !== taskId) return task;
-      previousTask = task;
-      const updated = { ...task, ...patch, updatedAt: new Date().toISOString() };
-      pendingTask = updated;
-      return updated;
+      return { ...task, ...patch, ...(touchesAoi ? { aoiApproval: "operator_confirmed" as const, approvalReason: "操作员调整 AOI 参数" } : {}), updatedAt: new Date().toISOString() };
     }));
-    window.setTimeout(() => {
-      if (!pendingTask || !previousTask) return;
-      const attempted = pendingTask;
-      const previous = previousTask;
-      void saveTask(attempted).then((ok) => {
-        if (!ok) setTasks((current) => current.map((task) => task.taskId === taskId && task.updatedAt === attempted.updatedAt ? previous : task));
-      });
-    }, 0);
+    const priorTimer = taskSaveTimers.current.get(taskId);
+    if (priorTimer) window.clearTimeout(priorTimer);
+    taskSaveTimers.current.set(taskId, window.setTimeout(() => {
+      taskSaveTimers.current.delete(taskId);
+      const pending = tasksRef.current.find((task) => task.taskId === taskId);
+      if (pending) void saveTask(pending);
+    }, 700));
   }, [saveTask]);
 
   const removeTask = useCallback(async (taskId: string) => {
@@ -286,7 +299,7 @@ export function Dashboard() {
   }, [tasks]);
 
   useEffect(() => {
-    if (!selected || locationState[selected.id]?.state === "resolved" || locationState[selected.id]?.state === "fallback") return;
+    if (!selected || ["resolved", "fallback", "error"].includes(locationState[selected.id]?.state ?? "")) return;
     const controller = new AbortController();
     const eventId = selected.id;
     const params = new URLSearchParams({
@@ -313,20 +326,28 @@ export function Dashboard() {
   }, [locationRetry, locationState, selected]);
 
   useEffect(() => {
+    if (!selected || !data) return;
+    const current = data.events.find((event) => event.masterEventId === selected.masterEventId) ?? data.events.find((event) => event.id === selected.id);
+    if (!current) setSelected(null);
+    else if (current !== selected) setSelected(current);
+  }, [data, selected]);
+
+  useEffect(() => {
     if (!selected) return;
     document.querySelector(`[data-event-id="${CSS.escape(selected.id)}"]`)?.scrollIntoView({ block: "nearest" });
   }, [selected]);
 
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    return (data?.events ?? [])
+    return [...new Map((data?.events ?? []).map((event) => [event.masterEventId, event])).values()]
     .filter((event) =>
         isVisibleInScope(event.scope, scope) &&
         (hazard === "all" || event.hazard === hazard) &&
         (!needle || `${event.title} ${event.country ?? ""} ${event.source} ${locationZh[event.id] ?? ""}`.toLowerCase().includes(needle)),
       )
-      .sort((a, b) => sortMode === "recent"
-        ? +new Date(b.updatedAt) - +new Date(a.updatedAt) || b.priority - a.priority
+      .sort((a, b) => sortMode === "occurred"
+        ? +new Date(b.occurredAt) - +new Date(a.occurredAt) || b.priority - a.priority
+        : sortMode === "updated" ? +new Date(b.updatedAt) - +new Date(a.updatedAt) || b.priority - a.priority
         : b.priority - a.priority || +new Date(b.updatedAt) - +new Date(a.updatedAt));
   }, [data, hazard, locationZh, query, scope, sortMode]);
 
@@ -343,6 +364,9 @@ export function Dashboard() {
 
   const severeCount = filtered.filter((e) => e.severity === "red" || e.severity === "orange").length;
   const highPriorityCount = filtered.filter((e) => e.priority >= 70).length;
+  const producingSourceCount = data?.producingSourceCount ?? data?.sourceStatus.filter((source) => source.producing).length ?? 0;
+  const runtimeMode = !data ? "正在连接" : data.fallback && data.retainedCount > 0 ? "缓存模式" : data.fallback ? "演示模式" : producingSourceCount === 0 ? "无事件产出" : data.persistenceAvailable === false ? "数据库降级" : "实时监测中";
+  const modeStale = runtimeMode !== "实时监测中" || Boolean(lastRefreshErrorAt);
 
   return (
     <main className="app-shell">
@@ -352,8 +376,8 @@ export function Dashboard() {
           <div><strong>天巡</strong><small>TIANXUN DISASTER WATCH</small></div>
         </div>
         <div className="live-summary">
-          <span className={`live-dot ${lastRefreshErrorAt ? "stale" : ""}`} />
-          <div><strong>{data?.fallback ? "演示模式" : lastRefreshErrorAt ? "数据更新异常" : "实时监测中"}</strong><small>{lastRefreshErrorAt ? `保留上次数据 · ${formatTimeWithYear(lastRefreshErrorAt)} 刷新失败` : data ? `${data.events.length} 个全球事件已入库` : "正在建立数据连接"}</small></div>
+          <span className={`live-dot ${modeStale ? "stale" : ""}`} />
+          <div><strong>{lastRefreshErrorAt ? "数据更新异常" : runtimeMode}</strong><small>{lastRefreshErrorAt ? `保留上次数据 · ${formatTimeWithYear(lastRefreshErrorAt)} 刷新失败` : data ? `${producingSourceCount} 个产出源 · ${data.events.length} 个事件` : "正在建立数据连接"}</small></div>
         </div>
         <div className="top-actions">
           <label className="search-box">
@@ -383,7 +407,7 @@ export function Dashboard() {
       <section className={`workspace ${taskPanelOpen ? "tasks-open" : ""}`}>
         <aside className={`event-panel ${listOpen ? "open" : "closed"}`} inert={taskPanelOpen ? true : undefined} aria-hidden={taskPanelOpen || undefined}>
           <div className="panel-heading">
-            <div><p>{scopes[scope].label} · 实时事件</p><h1>{filtered.length}<span> 个可观测事件</span></h1></div>
+            <div><p>{scopes[scope].label} · {runtimeMode}</p><h1>{filtered.length}<span> 个可观测事件</span></h1></div>
             <button onClick={() => setListOpen(false)} aria-label="收起列表">‹</button>
           </div>
           <div className="metrics-row">
@@ -393,27 +417,27 @@ export function Dashboard() {
             <div><span>时效剔除</span><strong>{data?.expiredCount ?? 0}</strong><small>已自动归档</small></div>
           </div>
           {data?.retainedCount ? <div className="retained-banner"><strong>{data.retainedCount}</strong> 个主事件当前未在短时源中复现，仍按既定观测期持续监测。</div> : null}
-          {lastRefreshErrorAt ? <div className="stale-banner" role="alert">数据刷新失败，当前保留上次成功结果 · {formatTimeWithYear(lastRefreshErrorAt)} UTC+08</div> : null}
+          {modeStale ? <div className="stale-banner" role="alert">当前为{lastRefreshErrorAt ? "刷新失败后的保留结果" : runtimeMode}；不得将本轮读取时间当作灾害观测时间，自动下发已禁止。</div> : null}
           <HazardFilters selected={hazard} onChange={setHazard} events={scopedEvents} />
           <SortControl selected={sortMode} onChange={setSortMode} />
           <ObservationPolicy />
           <div className="event-list">
             {loading && !data ? <LoadingList /> : null}
             {error && !data ? <EmptyState title="暂时无法连接数据源" detail="请检查网络后点击右上角刷新。" /> : null}
-            {!loading && filtered.length === 0 ? <EmptyState title={`${scopes[scope].label}暂无匹配事件`} detail="这通常是好消息。系统仍在持续监听新事件。" /> : null}
+            {!loading && filtered.length === 0 ? <EmptyState title={`${scopes[scope].label}暂无匹配事件`} detail={query || hazard !== "all" ? "当前搜索或筛选没有匹配结果，请清除搜索或重置灾种。" : modeStale ? "当前数据源未产出可用实时事件，请检查数据源状态。" : "当前范围没有满足条件的可观测事件。"} /> : null}
             {filtered.map((event) => (
               <EventCard key={event.id} event={event} active={selected?.id === event.id} onClick={() => selectEvent(event)} />
             ))}
           </div>
           <footer className="panel-footer">
             <span className={loading ? "syncing" : ""}>↻</span>
-            {loading ? "正在同步…" : data ? `${relativeTime(data.fetchedAt)}同步 · 实时${data.processedCount}条 + 延续${data.retainedCount}条，经配额筛为${data.events.length}条 · 每5分钟更新` : "等待同步"}
+            {loading ? "正在同步…" : data ? `本轮读取 ${formatTimeWithYear(data.fetchedAt)} UTC+08 · 实时${data.processedCount}条 + 延续${data.retainedCount}条 · ${producingSourceCount}个来源产出` : "等待同步"}
           </footer>
         </aside>
 
         {!listOpen && <button className="reopen-panel" onClick={() => setListOpen(true)} inert={taskPanelOpen ? true : undefined} aria-hidden={taskPanelOpen || undefined}>事件列表 <b>{filtered.length}</b> ›</button>}
 
-          <MapView scope={scope} events={filtered} selected={selected} activeTask={tasks.find((task) => task.taskId === activeTaskId) ?? null} layoutKey={`${taskPanelOpen}-${listOpen}`} obscured={taskPanelOpen} onSelect={selectEvent} />
+          <MapView scope={scope} events={filtered} selected={selected} activeTask={tasks.find((task) => task.taskId === activeTaskId) ?? null} detailOpen={Boolean(selected) && !taskPanelOpen} layoutKey={`${taskPanelOpen}-${listOpen}`} obscured={taskPanelOpen} onSelect={selectEvent} />
 
         <div className="map-legend" inert={taskPanelOpen ? true : undefined} aria-hidden={taskPanelOpen || undefined}>
           <span><i className="red" />红色</span><span><i className="orange" />橙色</span><span><i className="yellow" />黄色</span><span><i className="blue" />蓝色</span>
@@ -422,7 +446,7 @@ export function Dashboard() {
           {selected?.cycloneForecast ? <><em /><span><i className="forecast-track-key" />官方路径</span><span><i className="forecast-impact-key" />风圈范围</span><span><i className="forecast-uncertainty-key" />路径不确定区</span></> : null}
         </div>
 
-        {selected && <DetailPanel event={selected} obscured={taskPanelOpen} locationZh={locationZh[selected.id]} locationLoading={locationLoading === selected.id} locationState={locationState[selected.id]?.state} onRetryLocation={() => { setLocationState((current) => { const next = { ...current }; delete next[selected.id]; return next; }); setLocationRetry((value) => value + 1); }} taskAdded={tasks.some((task) => taskMatchesEvent(task, selected))} aoiConfirmed={confirmedAois.has(selected.masterEventId)} onConfirmAoi={(confirmed) => setConfirmedAois((current) => { const next = new Set(current); if (confirmed) next.add(selected.masterEventId); else next.delete(selected.masterEventId); return next; })} onAddTask={addTask} onClose={() => setSelected(null)} />}
+        {selected && <DetailPanel event={selected} obscured={taskPanelOpen} dispatchBlocked={modeStale} locationZh={locationZh[selected.id]} locationLoading={locationLoading === selected.id} locationState={locationState[selected.id]?.state} onRetryLocation={() => { setLocationState((current) => { const next = { ...current }; delete next[selected.id]; return next; }); setLocationRetry((value) => value + 1); }} taskAdded={tasks.some((task) => taskMatchesEvent(task, selected))} aoiConfirmed={confirmedAois.has(selected.masterEventId)} onConfirmAoi={(confirmed) => setConfirmedAois((current) => { const next = new Set(current); if (confirmed) next.add(selected.masterEventId); else next.delete(selected.masterEventId); return next; })} onAddTask={addTask} onClose={() => setSelected(null)} />}
         {taskPanelOpen && <TaskPanel tasks={tasks} syncState={taskSync} activeTaskId={activeTaskId} onActivate={setActiveTaskId} onUpdate={updateTask} onRemove={(taskId) => void removeTask(taskId)} onClose={closeTaskPanel} onRetry={(task) => void saveTask(task)} />}
       </section>
     </main>
@@ -452,8 +476,9 @@ function SortControl({ selected, onChange }: { selected: SortMode; onChange: (va
   return <div className="sort-control" aria-label="事件排序方式">
     <span>排序</span>
     <button aria-pressed={selected === "priority"} className={selected === "priority" ? "active" : ""} onClick={() => onChange("priority")}>综合优先</button>
-    <button aria-pressed={selected === "recent"} className={selected === "recent" ? "active" : ""} onClick={() => onChange("recent")}>最新发生</button>
-    <small>{selected === "priority" ? "时效最高30分，7天半衰" : "严格按发生时间倒序"}</small>
+    <button aria-pressed={selected === "occurred"} className={selected === "occurred" ? "active" : ""} onClick={() => onChange("occurred")}>最新发生</button>
+    <button aria-pressed={selected === "updated"} className={selected === "updated" ? "active" : ""} onClick={() => onChange("updated")}>最新更新</button>
+    <small>{selected === "priority" ? "时效最高30分，7天半衰" : selected === "occurred" ? "按灾害发生时间" : "按最新有效报次"}</small>
   </div>;
 }
 
@@ -496,7 +521,7 @@ function EventCard({ event, active, onClick }: { event: DisasterEvent; active: b
   </button>;
 }
 
-function MapView({ scope, events, selected, activeTask, layoutKey, obscured, onSelect }: { scope: ScopeId; events: DisasterEvent[]; selected: DisasterEvent | null; activeTask: SatelliteTask | null; layoutKey: string; obscured: boolean; onSelect: (event: DisasterEvent) => void }) {
+function MapView({ scope, events, selected, activeTask, detailOpen, layoutKey, obscured, onSelect }: { scope: ScopeId; events: DisasterEvent[]; selected: DisasterEvent | null; activeTask: SatelliteTask | null; detailOpen: boolean; layoutKey: string; obscured: boolean; onSelect: (event: DisasterEvent) => void }) {
   const bbox = scopes[scope].bbox;
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<import("leaflet").Map | null>(null);
@@ -510,6 +535,16 @@ function MapView({ scope, events, selected, activeTask, layoutKey, obscured, onS
   const [mapZoom, setMapZoom] = useState(2);
   const [mapError, setMapError] = useState("");
   const [viewLabel, setViewLabel] = useState("");
+  const detailOffset = useCallback(() => detailOpen && window.innerWidth > 720 ? Math.min(338, Math.max(0, (containerRef.current?.clientWidth ?? 0) - 180)) : 0, [detailOpen]);
+  const fitWithOverlay = useCallback((map: import("leaflet").Map, bounds: import("leaflet").LatLngBoundsExpression, maxZoom: number) => {
+    const overlay = detailOffset();
+    map.fitBounds(bounds, { paddingTopLeft: [32, 32], paddingBottomRight: [32 + overlay, 32], maxZoom, animate: false });
+  }, [detailOffset]);
+  const centerWithOverlay = useCallback((map: import("leaflet").Map, latitude: number, longitude: number, zoom: number) => {
+    map.setView([latitude, longitude], zoom, { animate: false });
+    const overlay = detailOffset();
+    if (overlay) map.panBy([overlay / 2, 0], { animate: false });
+  }, [detailOffset]);
 
   useEffect(() => {
     scopeRef.current = scope;
@@ -576,10 +611,10 @@ function MapView({ scope, events, selected, activeTask, layoutKey, obscured, onS
         map.invalidateSize({ pan: false });
         if (activeTask) {
           const layer = aoiLayerRef.current;
-          if (layer?.getBounds().isValid()) map.fitBounds(layer.getBounds(), { padding: [32, 32], maxZoom: 11, animate: false });
+          if (layer?.getBounds().isValid()) fitWithOverlay(map, layer.getBounds(), 11);
         } else if (selected?.cycloneForecast && selectedLayerRef.current?.getBounds().isValid()) {
-          map.fitBounds(selectedLayerRef.current.getBounds(), { padding: [32, 32], maxZoom: 7, animate: false });
-        } else if (selected) map.setView([selected.latitude, selected.longitude], Math.max(map.getZoom(), scope === "global" ? 4 : map.getZoom()), { animate: false });
+          fitWithOverlay(map, selectedLayerRef.current.getBounds(), 7);
+        } else if (selected) centerWithOverlay(map, selected.latitude, selected.longitude, Math.max(map.getZoom(), scope === "global" ? 4 : map.getZoom()));
         else map.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], { padding: [24, 24], animate: false });
         selectedLayerRef.current?.eachLayer((selectedLayer) => {
           if ("bringToFront" in selectedLayer && typeof selectedLayer.bringToFront === "function") selectedLayer.bringToFront();
@@ -590,7 +625,7 @@ function MapView({ scope, events, selected, activeTask, layoutKey, obscured, onS
     observer.observe(container);
     restoreView();
     return () => { observer.disconnect(); window.cancelAnimationFrame(frame); };
-  }, [activeTask, bbox, layoutKey, mapReady, scope, selected]);
+  }, [activeTask, bbox, centerWithOverlay, fitWithOverlay, layoutKey, mapReady, scope, selected]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -610,7 +645,8 @@ function MapView({ scope, events, selected, activeTask, layoutKey, obscured, onS
       const groups = new Map<string, DisasterEvent[]>();
       eventsRef.current.forEach((event) => {
         const projected = map.project([event.latitude, event.longitude], map.getZoom());
-        const key = map.getZoom() >= 9 ? event.id : `${Math.floor(projected.x / 48)}:${Math.floor(projected.y / 48)}`;
+        const grid = map.getZoom() >= 9 ? 26 : 48;
+        const key = `${Math.floor(projected.x / grid)}:${Math.floor(projected.y / grid)}`;
         groups.set(key, [...(groups.get(key) ?? []), event]);
       });
       groups.forEach((group) => {
@@ -621,8 +657,8 @@ function MapView({ scope, events, selected, activeTask, layoutKey, obscured, onS
             icon: L.divIcon({ className: "event-div-icon", html: `<span class="geo-cluster"><b>${group.length}</b></span>`, iconSize: [38, 38], iconAnchor: [19, 19] }),
             title: `${group.length} 个邻近灾害事件`, keyboard: true,
           });
-          cluster.bindTooltip(`${group.length} 个邻近事件，点击放大`, { direction: "top", offset: [0, -17] });
-          cluster.on("click", () => map.setView([latitude, longitude], Math.min(10, map.getZoom() + 3), { animate: true }));
+          cluster.bindTooltip(`${group.length} 个共址/邻近事件：${group.slice(0, 4).map((event) => event.title).join("；")}${group.length > 4 ? "…" : ""}`, { direction: "top", offset: [0, -17] });
+          cluster.on("click", () => map.getZoom() >= 12 ? onSelectRef.current(group[0]) : map.setView([latitude, longitude], Math.min(12, map.getZoom() + 3), { animate: true }));
           cluster.addTo(layer);
           return;
         }
@@ -661,6 +697,12 @@ function MapView({ scope, events, selected, activeTask, layoutKey, obscured, onS
     void import("leaflet").then((L) => {
       if (cancelled) return;
       const forecast = selected.cycloneForecast;
+      if (selected.geometry.type !== "Point") {
+        L.geoJSON(unwrapForecastGeometry(selected.geometry, selected.longitude) as GeoJSON.GeoJsonObject, {
+          style: { color: "#006d63", weight: 3, fillColor: "#46a795", fillOpacity: 0.12, dashArray: "4 3", className: "selected-source-geometry" },
+          interactive: false,
+        }).addTo(layer);
+      }
       if (forecast?.impactGeometry) {
         L.geoJSON(unwrapForecastGeometry(forecast.impactGeometry, selected.longitude) as GeoJSON.GeoJsonObject, {
           style: { color: "#c15624", weight: 1.5, fillColor: "#e58a42", fillOpacity: 0.16, className: "cyclone-impact-area" },
@@ -688,22 +730,23 @@ function MapView({ scope, events, selected, activeTask, layoutKey, obscured, onS
             interactive: true,
             className: "cyclone-forecast-point",
           });
-          marker.bindTooltip(`${point.leadHours === 0 ? "实况" : `+${point.leadHours}小时`} · ${formatTimeWithYear(point.forecastAt)} CST${point.windSpeedKnots !== undefined ? ` · ${point.windSpeedKnots} kt` : ""}`, { direction: "top" });
+          marker.bindTooltip(`${point.leadHours === 0 ? "实况" : `+${point.leadHours}小时`} · ${formatTimeWithYear(point.forecastAt)} UTC+08${point.windSpeedKnots !== undefined ? ` · ${point.windSpeedKnots} kt` : ""}`, { direction: "top" });
           marker.addTo(layer);
         });
       }
       L.circleMarker([selected.latitude, selected.longitude], { radius: 20, color: "#006d63", weight: 3, fill: false, interactive: false, className: "selected-event-ring" }).addTo(layer);
-      if (!activeTask && forecast && layer.getBounds().isValid()) map.fitBounds(layer.getBounds(), { padding: [32, 32], maxZoom: 7, animate: true, duration: 0.45 });
+      if (!activeTask && layer.getBounds().isValid() && (forecast || selected.geometry.type !== "Point")) fitWithOverlay(map, layer.getBounds(), forecast ? 7 : 9);
     });
     return () => { cancelled = true; };
-  }, [activeTask, mapReady, selected]);
+  }, [activeTask, fitWithOverlay, mapReady, selected]);
 
   useEffect(() => {
-    if (!mapReady || !selected || selected.cycloneForecast || !mapRef.current) return;
+    if (!mapReady || !selected || selected.cycloneForecast || selected.geometry.type !== "Point" || !mapRef.current) return;
     const map = mapRef.current;
     const targetZoom = Math.max(map.getZoom(), scope === "global" ? 4 : map.getZoom());
-    map.flyTo([selected.latitude, selected.longitude], targetZoom, { animate: true, duration: 0.45 });
-  }, [mapReady, scope, selected]);
+    if (detailOpen) centerWithOverlay(map, selected.latitude, selected.longitude, targetZoom);
+    else map.flyTo([selected.latitude, selected.longitude], targetZoom, { animate: true, duration: 0.45 });
+  }, [centerWithOverlay, detailOpen, mapReady, scope, selected]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -731,13 +774,15 @@ function MapView({ scope, events, selected, activeTask, layoutKey, obscured, onS
   </div>;
 }
 
-function DetailPanel({ event, obscured, locationZh, locationLoading, locationState, onRetryLocation, taskAdded, aoiConfirmed, onConfirmAoi, onAddTask, onClose }: { event: DisasterEvent; obscured: boolean; locationZh?: string; locationLoading: boolean; locationState?: "resolved" | "fallback" | "error"; onRetryLocation: () => void; taskAdded: boolean; aoiConfirmed: boolean; onConfirmAoi: (confirmed: boolean) => void; onAddTask: (event: DisasterEvent, operatorConfirmed: boolean) => void; onClose: () => void }) {
+function DetailPanel({ event, obscured, dispatchBlocked, locationZh, locationLoading, locationState, onRetryLocation, taskAdded, aoiConfirmed, onConfirmAoi, onAddTask, onClose }: { event: DisasterEvent; obscured: boolean; dispatchBlocked: boolean; locationZh?: string; locationLoading: boolean; locationState?: "resolved" | "fallback" | "error"; onRetryLocation: () => void; taskAdded: boolean; aoiConfirmed: boolean; onConfirmAoi: (confirmed: boolean) => void; onAddTask: (event: DisasterEvent, operatorConfirmed: boolean) => void; onClose: () => void }) {
   const isDemo = event.source === "演示数据";
-  const canDispatch = !isDemo && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived" && (event.dispatchEligibility === "ready" || aoiConfirmed);
-  return <aside className="detail-panel" inert={obscured ? true : undefined} aria-hidden={obscured || undefined}>
-    <button className="detail-close" onClick={onClose} aria-label="关闭详情">×</button>
+  const closeRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => { if (window.matchMedia("(max-width: 720px)").matches) closeRef.current?.focus(); }, [event.id]);
+  const canDispatch = !dispatchBlocked && !isDemo && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived" && (event.dispatchEligibility === "ready" || aoiConfirmed);
+  return <aside className="detail-panel" aria-labelledby={`detail-title-${event.id}`} inert={obscured ? true : undefined} aria-hidden={obscured || undefined}>
+    <button ref={closeRef} className="detail-close" onClick={onClose} aria-label="关闭详情">×</button>
     <div className={`detail-kicker ${event.severity}`}><span>{hazardMeta[event.hazard].symbol}</span>{hazardMeta[event.hazard].label} · {severityLabels[event.severity]}预警</div>
-    <h2>{event.title}</h2>
+    <h2 id={`detail-title-${event.id}`}>{event.title}</h2>
     <div className="detail-location">
       <span>⌖ 中文地点</span>
       <strong className={locationLoading ? "location-loading" : ""}>{locationLoading ? "正在解析中文地点…" : locationZh || "暂无中文地点"}</strong>
@@ -745,9 +790,9 @@ function DetailPanel({ event, obscured, locationZh, locationLoading, locationSta
       {locationState === "error" ? <small role="alert">中文地点解析失败。<button onClick={onRetryLocation}>重试</button></small> : null}
       <small>来源原文：{event.country || event.title}</small>
     </div>
-    <div className="detail-score"><div><strong>{event.priority}</strong><span>任务优先级</span></div><p>严重度 {event.priorityBreakdown.severity} · 区域 {event.priorityBreakdown.scope} · 遥感 {event.priorityBreakdown.observability} · 时效 {event.priorityBreakdown.time}</p></div>
+    <div className="detail-score"><div><strong>{event.priority}</strong><span>任务优先级</span></div><p>严重度 {event.priorityBreakdown.severity} · 区域 {event.priorityBreakdown.scope} · 遥感 {event.priorityBreakdown.observability} · 时效 {event.priorityBreakdown.time} · 可信度 {event.priorityBreakdown.confidence ?? 0}</p></div>
     <div className={`event-integrity ${event.dispatchEligibility}`}>
-      <div><strong>{confidenceLabels[event.confidenceLevel]} {event.confidenceScore}</strong><span>{event.evidenceCount} 条独立证据</span></div>
+      <div><strong>{confidenceLabels[event.confidenceLevel]} {event.confidenceScore}</strong><span>{event.evidenceCount} 条来源证据</span></div>
       <p><b>{locationQualityLabels[event.locationQuality]}</b> · 估计误差约 {event.locationAccuracyKm} km</p>
       <small>主事件ID：{event.masterEventId}</small>
       {event.sourcePresence === "retained" ? <em>当前短时数据源未再次报告该事件；未据此判定灾害已结束，仍保留至观测期届满或权威撤销。</em> : null}
@@ -755,7 +800,7 @@ function DetailPanel({ event, obscured, locationZh, locationLoading, locationSta
     <div className="observation-deadline"><span>{event.observationPhase === "golden" ? "距建议复核" : "后续观测剩余"}</span><strong>{remainingObservationTime(event.observationPhase === "golden" ? event.observationReviewAt : event.observationExpiresAt)}</strong><small>{event.observationPhase === "golden" ? `黄金期至 ${formatTime(event.observationReviewAt)}；到期不撤销，转后续观测` : `建议持续复核；兜底归档 ${formatTime(event.observationExpiresAt)}`}</small></div>
     {event.cycloneForecast ? <section className="cyclone-forecast-card">
       <h3>官方台风预报 · {event.cycloneForecast.source}</h3>
-      <div className="forecast-validity"><span>发布 {formatTimeWithYear(event.cycloneForecast.issuedAt)} CST</span><span>有效至 {formatTimeWithYear(event.cycloneForecast.forecastValidUntil)} CST</span></div>
+      <div className="forecast-validity"><span>发布 {formatTimeWithYear(event.cycloneForecast.issuedAt)} UTC+08</span><span>有效至 {formatTimeWithYear(event.cycloneForecast.forecastValidUntil)} UTC+08</span></div>
       <div className="forecast-layer-notes">
         <span><i className="track" />中心预报路径</span>
         <span><i className="impact" />{event.cycloneForecast.impactBasis === "forecast_wind_radii" ? event.cycloneForecast.impactThreshold || "预报风圈" : event.cycloneForecast.impactBasis === "current_wind_extent" ? event.cycloneForecast.impactThreshold || "当前强风范围" : "本报次无官方风圈"}</span>
@@ -771,17 +816,17 @@ function DetailPanel({ event, obscured, locationZh, locationLoading, locationSta
     <section><h3>可选载荷</h3><div className="target-list">{payloadOptions.map((payload) => <span key={payload}>{payload}</span>)}</div></section>
     <section><h3>事件摘要</h3><p>{event.description || "暂无详细描述。"}</p></section>
     <section className="evidence-chain"><h3>证据链</h3>{event.evidence.map((item) => <a key={`${item.source}-${item.sourceEventId}`} href={safeHttpUrl(item.sourceUrl)} target="_blank" rel="noreferrer"><span>{item.source}</span><small>{item.role === "detection" ? "探测" : item.role === "warning" ? "预警" : "核验"} · {formatTime(item.observedAt)}</small></a>)}</section>
-    {event.updateCount > 1 ? <section className="update-history"><h3>过程更新 · 共 {event.updateCount} 期</h3>{event.updateHistory.slice(0, 8).map((item, index) => <a key={`${item.source}-${item.sourceEventId}`} href={item.sourceUrl} target="_blank" rel="noreferrer"><i>{index === 0 ? "最新" : String(event.updateCount - index).padStart(2, "0")}</i><span><strong>{item.title}</strong><small>{item.source} · {formatTimeWithYear(item.observedAt)}</small></span></a>)}</section> : null}
+    {event.updateCount > 1 ? <section className="update-history"><h3>过程更新 · 共 {event.updateCount} 期</h3>{event.updateHistory.slice(0, 8).map((item, index) => <a key={`${item.source}-${item.sourceEventId}`} href={safeHttpUrl(item.sourceUrl)} target="_blank" rel="noreferrer"><i>{index === 0 ? "最新" : String(event.updateCount - index).padStart(2, "0")}</i><span><strong>{item.title}</strong><small>{item.source} · {formatTimeWithYear(item.observedAt)}</small></span></a>)}</section> : null}
     <dl>
-      <div><dt>发生时间</dt><dd>{formatTimeWithYear(event.occurredAt)} CST</dd></div>
-      <div><dt>最新更新</dt><dd>{formatTimeWithYear(event.updatedAt)} CST</dd></div>
+      <div><dt>发生时间</dt><dd>{formatTimeWithYear(event.occurredAt)} UTC+08</dd></div>
+      <div><dt>最新更新</dt><dd>{formatTimeWithYear(event.updatedAt)} UTC+08</dd></div>
       <div><dt>来源等级</dt><dd>{event.sourceSeverity}</dd></div>
       <div><dt>坐标</dt><dd>{event.latitude.toFixed(3)}°, {event.longitude.toFixed(3)}°</dd></div>
       <div><dt>数据来源</dt><dd>{event.source}</dd></div>
     </dl>
     <a className="source-link" href={safeHttpUrl(event.sourceUrl)} target="_blank" rel="noreferrer">查看权威来源 ↗</a>
-    {event.aoiApprovalRequired ? <div className="aoi-approval"><input id={`aoi-confirm-${event.id}`} type="checkbox" checked={aoiConfirmed} onChange={(change) => onConfirmAoi(change.target.checked)} /><label htmlFor={`aoi-confirm-${event.id}`}><strong>人工核对 AOI</strong><small>此坐标不是可直接下发的精确灾害边界；请在地图或外部矢量中复核后确认。</small></label></div> : null}
-    <button className="task-button" onClick={() => onAddTask(event, aoiConfirmed)} disabled={taskAdded || !canDispatch}>{taskAdded ? "已加入卫星任务候选" : isDemo ? "演示事件禁止下发" : !canDispatch ? "需先人工核对 AOI" : "加入卫星任务候选"}</button>
+    {event.aoiApprovalRequired ? <div className="aoi-approval"><input id={`aoi-confirm-${event.id}`} type="checkbox" checked={aoiConfirmed} onChange={(change) => onConfirmAoi(change.target.checked)} /><label htmlFor={`aoi-confirm-${event.id}`}><strong>人工核对 AOI</strong><small>地图已用绿色虚线显示完整来源几何；确认前请核对目标类型、范围和代表点误差。</small></label></div> : null}
+    <button className="task-button" onClick={() => onAddTask(event, aoiConfirmed)} disabled={taskAdded || !canDispatch}>{taskAdded ? "已加入卫星任务候选" : dispatchBlocked ? "非实时/数据库降级状态禁止下发" : isDemo ? "演示事件禁止下发" : !canDispatch ? "需先人工核对 AOI" : "加入卫星任务候选"}</button>
   </aside>;
 }
 
@@ -806,7 +851,7 @@ function TaskPanel({ tasks, syncState, activeTaskId, onActivate, onUpdate, onRem
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
-  const exportable = tasks.length > 0 && tasks.every((task) => validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true }).ok && syncState[task.taskId]?.state === "synced");
+  const exportable = tasks.length > 0 && tasks.every((task) => validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requireProvenance: true }).ok && syncState[task.taskId]?.state === "synced");
   const exportValidated = async (format: ExportFormat) => {
     setExportError("");
     try {
@@ -815,7 +860,11 @@ function TaskPanel({ tasks, syncState, activeTaskId, onActivate, onUpdate, onRem
       const result = await response.json() as { tasks?: Array<Partial<SatelliteTask>>; cancelledTaskIds?: string[] };
       const cancelled = new Set(result.cancelledTaskIds ?? []);
       const server = new Map((result.tasks ?? []).map((task) => [task.taskId, task]));
-      const mismatch = tasks.find((task) => cancelled.has(task.taskId) || server.get(task.taskId)?.status !== task.status || server.get(task.taskId)?.masterEventId !== task.masterEventId);
+      const mismatch = tasks.find((task) => {
+        const stored = server.get(task.taskId);
+        return cancelled.has(task.taskId) || !stored || stored.status !== task.status || stored.masterEventId !== task.masterEventId
+          || stored.revision !== task.revision || stored.eventRevision !== task.eventRevision || stored.aoiHash !== task.aoiHash;
+      });
       if (mismatch) throw new Error(`任务 ${mismatch.taskId} 已取消或服务端状态已变化，请刷新后重试`);
       downloadTasks(tasks, format);
     } catch (error) {
@@ -843,6 +892,7 @@ function TaskPanel({ tasks, syncState, activeTaskId, onActivate, onUpdate, onRem
       <button disabled={!exportable} title={exportable ? "" : "所有任务需通过校验、选择载荷并同步到业务数据库"} onClick={() => void exportValidated("csv")}>CSV</button>
       <button disabled={!exportable} title={exportable ? "" : "所有任务需通过校验、选择载荷并同步到业务数据库"} onClick={() => void exportValidated("geojson")}>GeoJSON</button>
     </div>
+    {!exportable && tasks.length ? <div className="task-export-hint" role="status">当前 0/{tasks.length} 项可导出。任务必须选择载荷、通过时间/AOI校验，并完成数据库同步；逐项错误显示在任务卡内。</div> : null}
     {exportError ? <div className="task-export-error" role="alert">{exportError}</div> : null}
     <div className="task-list">
       {!tasks.length ? <div className="task-empty"><strong>候选单为空</strong><p>从灾害详情中点击“加入卫星任务候选”，即可在这里设置AOI和成像时间窗。</p></div> : null}
@@ -854,7 +904,7 @@ function TaskPanel({ tasks, syncState, activeTaskId, onActivate, onUpdate, onRem
         </div>
         <div className="task-coordinates"><span>中心坐标</span><code>{task.latitude.toFixed(6)}, {task.longitude.toFixed(6)}</code><button onClick={() => void copyCoordinates(task).then((copied) => { if (copied) { setCopiedTaskId(task.taskId); window.setTimeout(() => setCopiedTaskId((current) => current === task.taskId ? null : current), 1800); } })}>{copiedTaskId === task.taskId ? "已复制" : "复制"}</button></div>
         <div className={`task-quality ${task.aoiApproval}`}><span>{locationQualityLabels[task.locationQuality]} · ±{task.locationAccuracyKm} km</span><b>{task.aoiApproval === "source_verified" ? "来源可下发" : "已人工核对"}</b><small>{task.evidenceCount} 条证据 · {task.masterEventId}</small></div>
-        {task.cycloneForecast ? <div className="task-forecast-summary"><strong>官方预报已随任务保存</strong><span>{task.cycloneForecast.track.length} 个中心节点 · 至 {formatTimeWithYear(task.cycloneForecast.forecastValidUntil)} CST</span><small>{task.cycloneForecast.impactGeometry ? `${task.cycloneForecast.impactThreshold || "官方风圈"}已作为默认来源 AOI` : "本报次没有官方风圈；默认 AOI 仍以当前中心设置"}</small></div> : null}
+        {task.cycloneForecast ? <div className="task-forecast-summary"><strong>官方预报已随任务保存</strong><span>{task.cycloneForecast.track.length} 个中心节点 · 至 {formatTimeWithYear(task.cycloneForecast.forecastValidUntil)} UTC+08</span><small>{task.cycloneForecast.impactGeometry ? `${task.cycloneForecast.impactThreshold || "官方风圈"}已作为默认来源 AOI` : "本报次没有官方风圈；默认 AOI 仍以当前中心设置"}</small></div> : null}
         <div className={`task-sync ${syncState[task.taskId]?.state ?? "local"}`} role="status">{syncState[task.taskId]?.state === "saving" ? "正在同步…" : syncState[task.taskId]?.state === "synced" ? "已同步到业务数据库" : syncState[task.taskId]?.state === "error" ? <>同步失败：{syncState[task.taskId]?.message ?? "请重试"} <button onClick={() => onRetry(task)}>重试同步</button></> : "仅保存在本机"}</div>
     <div className="aoi-type-selector" aria-label="AOI目标类型">
           {aoiOptions.filter((option) => option.id !== "source" || task.sourceGeometry).map((option) => <button key={option.id} aria-pressed={task.aoiType === option.id} className={task.aoiType === option.id ? "active" : ""} onClick={() => onUpdate(task.taskId, { aoiType: option.id })}>{option.label}</button>)}
@@ -864,8 +914,8 @@ function TaskPanel({ tasks, syncState, activeTaskId, onActivate, onUpdate, onRem
           {task.aoiType === "circle" ? <label>圆形面半径（公里）<input type="number" min="1" max="1000" value={task.aoiRadiusKm} onChange={(event) => onUpdate(task.taskId, { aoiRadiusKm: clampNumber(event.target.value, 1, 1000) })} /></label> : null}
           {task.aoiType === "rectangle" ? <><label>矩形宽度（公里）<input type="number" min="1" max="2000" value={task.aoiWidthKm} onChange={(event) => onUpdate(task.taskId, { aoiWidthKm: clampNumber(event.target.value, 1, 2000) })} /></label><label>矩形高度（公里）<input type="number" min="1" max="2000" value={task.aoiHeightKm} onChange={(event) => onUpdate(task.taskId, { aoiHeightKm: clampNumber(event.target.value, 1, 2000) })} /></label></> : null}
           {task.aoiType === "corridor" ? <><label>走廊长度（公里）<input type="number" min="1" max="3000" value={task.aoiLengthKm} onChange={(event) => onUpdate(task.taskId, { aoiLengthKm: clampNumber(event.target.value, 1, 3000) })} /></label><label>走廊宽度（公里）<input type="number" min="1" max="500" value={task.aoiWidthKm} onChange={(event) => onUpdate(task.taskId, { aoiWidthKm: clampNumber(event.target.value, 1, 500) })} /></label><label>方位角（度）<input type="number" min="0" max="359" value={task.aoiBearingDeg} onChange={(event) => onUpdate(task.taskId, { aoiBearingDeg: clampNumber(event.target.value, 0, 359) })} /></label></> : null}
-          <label>最早成像（本地时区）<input type="datetime-local" value={toLocalInput(task.imagingStart)} onChange={(event) => onUpdate(task.taskId, { imagingStart: fromLocalInput(event.target.value) })} /></label>
-          <label>最晚成像（本地时区）<input type="datetime-local" min={toLocalInput(task.imagingStart)} value={toLocalInput(task.imagingEnd)} onChange={(event) => onUpdate(task.taskId, { imagingEnd: fromLocalInput(event.target.value) })} /></label>
+          <label>最早成像（Asia/Shanghai UTC+08）<input type="datetime-local" value={toLocalInput(task.imagingStart)} onChange={(event) => onUpdate(task.taskId, { imagingStart: fromLocalInput(event.target.value) })} /></label>
+          <label>最晚成像（Asia/Shanghai UTC+08）<input type="datetime-local" min={toLocalInput(task.imagingStart)} value={toLocalInput(task.imagingEnd)} onChange={(event) => onUpdate(task.taskId, { imagingEnd: fromLocalInput(event.target.value) })} /></label>
           <label>任务状态<select value={task.status} onChange={(event) => onUpdate(task.taskId, { status: event.target.value as SatelliteTask["status"] })}>{allowedTaskStatuses(task.status).map((status) => <option key={status} value={status}>{taskStatusLabel(status)}</option>)}</select></label>
           <label>最低覆盖率（%）<input type="number" min="1" max="100" value={task.minimumCoveragePercent} onChange={(event) => onUpdate(task.taskId, { minimumCoveragePercent: clampNumber(event.target.value, 1, 100) })} /></label>
           <label>最大云量（%）<input type="number" min="0" max="100" value={task.maximumCloudPercent} onChange={(event) => onUpdate(task.taskId, { maximumCloudPercent: clampNumber(event.target.value, 0, 100) })} /></label>
@@ -873,11 +923,11 @@ function TaskPanel({ tasks, syncState, activeTaskId, onActivate, onUpdate, onRem
           <label>最小入射角（度）<input type="number" min="0" max="80" value={task.incidenceAngleMinDeg} onChange={(event) => onUpdate(task.taskId, { incidenceAngleMinDeg: clampNumber(event.target.value, 0, 80) })} /></label>
           <label>最大入射角（度）<input type="number" min="0" max="80" value={task.incidenceAngleMaxDeg} onChange={(event) => onUpdate(task.taskId, { incidenceAngleMaxDeg: clampNumber(event.target.value, 0, 80) })} /></label>
           <label>重访次数<input type="number" min="1" max="50" value={task.revisitCount} onChange={(event) => onUpdate(task.taskId, { revisitCount: clampNumber(event.target.value, 1, 50) })} /></label>
-          <label>最迟交付（本地时区）<input type="datetime-local" min={toLocalInput(task.imagingEnd)} value={toLocalInput(task.deliveryDeadline)} onChange={(event) => onUpdate(task.taskId, { deliveryDeadline: fromLocalInput(event.target.value) })} /></label>
+          <label>最迟交付（Asia/Shanghai UTC+08）<input type="datetime-local" min={toLocalInput(task.imagingEnd)} value={toLocalInput(task.deliveryDeadline)} onChange={(event) => onUpdate(task.taskId, { deliveryDeadline: fromLocalInput(event.target.value) })} /></label>
         </div>
         <fieldset className="payload-options"><legend>载荷选项（可多选）</legend>{payloadOptions.map((payload) => <label key={payload}><input type="checkbox" checked={task.sensors.includes(payload)} onChange={() => onUpdate(task.taskId, { sensors: toggleValue(task.sensors, payload) })} />{payload}</label>)}</fieldset>
         <div className="task-targets">观测目标：{task.observationTargets.join(" · ")}</div>
-        {(() => { const validation = validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true }); return validation.ok ? null : <div className="task-validation" role="alert">{validation.errors.join("；")}</div>; })()}
+        {(() => { const validation = validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requireProvenance: true }); return validation.ok ? null : <div className="task-validation" role="alert">{validation.errors.join("；")}</div>; })()}
         <div className={`visibility-box ${visibility[task.taskId]?.state ?? "idle"}`}>
           <button onClick={() => void calculateVisibility(task)} disabled={visibility[task.taskId]?.state === "loading"}>{visibility[task.taskId]?.state === "loading" ? "正在请求仿真…" : "计算卫星可见窗口"}</button>
           {visibility[task.taskId]?.message ? <p>{visibility[task.taskId].message}</p> : null}
@@ -944,7 +994,8 @@ function createSatelliteTask(event: DisasterEvent, operatorConfirmed: boolean): 
   const phaseEnd = new Date(event.observationPhase === "golden" ? event.observationReviewAt : event.observationExpiresAt).getTime();
   const preferredEnd = Math.min(phaseEnd, now + (event.observationPhase === "golden" ? 72 : 168) * 3_600_000);
   const officialImpactGeometry = event.cycloneForecast?.impactGeometry;
-  return {
+  const sourceGeometry = officialImpactGeometry ?? event.geometry;
+  const task: SatelliteTask = {
     taskId: `TASK-${event.id}-${now}`,
     eventId: event.id,
     masterEventId: event.masterEventId,
@@ -956,13 +1007,13 @@ function createSatelliteTask(event: DisasterEvent, operatorConfirmed: boolean): 
     longitude: event.longitude,
     eventOccurredAt: event.occurredAt,
     eventUpdatedAt: event.updatedAt,
-    aoiType: officialImpactGeometry ? "source" : event.geometryType === "Point" ? "circle" : "source",
+    aoiType: event.dispatchEligibility === "ready" || officialImpactGeometry || event.geometryType !== "Point" ? "source" : "circle",
     aoiRadiusKm: defaultAoiRadiusKm[event.hazard],
     aoiWidthKm: Math.max(10, defaultAoiRadiusKm[event.hazard] * 2),
     aoiHeightKm: Math.max(10, defaultAoiRadiusKm[event.hazard] * 2),
     aoiLengthKm: Math.max(20, defaultAoiRadiusKm[event.hazard] * 3),
     aoiBearingDeg: 0,
-    sourceGeometry: officialImpactGeometry ?? event.geometry,
+    sourceGeometry,
     cycloneForecast: event.cycloneForecast,
     minimumCoveragePercent: 80,
     maximumCloudPercent: 30,
@@ -984,10 +1035,15 @@ function createSatelliteTask(event: DisasterEvent, operatorConfirmed: boolean): 
     aoiApproval: event.dispatchEligibility === "ready" ? "source_verified" : "operator_confirmed",
     approvedAt: new Date(now).toISOString(),
     approvedBy: event.dispatchEligibility === "ready" ? event.source : "当前操作员",
+    approvalReason: event.dispatchEligibility === "ready" ? undefined : "已在事件详情地图核对来源几何、位置误差和观测目标",
     createdAt: new Date(now).toISOString(),
     updatedAt: new Date(now).toISOString(),
     status: "candidate",
+    revision: 0,
+    eventRevision: eventRevisionFingerprint(event),
+    aoiHash: "",
   };
+  return { ...task, aoiHash: aoiFingerprint(taskGeometry(task)) };
 }
 
 function downloadTasks(tasks: SatelliteTask[], format: ExportFormat) {
@@ -1020,14 +1076,25 @@ function downloadTasks(tasks: SatelliteTask[], format: ExportFormat) {
       longitude_wgs84: task.longitude,
       event_occurred_at_utc: task.eventOccurredAt,
       event_updated_at_utc: task.eventUpdatedAt,
+      task_revision: task.revision,
+      event_revision: task.eventRevision,
+      aoi_hash: task.aoiHash,
       aoi_type: task.aoiType,
       aoi_radius_km: task.aoiRadiusKm,
       aoi_width_km: task.aoiWidthKm,
       aoi_height_km: task.aoiHeightKm,
       aoi_length_km: task.aoiLengthKm,
       aoi_bearing_deg: task.aoiBearingDeg,
+      aoi_geojson: JSON.stringify(taskGeometry(task)),
       imaging_start_utc: task.imagingStart,
       imaging_end_utc: task.imagingEnd,
+      delivery_deadline_utc: task.deliveryDeadline,
+      minimum_coverage_percent: task.minimumCoveragePercent,
+      maximum_cloud_percent: task.maximumCloudPercent,
+      spatial_resolution_meters: task.spatialResolutionMeters,
+      incidence_angle_min_deg: task.incidenceAngleMinDeg,
+      incidence_angle_max_deg: task.incidenceAngleMaxDeg,
+      revisit_count: task.revisitCount,
       sensors: task.sensors.join("|"),
       observation_targets: task.observationTargets.join("|"),
       observation_phase: task.observationPhase,
@@ -1117,6 +1184,10 @@ function migrateSatelliteTask(task: Partial<SatelliteTask>): SatelliteTask {
     createdAt: task.createdAt ?? now,
     updatedAt: task.updatedAt ?? task.createdAt ?? now,
     status: task.status ?? "candidate",
+    revision: Number.isInteger(task.revision) && Number(task.revision) >= 0 ? Number(task.revision) : 0,
+    eventRevision: task.eventRevision ?? "0000000000000000",
+    aoiHash: task.aoiHash ?? "0000000000000000",
+    approvalReason: task.approvalReason,
   };
 }
 
@@ -1140,7 +1211,8 @@ function normalizeTaskEntityText(value: string) {
 }
 
 function csvCell(value: string | number) {
-  const text = String(value);
+  const raw = String(value);
+  const text = /^[=+@]/.test(raw) || /^-\D/.test(raw) ? `'${raw}` : raw;
   return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
@@ -1201,12 +1273,15 @@ function clampNumber(value: string, min: number, max: number) {
 
 function toLocalInput(value: string) {
   const date = new Date(value);
-  const shifted = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  const shifted = new Date(date.getTime() + 8 * 3_600_000);
   return shifted.toISOString().slice(0, 16);
 }
 
 function fromLocalInput(value: string) {
-  const date = new Date(value);
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/);
+  if (!match) return new Date().toISOString();
+  const [, year, month, day, hour, minute] = match;
+  const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour) - 8, Number(minute)));
   return Number.isFinite(date.getTime()) ? date.toISOString() : new Date().toISOString();
 }
 

@@ -42,8 +42,9 @@ export function distanceKm(latA, lonA, latB, lonB) {
   return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-export function signPayload(secret, body) {
-  return createHmac("sha256", secret).update(body).digest("hex");
+export function signPayload(secret, body, timestamp = "") {
+  const signed = timestamp ? `${timestamp}.${body}` : body;
+  return createHmac("sha256", secret).update(signed).digest("hex");
 }
 
 export function changeNotifications(previous, event, config) {
@@ -60,7 +61,7 @@ export function changeNotifications(previous, event, config) {
     changes.push({ type: "priority", label: `优先级升至 ${number(event.priority, 0)}` });
   }
   if (Number(event.evidenceCount) > Number(previous.evidenceCount) && Number(event.priority) >= config.minPriority - 10) {
-    changes.push({ type: "evidence", label: `新增独立证据，现有 ${number(event.evidenceCount, 0)} 个来源` });
+    changes.push({ type: "evidence", label: `新增来源证据，现有 ${number(event.evidenceCount, 0)} 个来源` });
   }
   if (locationRank(event.locationQuality) > locationRank(previous.locationQuality)) {
     changes.push({ type: "location", label: `定位质量提升：${locationLabel(previous.locationQuality)} → ${locationLabel(event.locationQuality)}` });
@@ -89,12 +90,13 @@ export function buildEventMessage(event, changeLabel) {
   const coordinate = `${number(event.latitude, 5)}, ${number(event.longitude, 5)}`;
   const accuracy = Number.isFinite(Number(event.locationAccuracyKm)) ? `（约 ±${number(event.locationAccuracyKm, 0)} km）` : "";
   const sourceUrl = safeUrl(event.sourceUrl);
-  const source = sourceUrl ? `[${clean(event.source, 120)}](${sourceUrl})` : clean(event.source, 120);
+  const sourceLabel = markdownText(event.source, 120);
+  const source = sourceUrl ? `[${sourceLabel}](${sourceUrl})` : sourceLabel;
   const sensors = Array.isArray(event.recommendedSensors) && event.recommendedSensors.length
-    ? event.recommendedSensors.map((item) => clean(item, 40)).join(" / ")
+    ? event.recommendedSensors.map((item) => markdownText(item, 40)).join(" / ")
     : "待卫星系统匹配";
   const targets = Array.isArray(event.observationTargets) && event.observationTargets.length
-    ? event.observationTargets.slice(0, 5).map((item) => clean(item, 50)).join("、")
+    ? event.observationTargets.slice(0, 5).map((item) => markdownText(item, 50)).join("、")
     : "待判定";
   const review = event.aoiApprovalRequired ? "⚠️ AOI 需人工复核" : "✅ AOI 可直接进入仿真规划";
   const forecast = event.hazard === "cyclone" && event.cycloneForecast
@@ -102,7 +104,7 @@ export function buildEventMessage(event, changeLabel) {
     : "";
 
   return [
-    `${SEVERITY_EMOJI[event.severity] ?? "⚪"} **${clean(changeLabel, 160)}｜${clean(event.title, 220)}**`,
+    `${SEVERITY_EMOJI[event.severity] ?? "⚪"} **${markdownText(changeLabel, 160)}｜${markdownText(event.title, 220)}**`,
     `- 类型/等级：${hazardLabel(event.hazard)} · ${severityLabel(event.severity)} · 优先级 **${number(event.priority, 0)}**`,
     `- 范围/坐标：${SCOPE_LABELS[event.scope] ?? "全球"} · \`${coordinate}\``,
     `- 定位质量：${locationLabel(event.locationQuality)}${accuracy} · ${review}`,
@@ -111,7 +113,7 @@ export function buildEventMessage(event, changeLabel) {
     `- AOI/目标：${clean(event.geometryType || "Point", 30)} · ${targets}`,
     forecast,
     `- 可选载荷：${sensors}`,
-    `- 证据/来源：${number(event.evidenceCount, 0)} 个独立来源，过程更新 ${number(event.updateCount, 0)} 次 · ${source}`,
+    `- 证据/来源：${number(event.evidenceCount, 0)} 条来源证据，过程更新 ${number(event.updateCount, 0)} 次 · ${source}`,
     `- 事件键：\`${clean(event.entityKey || event.masterEventId || event.id, 180)}\``,
   ].filter(Boolean).join("\n");
 }
@@ -119,6 +121,7 @@ export function buildEventMessage(event, changeLabel) {
 export function defaultConfig(env = process.env) {
   return {
     engineUrl: env.TIANXUN_ENGINE_URL || "http://127.0.0.1:3000/api/events",
+    changesUrl: env.TIANXUN_CHANGES_URL || new URL("/api/changes", env.TIANXUN_ENGINE_URL || "http://127.0.0.1:3000/api/events").toString(),
     engineToken: env.TIANXUN_API_TOKEN || "",
     dbPath: resolve(env.TIANXUN_NOTIFY_DB || ".data/notifier.sqlite"),
     webhookUrl: env.HERMES_WEBHOOK_URL || "http://127.0.0.1:8644/webhooks/tianxun-alerts",
@@ -142,6 +145,13 @@ export async function runOnce(config = defaultConfig(), fetchImpl = fetch) {
     processSourceHealth(db, Array.isArray(payload.sourceStatus) ? payload.sourceStatus : [], config);
     if (!payload.fallback) {
       processEvents(db, Array.isArray(payload.events) ? payload.events : [], payload, config);
+      try {
+        const changePayload = await fetchChanges(config, db, fetchImpl);
+        processOperationalChanges(db, changePayload.changes, changePayload.cursor);
+        setMeta(db, "operational_change_error", "");
+      } catch (changeError) {
+        setMeta(db, "operational_change_error", clean(changeError instanceof Error ? changeError.message : changeError, 300));
+      }
       setMeta(db, "consecutive_collection_failures", "0");
       recordRun(db, startedAt, "ok", Array.isArray(payload.events) ? payload.events.length : 0, "");
     } else {
@@ -235,6 +245,58 @@ async function fetchEvents(config, fetchImpl) {
   const payload = await response.json();
   if (!payload || !Array.isArray(payload.events)) throw new Error("灾害引擎响应缺少 events 数组");
   return payload;
+}
+
+async function fetchChanges(config, db, fetchImpl) {
+  const after = getMeta(db, "operational_change_cursor") || "1970-01-01T00:00:00.000Z";
+  const url = new URL(config.changesUrl);
+  url.searchParams.set("after", after);
+  url.searchParams.set("limit", "200");
+  const authorization = config.engineToken ? { Authorization: `Bearer ${config.engineToken}` } : {};
+  const response = await fetchImpl(url, { headers: { Accept: "application/json", "User-Agent": "Tianxun-VPS-Notifier/1.0", ...authorization }, signal: AbortSignal.timeout(config.requestTimeoutMs) });
+  if (!response.ok) throw new Error(`灾害变更流 HTTP ${response.status}`);
+  const payload = await response.json();
+  if (!payload || !Array.isArray(payload.changes)) throw new Error("灾害变更流响应无效");
+  return { changes: payload.changes.slice(0, 200), cursor: String(payload.cursor || after) };
+}
+
+function processOperationalChanges(db, changes, cursor) {
+  for (const change of changes) {
+    if (!change || typeof change.id !== "string" || typeof change.type !== "string") continue;
+    const event = change.payload?.event;
+    if (change.type === "event_merged") {
+      enqueue(db, {
+        dedupeKey: `change:${change.id}`,
+        kind: change.type,
+        entityKey: clean(change.masterEventId, 220),
+        message: `🔗 **重复灾害过程已聚合**\n- 原事件：${markdownText(change.payload?.event?.title || change.payload?.fromMasterEventId, 220)}\n- 主事件：${markdownText(change.payload?.toMasterEventId || change.masterEventId, 220)}\n- 处置：旧候选任务不会静默迁移，需基于主事件重新核对 AOI\n- 时间：${formatTime(change.createdAt)}`,
+      });
+    } else if (change.type === "event_resolved" || change.type === "event_quarantined") {
+      enqueue(db, {
+        dedupeKey: `change:${change.id}`,
+        kind: change.type,
+        entityKey: clean(change.masterEventId, 220),
+        message: change.type === "event_quarantined"
+          ? `⛔ **事件已隔离，禁止任务下发**\n- 事件：${markdownText(event?.title || change.masterEventId, 220)}\n- 原因：${markdownText(change.payload?.reason || "事件身份或证据冲突", 300)}\n- 时间：${formatTime(change.createdAt)}`
+          : `✅ **灾害事件已解除**\n- 事件：${markdownText(event?.title || change.masterEventId, 220)}\n- 原因：${markdownText(change.payload?.reason || "权威来源撤销或全部证据失效", 300)}\n- 时间：${formatTime(change.createdAt)}`,
+      });
+    } else if (change.type === "task_cancelled") {
+      enqueue(db, {
+        dedupeKey: `change:${change.id}`,
+        kind: change.type,
+        entityKey: clean(change.masterEventId, 220),
+        message: `🛑 **关联卫星任务已自动取消**\n- 任务：${markdownText(change.payload?.taskId, 220)}\n- 原状态：${markdownText(change.payload?.previousStatus, 80)}\n- 原因：${markdownText(change.payload?.reason, 300)}\n- 时间：${formatTime(change.createdAt)}`,
+      });
+    }
+  }
+  if (cursor) {
+    const separator = cursor.indexOf("|");
+    const timePart = separator >= 0 ? cursor.slice(0, separator) : cursor;
+    const idPart = separator >= 0 ? cursor.slice(separator + 1) : "";
+    if (Number.isFinite(Date.parse(timePart)) && idPart.length <= 300 && ![...idPart].some((character) => character.charCodeAt(0) < 32)) {
+      setMeta(db, "operational_change_cursor", separator >= 0 ? `${new Date(timePart).toISOString()}|${idPart}` : new Date(timePart).toISOString());
+    }
+  }
 }
 
 function processEvents(db, events, payload, config) {
@@ -413,11 +475,13 @@ async function deliverPending(db, config, fetchImpl) {
     message: rows.map((row) => row.message).join("\n\n---\n\n"),
   });
   try {
+    const webhookTimestamp = Math.floor(Date.now() / 1000).toString();
     const response = await fetchImpl(config.webhookUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-Webhook-Signature": signPayload(config.webhookSecret, body),
+        "X-Webhook-Signature-V2": signPayload(config.webhookSecret, body, webhookTimestamp),
+        "X-Webhook-Timestamp": webhookTimestamp,
         "X-Request-ID": requestId,
         "User-Agent": "Tianxun-VPS-Notifier/1.0",
       },
@@ -474,7 +538,12 @@ function isAlertable(event, config) {
 }
 
 function validEvent(event) {
-  return event && finiteCoordinates(event) && eventKey(event);
+  if (!event || !finiteCoordinates(event)) return false;
+  const latitude = Number(event.latitude);
+  const longitude = Number(event.longitude);
+  const key = eventKey(event);
+  return latitude >= -90 && latitude <= 90 && longitude >= -180 && longitude <= 180
+    && Boolean(key) && !/(?:^|[-_:])(undefined|null|nan|unknown)(?:$|[-_:])/i.test(key);
 }
 
 function finiteCoordinates(event) {
@@ -509,10 +578,15 @@ function clean(value, limit = 200) {
     .slice(0, limit);
 }
 
+function markdownText(value, limit = 200) {
+  return clean(value, limit).replace(/[\\`*_[\]()#+.!>|~-]/g, "\\$&");
+}
+
 function safeUrl(value) {
   try {
     const url = new URL(String(value));
-    return ["http:", "https:"].includes(url.protocol) ? url.toString() : "";
+    const localHttp = url.protocol === "http:" && ["localhost", "127.0.0.1", "::1"].includes(url.hostname);
+    return url.protocol === "https:" || localHttp ? url.toString() : "";
   } catch {
     return "";
   }
