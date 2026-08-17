@@ -103,9 +103,11 @@ bash /opt/tianxun/current/vps/scripts/configure-hermes.sh
 脚本会生成强随机 HMAC 密钥并创建 `tianxun-alerts` 路由。把输出的
 `HERMES_WEBHOOK_SECRET=...` 写入 `/etc/tianxun/notifier.env`。该路由使用
 `deliver_only`：不唤醒模型、不消耗 token，直接向飞书 home channel 投递。
-通知器使用 Hermes 推荐的 Generic V2 签名：`X-Webhook-Signature-V2` 为
-`HMAC-SHA256(timestamp.body)`，并发送 `X-Webhook-Timestamp` 与稳定的
-`X-Request-ID`，同时获得五分钟重放窗口和批次幂等保护。
+通知器默认使用 `HERMES_SIGNATURE_VERSION=auto`：优先发送 Generic V2
+`X-Webhook-Signature-V2 = HMAC-SHA256(timestamp.body)`；如果已安装的旧版 Hermes
+明确返回 `401 Invalid signature`，则仅对该请求兼容回退到 Generic V1
+`X-Webhook-Signature = HMAC-SHA256(body)`。升级 Hermes 后可固定为 `v2`；兼容期间
+仍发送稳定的 `X-Request-ID`，避免批次重复投递。
 
 如果 Hermes 已使用用户级服务，应让 `tianxun-notifier.service` 的 `After=` 与实际
 服务名保持一致；即使没有该依赖，通知器也会把失败投递留在 SQLite 中指数退避重试。

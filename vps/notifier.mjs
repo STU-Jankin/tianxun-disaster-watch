@@ -126,6 +126,7 @@ export function defaultConfig(env = process.env) {
     dbPath: resolve(env.TIANXUN_NOTIFY_DB || ".data/notifier.sqlite"),
     webhookUrl: env.HERMES_WEBHOOK_URL || "http://127.0.0.1:8644/webhooks/tianxun-alerts",
     webhookSecret: env.HERMES_WEBHOOK_SECRET || "",
+    webhookSignatureVersion: normalizeSignatureVersion(env.HERMES_SIGNATURE_VERSION),
     minPriority: boundedNumber(env.MIN_NOTIFY_PRIORITY, 0, 100, 65),
     cycloneMoveKm: boundedNumber(env.CYCLONE_MOVE_ALERT_KM, 10, 2000, 150),
     sourceFailureThreshold: boundedNumber(env.SOURCE_FAILURE_THRESHOLD, 1, 20, 3),
@@ -475,25 +476,38 @@ async function deliverPending(db, config, fetchImpl) {
     message: rows.map((row) => row.message).join("\n\n---\n\n"),
   });
   try {
-    const webhookTimestamp = Math.floor(Date.now() / 1000).toString();
-    const response = await fetchImpl(config.webhookUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Webhook-Signature-V2": signPayload(config.webhookSecret, body, webhookTimestamp),
-        "X-Webhook-Timestamp": webhookTimestamp,
-        "X-Request-ID": requestId,
-        "User-Agent": "Tianxun-VPS-Notifier/1.0",
-      },
-      body,
-      signal: AbortSignal.timeout(Math.min(config.requestTimeoutMs, 20000)),
-    });
-    if (!response.ok) throw new Error(`Hermes HTTP ${response.status}: ${clean(await response.text(), 300)}`);
+    const signaturePreference = normalizeSignatureVersion(config.webhookSignatureVersion);
+    const signatureVersions = signaturePreference === "auto" ? ["v2", "v1"] : [signaturePreference];
+    let deliveredWith = signatureVersions[0];
+    for (const signatureVersion of signatureVersions) {
+      const webhookTimestamp = Math.floor(Date.now() / 1000).toString();
+      const signatureHeaders = signatureVersion === "v2"
+        ? { "X-Webhook-Signature-V2": signPayload(config.webhookSecret, body, webhookTimestamp), "X-Webhook-Timestamp": webhookTimestamp }
+        : { "X-Webhook-Signature": signPayload(config.webhookSecret, body) };
+      const response = await fetchImpl(config.webhookUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...signatureHeaders,
+          "X-Request-ID": requestId,
+          "User-Agent": "Tianxun-VPS-Notifier/1.0",
+        },
+        body,
+        signal: AbortSignal.timeout(Math.min(config.requestTimeoutMs, 20000)),
+      });
+      if (response.ok) {
+        deliveredWith = signatureVersion;
+        break;
+      }
+      const responseText = clean(await response.text(), 300);
+      const canUseLegacyCompatibility = signaturePreference === "auto" && signatureVersion === "v2" && response.status === 401 && /invalid signature/i.test(responseText);
+      if (!canUseLegacyCompatibility) throw new Error(`Hermes HTTP ${response.status}: ${responseText}`);
+    }
     const deliveredAt = new Date().toISOString();
     const update = db.prepare("UPDATE notification_queue SET status='delivered', delivered_at=?, last_error='', lease_owner='' WHERE id=? AND lease_owner=?");
     for (const row of rows) update.run(deliveredAt, row.id, leaseOwner);
     setMeta(db, "last_delivery_success_at", deliveredAt);
-    return { delivered: rows.length, pending: 0, requestId };
+    return { delivered: rows.length, pending: 0, requestId, signatureVersion: deliveredWith };
   } catch (error) {
     const update = db.prepare("UPDATE notification_queue SET status=?, attempts=?, next_attempt_at=?, last_error=?, lease_owner='' WHERE id=? AND lease_owner=?");
     const now = Date.now();
@@ -618,6 +632,11 @@ function number(value, digits) {
 function boundedNumber(value, min, max, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
+}
+
+function normalizeSignatureVersion(value) {
+  const normalized = String(value || "auto").trim().toLowerCase();
+  return ["auto", "v1", "v2"].includes(normalized) ? normalized : "auto";
 }
 
 function booleanValue(value, fallback) {

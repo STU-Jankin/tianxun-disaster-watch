@@ -188,6 +188,39 @@ test("end-to-end baseline is delivered once and only material changes repeat", a
   assert.match(JSON.parse(sent[1].body).message, /等级升级/);
 });
 
+test("auto signature mode falls back to legacy Hermes only after an explicit invalid-signature response", async (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "tianxun-signature-compat-"));
+  context.after(() => rmSync(directory, { recursive: true, force: true }));
+  const deliveries = [];
+  const fetchImpl = async (url, options = {}) => {
+    if (String(url).includes("/api/events")) return Response.json({ events: [event({ priority: 75 })], sourceStatus: [], fallback: false, fetchedAt: "2026-08-13T00:00:00.000Z" });
+    if (String(url).includes("/api/changes")) return Response.json({ changes: [], cursor: "1970-01-01T00:00:00.000Z" });
+    deliveries.push(options.headers);
+    return deliveries.length === 1 ? new Response('{"error":"Invalid signature"}', { status: 401 }) : Response.json({ status: "delivered" });
+  };
+  const result = await runOnce({
+    ...config,
+    dbPath: join(directory, "notifier.sqlite"),
+    engineUrl: "http://engine/api/events",
+    webhookUrl: "http://hermes/webhooks/tianxun-alerts",
+    webhookSecret: "test-secret",
+    webhookSignatureVersion: "auto",
+    sourceFailureThreshold: 3,
+    maxDeliveryAttempts: 8,
+    maxBatchSize: 5,
+    requestTimeoutMs: 5000,
+    bootstrapNotify: true,
+  }, fetchImpl);
+  assert.equal(result.delivered, 1);
+  assert.equal(result.signatureVersion, "v1");
+  assert.equal(deliveries.length, 2);
+  assert.ok(deliveries[0]["X-Webhook-Signature-V2"]);
+  assert.ok(deliveries[0]["X-Webhook-Timestamp"]);
+  assert.ok(deliveries[1]["X-Webhook-Signature"]);
+  assert.equal(deliveries[1]["X-Webhook-Signature-V2"], undefined);
+  assert.equal(deliveries[0]["X-Request-ID"], deliveries[1]["X-Request-ID"]);
+});
+
 test("failed Hermes delivery remains queued for retry", async (context) => {
   const directory = mkdtempSync(join(tmpdir(), "tianxun-retry-"));
   context.after(() => rmSync(directory, { recursive: true, force: true }));
