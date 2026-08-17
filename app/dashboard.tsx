@@ -431,8 +431,8 @@ export function Dashboard() {
     <main className="app-shell">
       <header className="topbar" inert={taskPanelOpen ? true : undefined} aria-hidden={taskPanelOpen || undefined}>
         <div className="brand">
-          <div className="brand-mark"><span /></div>
-          <div><strong>天巡</strong><small>TIANXUN DISASTER WATCH</small></div>
+          <span className="brand-logo-frame" aria-hidden="true" />
+          <div className="brand-copy"><strong>星联体·天巡灾情实时预报系统</strong><small>SATELLITE UNION · TIANXUN DISASTER NOWCAST</small></div>
         </div>
         <div className="live-summary">
           <span className={`live-dot ${modeStale ? "stale" : ""}`} />
@@ -800,9 +800,9 @@ function MapView({ scope, events, selected, activeTask, detailOpen, layoutKey, o
       if (cancelled) return;
       const forecast = selected.cycloneForecast;
       const impactFrame = forecast?.impactField?.frames[Math.min(forecastFrameIndex, Math.max(0, forecast.impactField.frames.length - 1))];
-      if (selected.geometry.type !== "Point") {
+      if (selected.geometry && selected.geometry.type !== "Point") {
         L.geoJSON(unwrapForecastGeometry(selected.geometry, selected.longitude) as GeoJSON.GeoJsonObject, {
-          style: { color: "#006d63", weight: 3, fillColor: "#46a795", fillOpacity: 0.12, dashArray: "4 3", className: "selected-source-geometry" },
+          style: { color: "#087bd3", weight: 3, fillColor: "#4ba9e8", fillOpacity: 0.12, dashArray: "4 3", className: "selected-source-geometry" },
           interactive: false,
         }).addTo(layer);
       }
@@ -863,14 +863,14 @@ function MapView({ scope, events, selected, activeTask, detailOpen, layoutKey, o
           marker.addTo(layer);
         });
       }
-      L.circleMarker([selected.latitude, selected.longitude], { radius: 20, color: "#006d63", weight: 3, fill: false, interactive: false, className: "selected-event-ring" }).addTo(layer);
-      if (!activeTask && layer.getBounds().isValid() && (forecast || selected.geometry.type !== "Point")) fitWithOverlay(map, layer.getBounds(), forecast ? 7 : 9);
+      L.circleMarker([selected.latitude, selected.longitude], { radius: 20, color: "#087bd3", weight: 3, fill: false, interactive: false, className: "selected-event-ring" }).addTo(layer);
+      if (!activeTask && layer.getBounds().isValid() && (forecast || (selected.geometry && selected.geometry.type !== "Point"))) fitWithOverlay(map, layer.getBounds(), forecast ? 7 : 9);
     });
     return () => { cancelled = true; };
   }, [activeTask, fitWithOverlay, forecastFrameIndex, mapReady, selected]);
 
   useEffect(() => {
-    if (!mapReady || !selected || selected.cycloneForecast || selected.geometry.type !== "Point" || !mapRef.current) return;
+    if (!mapReady || !selected || selected.cycloneForecast || (selected.geometry && selected.geometry.type !== "Point") || !mapRef.current) return;
     const map = mapRef.current;
     const targetZoom = Math.max(map.getZoom(), scope === "global" ? 4 : map.getZoom());
     if (detailOpen) centerWithOverlay(map, selected.latitude, selected.longitude, targetZoom);

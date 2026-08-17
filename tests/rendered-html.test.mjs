@@ -17,8 +17,8 @@ test("server-renders the disaster watch dashboard", async () => {
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
   const html = await response.text();
-  assert.match(html, /天巡/);
-  assert.match(html, /全球自然灾害预警/);
+  assert.match(html, /星联体·天巡灾情实时预报系统/);
+  assert.match(html, /satellite-union-logo\.png/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
 });
 
@@ -65,6 +65,31 @@ test("keeps the data-source popover above every Leaflet pane", async () => {
   assert.match(css, /\.event-panel\s*\{[^}]*position:\s*relative;[^}]*z-index:\s*10;/s);
   assert.match(css, /\.map-title\s*\{[^}]*z-index:\s*900;/s);
   assert.match(css, /@media \(max-width: 720px\)[\s\S]*\.source-status-popover\s*\{[^}]*position:\s*fixed;[^}]*z-index:\s*1000;/s);
+});
+
+test("keeps the cyclone 4D timeline to the right of the observation title and responsive around detail panels", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(css, /\.cyclone-timeline\s*\{[^}]*left:\s*225px;[^}]*top:\s*20px;/s);
+  assert.match(css, /\.workspace:has\(\.detail-panel\)\s+\.cyclone-timeline\s*\{[^}]*calc\(100% - 585px\)/s);
+  assert.match(css, /@media \(max-width: 720px\)[\s\S]*\.cyclone-timeline,[^{]*\.event-panel\.closed[^{]*\{[^}]*top:\s*84px;[^}]*min-width:\s*0;/s);
+});
+
+test("uses a white and blue command-center color system", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(css, /--paper:\s*#edf5fc;/);
+  assert.match(css, /--panel:\s*#ffffff;/);
+  assert.match(css, /--teal:\s*#0868be;/);
+  assert.match(css, /Blue-white command-center theme/);
+});
+
+test("keeps map selection resilient while event geometry is being refreshed", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  assert.match(dashboard, /selected\.geometry && selected\.geometry\.type !== "Point"/);
+  assert.doesNotMatch(dashboard, /if \(selected\.geometry\.type !== "Point"/);
+  assert.doesNotMatch(dashboard, /\|\| selected\.geometry\.type !== "Point"/);
 });
 
 test("includes free official tsunami, typhoon, CAP and volcano-status connectors", async () => {
