@@ -82,6 +82,7 @@ test("uses a white and blue command-center color system", async () => {
   assert.match(css, /--panel:\s*#ffffff;/);
   assert.match(css, /--teal:\s*#0868be;/);
   assert.match(css, /Blue-white command-center theme/);
+  assert.match(css, /\.brand-logo-frame\s*\{[^}]*background:\s*#fff url\("\/satellite-union-logo\.png"\)/s);
 });
 
 test("keeps map selection resilient while event geometry is being refreshed", async () => {

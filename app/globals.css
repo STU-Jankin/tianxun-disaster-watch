@@ -25,7 +25,7 @@ button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visibl
 .app-shell { min-height: 100vh; background: linear-gradient(145deg, #f8fbff 0%, #e8f2fb 100%); }
 .topbar { height: 68px; padding: 0 22px; display: flex; align-items: center; gap: 30px; color: #f7fbff; background-color: #052e5c; background-image: linear-gradient(110deg, #031f42 0%, #075da3 68%, #087cc5 100%); border-bottom: 1px solid #2c83c2; box-shadow: 0 3px 18px #03274852; position: relative; z-index: 20; }
 .brand { display: flex; align-items: center; min-width: 390px; gap: 12px; }
-.brand-logo-frame { display: block; width: 140px; height: 48px; overflow: hidden; flex: 0 0 140px; background: url("/satellite-union-logo.png") -47px -35px / 254px auto no-repeat; }
+.brand-logo-frame { display: block; width: 140px; height: 48px; overflow: hidden; flex: 0 0 140px; background: #fff url("/satellite-union-logo.png") -47px -35px / 254px auto no-repeat; border-radius: 2px; box-shadow: 0 0 0 2px #fff; }
 .brand-copy { min-width: 0; }
 .brand strong { font-family: Georgia, "Noto Serif SC", serif; display: block; letter-spacing: .05em; font-size: 16px; line-height: 1.15; white-space: nowrap; }
 .brand small { display: block; color: #a9d3f4; font-size: 7px; letter-spacing: .09em; margin-top: 5px; white-space: nowrap; }
