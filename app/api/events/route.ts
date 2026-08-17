@@ -17,6 +17,7 @@ import { buildHourlyCycloneImpactField, buildJmaCycloneForecast, extractKmlFromK
 import { eventHasInvalidIdentity, firstValidSourceEventId, isValidSourceEventId } from "../../../lib/event-integrity";
 import { updateIngestionHealth } from "../../../lib/runtime-health";
 import { floodProcessEntityKey, sameFloodRegion } from "../../../lib/process-identity";
+import { selectFirmsEvents } from "../../../lib/event-selection";
 
 export const dynamic = "force-dynamic";
 
@@ -290,7 +291,7 @@ async function refreshEvents() {
       processedCount: normalized.length,
       retainedCount,
       persistenceAvailable,
-      selectionPolicy: { limit: 250, reservedPerHazard: 20, wildfireCap: 100, perSourceCap: 80 },
+      selectionPolicy: { limit: 250, reservedPerHazard: 20, wildfireCap: 100, perSourceCap: 80, firmsIngestionCap: 600, firmsSpatialReserveDegrees: 5 },
       windowPolicyVersion: "2026.08-phased-v3",
     },
     { headers: { "Cache-Control": "public, max-age=60, s-maxage=120" } },
@@ -734,7 +735,7 @@ async function fetchFirms(): Promise<DisasterEvent[]> {
     const cell = `${Math.round(latitude * 4) / 4},${Math.round(longitude * 4) / 4}`;
     cells.set(cell, [...(cells.get(cell) ?? []), row]);
   });
-  return [...cells.entries()]
+  const events = [...cells.entries()]
     .map(([cell, detections]) => {
       const latitude = detections.reduce((sum, row) => sum + Number(row.latitude), 0) / detections.length;
       const longitude = detections.reduce((sum, row) => sum + Number(row.longitude), 0) / detections.length;
@@ -762,6 +763,11 @@ async function fetchFirms(): Promise<DisasterEvent[]> {
       const detectionConfidence = Math.min(event.confidenceScore, confidence);
       return { ...event, confidenceScore: detectionConfidence, confidenceLevel: confidenceLevel(detectionConfidence), observable: "conditional" as const, dispatchEligibility: "review_required" as const, aoiApprovalRequired: true };
     });
+  // A global VIIRS day can contain tens of thousands of 0.25° cells. Keeping
+  // every low-confidence cell makes canonicalization and SQLite persistence
+  // monopolize the single web process for minutes. Preserve broad geographic
+  // coverage first, then fill the remaining budget with the strongest cells.
+  return selectFirmsEvents(events, 600);
 }
 
 async function fetchNhc(): Promise<DisasterEvent[]> {
