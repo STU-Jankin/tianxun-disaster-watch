@@ -139,3 +139,13 @@ test("implements stale-data, map resize, AOI preview and server task gates", asy
   assert.match(dashboard, /台风官方路径\/风圈/);
   assert.match(eventRoute, /authorizeApiRequest/);
 });
+
+test("keeps the public Nginx trial read-only and leaves internal services unexposed", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const nginx = await readFile(new URL("../vps/nginx/tianxun-public-readonly.conf", import.meta.url), "utf8");
+  assert.match(nginx, /listen 80 default_server/);
+  assert.equal(nginx.match(/tianxun-proxy-secret\.conf/g)?.length, 3);
+  assert.match(nginx, /location = \/api\/tasks[\s\S]*public-read-only[\s\S]*return 403/);
+  assert.match(nginx, /location ~ \^\/api\/\(changes\|visibility\)[\s\S]*return 403/);
+  assert.doesNotMatch(nginx, /listen\s+(?:127\.0\.0\.1:)?(?:3000|8644)/);
+});
