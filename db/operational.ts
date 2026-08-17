@@ -1,6 +1,7 @@
 import type { DisasterEvent } from "../lib/disasters";
 import { canTransitionTask } from "../lib/task-contract";
 import { eventHasInvalidIdentity, isValidSourceEventId } from "../lib/event-integrity";
+import { evidenceReassignmentSql } from "../lib/operational-sql";
 
 type TaskRecord = Record<string, unknown> & {
   taskId: string;
@@ -263,7 +264,8 @@ async function reconcileCanonicalMasters(db: DatabaseLike, masterIds: string[], 
     ]);
     const now = new Date().toISOString();
     const statements: DatabaseStatement[] = [
-      db.prepare(`UPDATE event_evidence SET master_event_id = ? WHERE master_event_id = ?`).bind(target, source.id),
+      db.prepare(evidenceReassignmentSql.copy).bind(target, source.id),
+      db.prepare(evidenceReassignmentSql.removeSource).bind(source.id),
       db.prepare(`UPDATE event_source_claims SET master_event_id = ? WHERE master_event_id = ? AND hazard = ?`).bind(target, source.id, event.hazard),
       db.prepare(`UPDATE canonical_events SET lifecycle_status = 'resolved', observation_expires_at = ?, synced_at = ? WHERE id = ?`).bind(now, now, source.id),
       db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at) VALUES (?, 'event_merged', ?, ?, ?)`)

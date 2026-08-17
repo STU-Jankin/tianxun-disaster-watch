@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
 
 import {
   aoiFingerprint,
@@ -10,6 +11,7 @@ import {
 } from "../lib/event-integrity.ts";
 import { classifyScope } from "../lib/disasters.ts";
 import { floodProcessEntityKey, sameFloodRegion } from "../lib/process-identity.ts";
+import { evidenceReassignmentSql } from "../lib/operational-sql.ts";
 
 test("rejects placeholder source identities and falls back to a valid feature id", () => {
   assert.equal(isValidSourceEventId("eonet-undefined"), false);
@@ -54,4 +56,18 @@ test("continuing flood bulletins map to one regional process without crossing ye
   const canal = floodProcessEntityKey({ title: "苏南运河洪水蓝色预警", country: "中国 · 江苏省", occurredAt: "2026-07-08T00:00:00Z" });
   const river = floodProcessEntityKey({ title: "望虞河洪水蓝色预警", country: "中国 · 江苏省", occurredAt: "2026-07-08T00:00:00Z" });
   assert.equal(sameFloodRegion(canal, river), false);
+});
+
+test("canonical evidence reassignment tolerates identities already present on the target", () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec(`CREATE TABLE event_evidence (id INTEGER PRIMARY KEY AUTOINCREMENT, master_event_id TEXT NOT NULL, source TEXT NOT NULL, source_url TEXT NOT NULL, source_event_id TEXT NOT NULL, observed_at TEXT NOT NULL, role TEXT NOT NULL);
+    CREATE UNIQUE INDEX event_evidence_source_event_uidx ON event_evidence (master_event_id, source, source_event_id);`);
+  const insert = db.prepare("INSERT INTO event_evidence (master_event_id, source, source_url, source_event_id, observed_at, role) VALUES (?, ?, ?, ?, ?, ?)");
+  insert.run("target", "source", "https://example.test/1", "shared", "2026-08-01T00:00:00Z", "detection");
+  insert.run("source-master", "source", "https://example.test/1", "shared", "2026-08-01T00:00:00Z", "detection");
+  insert.run("source-master", "source", "https://example.test/2", "unique", "2026-08-02T00:00:00Z", "detection");
+  db.prepare(evidenceReassignmentSql.copy).run("target", "source-master");
+  db.prepare(evidenceReassignmentSql.removeSource).run("source-master");
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM event_evidence WHERE master_event_id='target'").get().count, 2);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM event_evidence WHERE master_event_id='source-master'").get().count, 0);
 });
