@@ -7,6 +7,7 @@ import type {
   CycloneWindField,
   EventGeometry,
 } from "./disasters";
+import { normalizeAntimeridianGeometry } from "./geo-geometry.ts";
 
 const MAX_KMZ_BYTES = 6_000_000;
 const MAX_KML_BYTES = 12_000_000;
@@ -18,6 +19,17 @@ export type OfficialImpactSlice = {
   uncertaintyRadiusKm?: number;
   uncertaintyGeometry?: EventGeometry;
   windFields: CycloneWindField[];
+};
+
+export type CycloneTaskAoiSlice = {
+  validFrom: string;
+  validTo: string;
+  leadHours: number;
+  center: [number, number];
+  centerBasis: CycloneImpactFrame["centerBasis"];
+  thresholdKnots?: number;
+  windGeometry?: EventGeometry;
+  uncertaintyGeometry?: EventGeometry;
 };
 
 export async function extractKmlFromKmz(input: ArrayBuffer | Uint8Array): Promise<string> {
@@ -179,14 +191,40 @@ export function cycloneWindGeometry(frame: CycloneImpactFrame, field: CycloneWin
     const bearing = index * 5;
     return destinationCoordinate(frame.latitude, frame.longitude, interpolatedQuadrantRadius(field.quadrantsKm, bearing), bearing);
   });
-  return { type: "Polygon", coordinates: [ring] };
+  return normalizeAntimeridianGeometry({ type: "Polygon", coordinates: [ring] }) as EventGeometry
+    ?? { type: "Polygon", coordinates: [ring] };
 }
 
 export function cycloneUncertaintyGeometry(frame: CycloneImpactFrame): EventGeometry | undefined {
   if (frame.uncertaintyGeometry) return frame.uncertaintyGeometry;
-  return frame.uncertaintyRadiusKm && frame.uncertaintyRadiusKm > 0
-    ? { type: "Polygon", coordinates: [circleRing(frame.latitude, frame.longitude, frame.uncertaintyRadiusKm * 1000)] }
-    : undefined;
+  if (!frame.uncertaintyRadiusKm || frame.uncertaintyRadiusKm <= 0) return undefined;
+  const geometry = { type: "Polygon" as const, coordinates: [circleRing(frame.latitude, frame.longitude, frame.uncertaintyRadiusKm * 1000)] };
+  return normalizeAntimeridianGeometry(geometry) as EventGeometry ?? geometry;
+}
+
+export function cycloneTaskAoiSlices(forecast: CycloneForecast | undefined, imagingStart: string, imagingEnd: string): CycloneTaskAoiSlice[] {
+  const start = Date.parse(imagingStart);
+  const end = Date.parse(imagingEnd);
+  const frames = forecast?.impactField?.frames ?? [];
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || !frames.length) return [];
+  return frames.flatMap((frame, index): CycloneTaskAoiSlice[] => {
+    const frameStart = Date.parse(frame.forecastAt);
+    const nextFrameStart = index + 1 < frames.length ? Date.parse(frames[index + 1].forecastAt) : frameStart + 3_600_000;
+    const validFrom = Math.max(start, frameStart);
+    const validTo = Math.min(end, nextFrameStart);
+    if (!Number.isFinite(frameStart) || validTo <= validFrom) return [];
+    const field = [...frame.windFields].sort((left, right) => left.thresholdKnots - right.thresholdKnots)[0];
+    return [{
+      validFrom: new Date(validFrom).toISOString(),
+      validTo: new Date(validTo).toISOString(),
+      leadHours: frame.leadHours,
+      center: [frame.longitude, frame.latitude],
+      centerBasis: frame.centerBasis,
+      thresholdKnots: field?.thresholdKnots,
+      windGeometry: field ? cycloneWindGeometry(frame, field) : undefined,
+      uncertaintyGeometry: cycloneUncertaintyGeometry(frame),
+    }];
+  }).slice(0, 361);
 }
 
 export function buildJmaCycloneForecast(
@@ -228,8 +266,11 @@ export function buildJmaCycloneForecast(
   const windArea = asRecord(currentForecast?.galeWarningArea);
   const windCenter = coordinateFromLatLonArray(windArea?.center);
   const windRadius = finiteNumber(windArea?.radius);
-  const impactGeometry = windCenter && windRadius && windRadius > 0
+  const rawImpactGeometry = windCenter && windRadius && windRadius > 0
     ? { type: "Polygon" as const, coordinates: [circleRing(windCenter[1], windCenter[0], windRadius)] }
+    : undefined;
+  const impactGeometry = rawImpactGeometry
+    ? normalizeAntimeridianGeometry(rawImpactGeometry) as EventGeometry ?? undefined
     : undefined;
   const impactSlices = forecastRecords.flatMap((record): OfficialImpactSlice[] => {
     const leadHours = Number(record.advancedHours);
@@ -319,7 +360,8 @@ function parseCoordinates(value: string): Coordinate[] {
 function polygonGeometry(rings: Coordinate[][]): EventGeometry | undefined {
   const valid = rings.filter((ring) => ring.length >= 4 && sameCoordinate(ring[0], ring[ring.length - 1]));
   if (!valid.length) return undefined;
-  return valid.length === 1 ? { type: "Polygon", coordinates: [valid[0]] } : { type: "MultiPolygon", coordinates: valid.map((ring) => [ring]) };
+  const geometry: EventGeometry = valid.length === 1 ? { type: "Polygon", coordinates: [valid[0]] } : { type: "MultiPolygon", coordinates: valid.map((ring) => [ring]) };
+  return normalizeAntimeridianGeometry(geometry) as EventGeometry ?? undefined;
 }
 
 function sameCoordinate(left: Coordinate, right: Coordinate) {

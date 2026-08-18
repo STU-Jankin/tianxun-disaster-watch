@@ -1,3 +1,5 @@
+import { normalizeAntimeridianGeometry, validateGeoGeometry } from "./geo-geometry.ts";
+
 export type GeoGeometry = { type: "Point" | "Polygon" | "MultiPolygon" | "LineString"; coordinates: unknown };
 export type CustomAoiGeometry = { type: "Polygon" | "MultiPolygon"; coordinates: unknown };
 
@@ -62,9 +64,17 @@ export function normalizeCustomAoiGeoJson(value: unknown): CustomAoiGeometry | n
   };
   addGeometry(value);
   if (!polygons.length || vertices > 10_000) return null;
-  return polygons.length === 1
+  const geometry: CustomAoiGeometry = polygons.length === 1
     ? { type: "Polygon", coordinates: polygons[0] }
     : { type: "MultiPolygon", coordinates: polygons };
+  const normalized = normalizeAntimeridianGeometry(geometry);
+  if (!normalized || (normalized.type !== "Polygon" && normalized.type !== "MultiPolygon")) return null;
+  return validateGeoGeometry(normalized, {
+    maximumVertices: 10_000,
+    maximumRingVertices: 2_000,
+    maximumAreaKm2: 2_000_000,
+    rejectUnsplitAntimeridian: true,
+  }).ok ? normalized as CustomAoiGeometry : null;
 }
 
 export function customAoiPartCount(geometry: CustomAoiGeometry | undefined) {
@@ -133,5 +143,10 @@ function normalizeLongitude(value: number) {
 }
 
 function isGeometry(value: unknown) {
-  return Boolean(value && typeof value === "object" && ["Point", "LineString", "Polygon", "MultiPolygon"].includes(String((value as { type?: unknown }).type)) && Array.isArray((value as { coordinates?: unknown }).coordinates));
+  return validateGeoGeometry(value, {
+    maximumVertices: 10_000,
+    maximumRingVertices: 2_000,
+    maximumAreaKm2: 25_000_000,
+    rejectUnsplitAntimeridian: true,
+  }).ok;
 }

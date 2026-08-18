@@ -72,7 +72,19 @@ test("keeps the cyclone 4D timeline to the right of the observation title and re
   const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   assert.match(css, /\.cyclone-timeline\s*\{[^}]*left:\s*225px;[^}]*top:\s*20px;/s);
   assert.match(css, /\.workspace:has\(\.detail-panel\)\s+\.cyclone-timeline\s*\{[^}]*calc\(100% - 585px\)/s);
-  assert.match(css, /@media \(max-width: 720px\)[\s\S]*\.cyclone-timeline,[^{]*\.event-panel\.closed[^{]*\{[^}]*top:\s*84px;[^}]*min-width:\s*0;/s);
+  assert.match(css, /@media \(max-width: 720px\)[\s\S]*\.cyclone-timeline,[^{]*\.event-panel\.closed[^{]*\{[^}]*top:\s*112px;[^}]*min-width:\s*0;/s);
+});
+
+test("separates expired cyclone forecast AOIs from post-event observation tasks", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  const taskRoute = await readFile(new URL("../app/api/tasks/route.ts", import.meta.url), "utf8");
+  const contract = await readFile(new URL("../lib/task-contract.ts", import.meta.url), "utf8");
+  assert.match(dashboard, /const cycloneForecastUsable = !event\.cycloneForecast/);
+  assert.match(dashboard, /官方台风报次已不足一小时，不再作为预测 AOI/);
+  assert.match(dashboard, /cycloneForecastUsable \? event\.cycloneForecast\?\.impactGeometry : undefined/);
+  assert.match(taskRoute, /task\.aoiType === "source"/);
+  assert.match(contract, /forecast\?\.impactField !== undefined && task\.aoiType === "source"/);
 });
 
 test("uses a white and blue command-center color system", async () => {
@@ -100,7 +112,8 @@ test("includes free official tsunami, typhoon, CAP and volcano-status connectors
   for (const source of ["NOAA NTWC 海啸", "NOAA PTWC 海啸", "日本气象厅 JMA 台风", "WMO Alert Hub · 中国", "GeoNet 火山警戒"]) assert.ok(route.includes(source));
   assert.match(route, /selectBalancedEvents/);
   assert.match(route, /information statement\|cancell\?ation/);
-  assert.match(disasters, /tsunami: \{ goldenHours: 72, followupHours: 720/);
+  assert.match(disasters, /tsunami: \{ goldenHours: 24, followupHours: 336, hardReviewHours: 720/);
+  assert.match(disasters, /PhenomenonStage = "observed" \| "forecast" \| "warning"/);
 });
 
 test("models canonical events, evidence provenance and AOI dispatch gates", async () => {

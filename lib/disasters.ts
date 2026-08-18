@@ -11,13 +11,14 @@ export type HazardType =
   | "ice";
 
 export type ScopeId = "wuxi" | "jiangsu" | "china" | "global";
+export type PhenomenonStage = "observed" | "forecast" | "warning" | "driver" | "context";
 
 export type EventEvidence = {
   source: string;
   sourceUrl: string;
   sourceEventId: string;
   observedAt: string;
-  role: "detection" | "warning" | "verification";
+  role: "detection" | "warning" | "verification" | "driver" | "context";
 };
 
 export type EventUpdate = {
@@ -105,6 +106,10 @@ export type DisasterEvent = {
   occurredAt: string;
   updatedAt: string;
   activityAt: string;
+  issuedAt: string;
+  validFrom?: string;
+  validTo?: string;
+  phenomenonStage: PhenomenonStage;
   source: string;
   sourceUrl: string;
   sourceSeverity: string;
@@ -144,29 +149,33 @@ export type DisasterEvent = {
   observationWindowHours: number;
   observationReviewAt: string;
   observationExpiresAt: string;
-  observationPhase: "golden" | "followup" | "archive";
-  observationStatus: "actionable" | "expired";
+  observationHardReviewAt: string;
+  observationReferenceAt: string;
+  observationRationale: string;
+  observationPolicyVersion: string;
+  observationPhase: "forecast" | "golden" | "followup" | "archive";
+  observationStatus: "actionable" | "review_required" | "expired";
 };
 
 export const observationWindowPolicy: Record<
   HazardType,
-  { goldenHours: number; followupHours: number; label: string; rationale: string }
+  { goldenHours: number; followupHours: number; hardReviewHours: number; forecastHorizonHours: number; label: string; rationale: string }
 > = {
-  earthquake: { goldenHours: 168, followupHours: 720, label: "7天 / 30天", rationale: "形变、破裂、滑坡及损毁复核" },
-  tsunami: { goldenHours: 72, followupHours: 720, label: "3天 / 30天", rationale: "沿岸淹没、冲刷、漂浮物与港口损毁" },
-  wildfire: { goldenHours: 168, followupHours: 1080, label: "7天 / 45天", rationale: "火场演化、过火范围及烧毁强度" },
-  flood: { goldenHours: 168, followupHours: 720, label: "7天 / 30天", rationale: "洪峰、退水与持续淹没监测" },
-  cyclone: { goldenHours: 168, followupHours: 720, label: "7天 / 30天", rationale: "登陆影响、内涝及灾后损毁" },
-  volcano: { goldenHours: 336, followupHours: 1440, label: "14天 / 60天", rationale: "热异常、熔岩、羽流与形变" },
-  landslide: { goldenHours: 336, followupHours: 1440, label: "14天 / 60天", rationale: "滑坡扩张、残余形变与堰塞湖" },
-  drought: { goldenHours: 720, followupHours: 4320, label: "30天 / 180天", rationale: "按月及季节基线复核慢发过程" },
-  dust: { goldenHours: 24, followupHours: 72, label: "24小时 / 72小时", rationale: "跟踪沙尘输送直至过程消散" },
-  ice: { goldenHours: 720, followupHours: 4320, label: "30天 / 180天", rationale: "按季节基线监测冰雪与冰湖变化" },
+  earthquake: { goldenHours: 72, followupHours: 720, hardReviewHours: 2160, forecastHorizonHours: 72, label: "72小时 / 30天", rationale: "前3天优先损毁与滑坡；SAR形变依轨道重访可延至30天，90天强制重审" },
+  tsunami: { goldenHours: 24, followupHours: 336, hardReviewHours: 720, forecastHorizonHours: 72, label: "24小时 / 14天", rationale: "首日优先沿岸淹没与港口；岸线冲刷与漂浮物复核至14天" },
+  wildfire: { goldenHours: 24, followupHours: 720, hardReviewHours: 2160, forecastHorizonHours: 168, label: "24小时 / 30天", rationale: "活跃火点和火线按小时级复访；过火面与烧毁强度保留30天" },
+  flood: { goldenHours: 72, followupHours: 336, hardReviewHours: 720, forecastHorizonHours: 240, label: "72小时 / 14天", rationale: "洪峰和淹没前3天优先；退水与堤防复核至14天，流域慢洪需人工延长" },
+  cyclone: { goldenHours: 24, followupHours: 336, hardReviewHours: 720, forecastHorizonHours: 240, label: "24小时 / 14天", rationale: "路径与风圈严格服从官方报次有效期；登陆后损毁复核至14天" },
+  volcano: { goldenHours: 72, followupHours: 2160, hardReviewHours: 8760, forecastHorizonHours: 336, label: "72小时 / 90天", rationale: "热异常、火山灰与熔岩前3天密集观测；形变序列至90天" },
+  landslide: { goldenHours: 72, followupHours: 720, hardReviewHours: 2160, forecastHorizonHours: 168, label: "72小时 / 30天", rationale: "滑坡范围、堵江与应急通道前3天优先；残余形变至30天" },
+  drought: { goldenHours: 720, followupHours: 8760, hardReviewHours: 17520, forecastHorizonHours: 2160, label: "30天 / 365天", rationale: "慢发过程以月度和季节基线判定；每30天复核，不使用快灾时效逻辑" },
+  dust: { goldenHours: 6, followupHours: 36, hardReviewHours: 72, forecastHorizonHours: 72, label: "6小时 / 36小时", rationale: "宽幅高频跟踪输送过程；连续36小时无实质更新则归档" },
+  ice: { goldenHours: 168, followupHours: 2160, hardReviewHours: 8760, forecastHorizonHours: 720, label: "7天 / 90天", rationale: "冰湖、海冰与雪崩以周度复访起步；季节变化至90天后重审" },
 };
 
 export const severityWindowMultiplier: Record<DisasterEvent["severity"], number> = {
-  red: 1.5,
-  orange: 1.25,
+  red: 1.35,
+  orange: 1.2,
   yellow: 1.1,
   blue: 1,
 };
@@ -269,9 +278,10 @@ export function calculatePriority(
   occurredAt: string,
   observable: DisasterEvent["observable"] = hazardMeta[hazard].observable,
   confidenceScore = 100,
+  temporal: { phenomenonStage?: PhenomenonStage; issuedAt?: string; validFrom?: string } = {},
 ) {
   const severityScore = { red: 35, orange: 30, yellow: 24, blue: 18 }[severity];
-  const timeScore = calculateTimeScore(occurredAt);
+  const timeScore = calculateTimeScore(occurredAt, temporal);
   const observability = observable === "direct" ? 10 : observable === "consequence" ? 8 : 6;
   const confidence = confidenceScore >= 85 ? 0 : confidenceScore >= 70 ? -8 : -20;
   const breakdown = {
@@ -287,10 +297,23 @@ export function calculatePriority(
   };
 }
 
-export function calculateTimeScore(occurredAt: string) {
+export function calculateTimeScore(occurredAt: string, temporal: { phenomenonStage?: PhenomenonStage; issuedAt?: string; validFrom?: string } = {}) {
   const occurred = new Date(occurredAt).getTime();
   if (!Number.isFinite(occurred)) return 0;
-  const ageHours = Math.max(0, (Date.now() - occurred) / 3_600_000);
+  const now = Date.now();
+  const stage = temporal.phenomenonStage ?? "observed";
+  if (stage === "driver" || stage === "context") return stage === "driver" ? 0 : 4;
+  if (stage === "warning" || stage === "forecast") {
+    const issued = new Date(temporal.issuedAt ?? occurredAt).getTime();
+    const validFrom = new Date(temporal.validFrom ?? occurredAt).getTime();
+    if (!Number.isFinite(issued) || !Number.isFinite(validFrom)) return 0;
+    const issueAgeHours = Math.max(0, (now - issued) / 3_600_000);
+    const leadHours = Math.max(0, (validFrom - now) / 3_600_000);
+    const ceiling = stage === "warning" ? 18 : 15;
+    return Math.max(0, Math.round(ceiling * 2 ** (-issueAgeHours / 72) * 2 ** (-leadHours / 120)));
+  }
+  if (occurred > now + 5 * 60_000) return 0;
+  const ageHours = Math.max(0, (now - occurred) / 3_600_000);
   // 七天半衰期：刚发生为30分，1/3/7/14/30天约为27/22/15/8/2分。
   return Math.max(0, Math.min(30, Math.round(30 * 2 ** (-ageHours / 168))));
 }
@@ -300,33 +323,70 @@ export function getObservationTimeline(
   activityAt: string,
   hazard: HazardType,
   severity: DisasterEvent["severity"],
+  context: {
+    phenomenonStage?: PhenomenonStage;
+    issuedAt?: string;
+    validFrom?: string;
+    validTo?: string;
+    forecastValidUntil?: string;
+    targets?: string[];
+    sensors?: string[];
+  } = {},
 ) {
   const occurred = new Date(occurredAt).getTime();
   const activity = new Date(activityAt).getTime();
+  const issued = new Date(context.issuedAt ?? activityAt).getTime();
+  const validFrom = new Date(context.validFrom ?? occurredAt).getTime();
+  const declaredEnds = [context.validTo, context.forecastValidUntil]
+    .map((value) => value ? new Date(value).getTime() : Number.NaN)
+    .filter(Number.isFinite);
   const latestActivity = Math.max(
     Number.isFinite(occurred) ? occurred : 0,
     Number.isFinite(activity) ? activity : 0,
   );
   const policy = observationWindowPolicy[hazard];
+  const stage = context.phenomenonStage ?? "observed";
   const goldenHours = policy.goldenHours;
-  const followupHours = Math.max(
-    goldenHours,
-    Math.round(policy.followupHours * severityWindowMultiplier[severity]),
-  );
-  const reviewAt = latestActivity + goldenHours * 3_600_000;
-  // 实质活动可以延长观测期，但不能被标题或行政性修订无限续期。
-  const rollingExpiry = latestActivity + followupHours * 3_600_000;
-  const hardExpiry = (Number.isFinite(occurred) ? occurred : latestActivity) + followupHours * 2 * 3_600_000;
-  // 仍有实质活动时 hard cap 只触发复核，不直接删除；活动停止后仍由滚动期限归档。
-  const expiresAt = rollingExpiry;
-  const hardReviewAt = hardExpiry;
   const now = Date.now();
+  if (stage === "forecast" || stage === "warning") {
+    const referenceAt = Number.isFinite(validFrom) ? validFrom : Number.isFinite(issued) ? issued : latestActivity;
+    const horizonEnd = (Number.isFinite(issued) ? issued : latestActivity) + policy.forecastHorizonHours * 3_600_000;
+    const declaredEnd = declaredEnds.length ? Math.min(...declaredEnds) : horizonEnd;
+    const expiresAt = Math.min(declaredEnd, horizonEnd);
+    const reviewAt = Math.min(referenceAt + goldenHours * 3_600_000, expiresAt);
+    const hardReviewAt = expiresAt;
+    const phase = now < referenceAt ? "forecast" as const : now < reviewAt ? "golden" as const : now < expiresAt ? "followup" as const : "archive" as const;
+    return {
+      goldenHours,
+      followupHours: Math.max(0, Math.round((expiresAt - referenceAt) / 3_600_000)),
+      reviewAt: new Date(reviewAt).toISOString(),
+      expiresAt: new Date(expiresAt).toISOString(),
+      hardReviewAt: new Date(hardReviewAt).toISOString(),
+      referenceAt: new Date(referenceAt).toISOString(),
+      phase,
+      requiresReview: !declaredEnds.length,
+      rationale: `${stage === "forecast" ? "预报" : "预警"}任务严格截止于权威有效期；严重度不延长官方报次。${policy.rationale}`,
+    };
+  }
+  const longTermTarget = (context.targets ?? []).some((target) => /形变|过火|烧毁|植被|水体|岸线|堆积|退水|损毁|冰|雪/.test(target));
+  const persistentSensor = (context.sensors ?? []).some((sensor) => /SAR|多光谱|高分/.test(sensor));
+  const scienceMultiplier = Math.min(1.5, 1 + (longTermTarget ? 0.2 : 0) + (persistentSensor ? 0.1 : 0));
+  const followupHours = Math.max(goldenHours, Math.round(policy.followupHours * severityWindowMultiplier[severity] * scienceMultiplier));
+  const referenceAt = Number.isFinite(occurred) ? occurred : latestActivity;
+  const reviewAt = referenceAt + goldenHours * 3_600_000;
+  // 只有实质活动时间可以推迟归档；达到硬复核点后必须重新确认AOI和观测价值。
+  const expiresAt = latestActivity + followupHours * 3_600_000;
+  const hardReviewAt = referenceAt + policy.hardReviewHours * 3_600_000;
+  const phase = now < reviewAt ? "golden" as const : now < expiresAt ? "followup" as const : "archive" as const;
   return {
     goldenHours,
     followupHours,
     reviewAt: new Date(reviewAt).toISOString(),
     expiresAt: new Date(expiresAt).toISOString(),
     hardReviewAt: new Date(hardReviewAt).toISOString(),
-    phase: now < reviewAt ? "golden" as const : now < expiresAt ? "followup" as const : "archive" as const,
+    referenceAt: new Date(referenceAt).toISOString(),
+    phase,
+    requiresReview: stage === "driver" || stage === "context" || now >= hardReviewAt,
+    rationale: `${policy.rationale}；${longTermTarget ? "包含长期变化目标" : "以快速应急目标为主"}${persistentSensor ? "，且载荷支持持续复访" : ""}。`,
   };
 }

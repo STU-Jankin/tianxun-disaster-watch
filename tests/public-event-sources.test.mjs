@@ -53,8 +53,8 @@ test("parses ECCC warning areas but filters ended and irrelevant alerts", async 
     geometry: { type: "Polygon", coordinates: [[[-124, 52], [-123, 52], [-123, 53], [-124, 52]]] },
     properties: {
       alert_type: "warning",
-      alert_name_en: "air quality warning",
-      alert_text_en: "Area impacted by wildfire smoke.",
+      alert_name_en: "forest fire warning",
+      alert_text_en: "An active forest fire is affecting the warning polygon.",
       publication_datetime: "2026-08-18T06:00:00Z",
       validity_datetime: "2026-08-18T06:00:00Z",
       expiration_datetime: "2026-08-19T06:00:00Z",
@@ -68,6 +68,9 @@ test("parses ECCC warning areas but filters ended and irrelevant alerts", async 
   assert.equal(events.length, 1);
   assert.equal(events[0].hazard, "wildfire");
   assert.equal(events[0].requiresReview, true);
+  assert.equal(events[0].phenomenonStage, "warning");
+  const smokeOnly = parseEcccAlerts({ features: [{ ...feature, id: "smoke", properties: { ...feature.properties, alert_name_en: "air quality warning", alert_text_en: "Wildfire smoke only." } }] }, Date.parse("2026-08-18T07:00:00Z"));
+  assert.equal(smokeOnly.length, 0, "smoke advisories are drivers/context, not observed wildfire events");
 });
 
 test("turns Copernicus WKT AOIs into a MultiPolygon without treating them as damage boundaries", async () => {

@@ -3,6 +3,7 @@ import {
   normalizeEarthquakeSeverity,
   type DisasterEvent,
   type HazardType,
+  type PhenomenonStage,
 } from "./disasters.ts";
 
 export type PublicEventCandidate = {
@@ -13,6 +14,10 @@ export type PublicEventCandidate = {
   occurredAt: string;
   updatedAt: string;
   activityAt?: string;
+  issuedAt?: string;
+  validFrom?: string;
+  validTo?: string;
+  phenomenonStage?: PhenomenonStage;
   sourceUrl: string;
   sourceSeverity: string;
   severity: DisasterEvent["severity"];
@@ -42,18 +47,22 @@ export function parseNwsAlerts(payload: unknown, now = Date.now()): PublicEventC
     const geometry = geometryValue(feature.geometry);
     if (!hazard || !geometry) return [];
     const sourceEventId = stableId(properties.id ?? feature.id);
-    const occurredAt = validIso(properties.onset ?? properties.effective ?? properties.sent);
-    const updatedAt = validIso(properties.sent ?? properties.effective);
-    if (!sourceEventId || !occurredAt || !updatedAt) return [];
+    const issuedAt = validIso(properties.sent ?? properties.effective);
+    const validFrom = validIso(properties.onset ?? properties.effective) ?? issuedAt;
+    if (!sourceEventId || !issuedAt || !validFrom) return [];
     const severityText = [properties.severity, properties.urgency, properties.certainty].map(text).filter(Boolean).join(" · ") || "NWS alert";
     return [{
       sourceEventId,
       title: safeText(properties.headline, 240, eventName),
       hazard,
       geometry,
-      occurredAt,
-      updatedAt,
-      activityAt: updatedAt,
+      occurredAt: issuedAt,
+      updatedAt: issuedAt,
+      activityAt: issuedAt,
+      issuedAt,
+      validFrom,
+      validTo: expiresAt ?? undefined,
+      phenomenonStage: "warning",
       sourceUrl: safeHttps(properties["@id"] ?? feature.id, nwsPublicUrl),
       sourceSeverity: severityText,
       severity: normalizeCapSeverity(text(properties.severity), text(properties.urgency), text(properties.certainty)),
@@ -75,9 +84,9 @@ export function parseEcccAlerts(payload: unknown, now = Date.now()): PublicEvent
     const hazard = officialAlertHazard(alertName, description);
     const geometry = geometryValue(feature.geometry);
     const sourceEventId = stableId(feature.id ?? properties.feature_id);
-    const occurredAt = validIso(properties.validity_datetime ?? properties.publication_datetime);
-    const updatedAt = validIso(properties.publication_datetime);
-    if (!hazard || !geometry || !sourceEventId || !occurredAt || !updatedAt) return [];
+    const issuedAt = validIso(properties.publication_datetime);
+    const validFrom = validIso(properties.validity_datetime) ?? issuedAt;
+    if (!hazard || !geometry || !sourceEventId || !issuedAt || !validFrom) return [];
     const colour = safeText(properties.risk_colour_en, 30, "official alert");
     const featureName = safeText(properties.feature_name_en, 120, "Canada");
     const province = safeText(properties.province, 30, "Canada");
@@ -86,9 +95,13 @@ export function parseEcccAlerts(payload: unknown, now = Date.now()): PublicEvent
       title: `${alertName} · ${featureName}`,
       hazard,
       geometry,
-      occurredAt,
-      updatedAt,
-      activityAt: updatedAt,
+      occurredAt: issuedAt,
+      updatedAt: issuedAt,
+      activityAt: issuedAt,
+      issuedAt,
+      validFrom,
+      validTo: expiresAt ?? undefined,
+      phenomenonStage: "warning",
       sourceUrl: ecccPublicUrl,
       sourceSeverity: `${safeText(properties.alert_type, 30, "alert")} · ${colour}`,
       severity: colourSeverity(colour),
@@ -117,6 +130,8 @@ export function parseEmscEvents(payload: unknown): PublicEventCandidate[] {
       geometry,
       occurredAt,
       updatedAt,
+      issuedAt: updatedAt,
+      phenomenonStage: "observed",
       sourceUrl: emscPublicUrl,
       sourceSeverity: `M${magnitude.toFixed(1)}`,
       severity: normalizeEarthquakeSeverity(magnitude),
@@ -156,6 +171,8 @@ export function parseCopernicusActivations(payload: unknown, now = Date.now()): 
       occurredAt: eventTime,
       updatedAt,
       activityAt: updatedAt,
+      issuedAt: updatedAt,
+      phenomenonStage: "context",
       sourceUrl: safeHttps(activation.reportLink, `${copernicusPublicUrl}${code}`),
       sourceSeverity: activation.closed ? "Rapid Mapping closed" : "Rapid Mapping active",
       severity: activation.closed ? "blue" as const : "yellow" as const,
@@ -211,7 +228,7 @@ export function officialAlertHazard(title: string, description = ""): HazardType
   if (/landslide|mudslide|debris flow/.test(value)) return "landslide";
   if (/hurricane|tropical (?:cyclone|storm|depression)|typhoon/.test(value)) return "cyclone";
   if (/flash flood|flood warning|coastal flood|storm surge|river flood/.test(value)) return "flood";
-  if (/wildfire smoke|forest fire|wildfire|fire warning/.test(value) && !/fire weather/.test(value)) return "wildfire";
+  if (/forest fire|wildfire|bushfire|fire warning/.test(value) && !/wildfire smoke|fire weather|red flag/.test(value)) return "wildfire";
   if (/dust storm|blowing dust|sandstorm/.test(value)) return "dust";
   if (/blizzard|ice storm|snow squall|heavy snow|avalanche/.test(value)) return "ice";
   if (/drought/.test(value)) return "drought";

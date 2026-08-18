@@ -9,7 +9,9 @@ import {
   type CycloneForecast,
   type DisasterEvent,
   type HazardType,
+  type PhenomenonStage,
 } from "../../../lib/disasters";
+import { normalizeAntimeridianGeometry, validateGeoGeometry } from "../../../lib/geo-geometry";
 import { listRetainedCanonicalEvents, persistCanonicalEvents, resolveCanonicalEventsByReferences } from "../../../db/operational";
 import { circularGeometryCenter, cycloneSeverityFromKnots, firmsConfidenceScore, firmsHeatSeverity, latestTrackPoint } from "../../../lib/source-normalization";
 import { authorizeApiRequest } from "../../../lib/api-security";
@@ -293,9 +295,14 @@ async function refreshEvents() {
   if (runs.some((run) => run.online)) lastSuccessfulFetchAt = refreshCompletedAt;
   const cancellations = cancellationBuffer.splice(0);
   const collected = runs.flatMap((run) => run.events);
-  const normalized = canonicalizeEvents(collected.filter((event) => !eventHasInvalidIdentity(event)))
+  const currentEvents = canonicalizeEvents(collected.filter((event) => !eventHasInvalidIdentity(event)))
     .filter((event) => event.evidence.some((item) => !isCmaSurfaceSource(item.source)))
     .map(finalize);
+  // Merge the last persisted event and evidence snapshot before writing the new
+  // batch. Otherwise a transient source outage would overwrite a multi-source
+  // evidence chain with the one source that happened to answer this refresh.
+  const retained = await listRetainedEventsSafely();
+  const normalized = canonicalizeEvents([...currentEvents, ...retained]).map(finalize);
   const allSourcesUnavailable = runs.every((source) => !source.online);
   const sourceCounts = runs.map((run) => ({
     name: run.name,
@@ -306,7 +313,7 @@ async function refreshEvents() {
     online: run.online,
     message: run.message,
     producing: run.producing,
-    count: normalized.filter((event) => event.evidence.some((item) => item.source.startsWith(run.name))).length,
+    count: currentEvents.filter((event) => event.evidence.some((item) => item.source.startsWith(run.name))).length,
   }));
   let persistenceAvailable = true;
   if (!allSourcesUnavailable) persistenceAvailable = await persistCanonicalEvents(normalized);
@@ -315,7 +322,6 @@ async function refreshEvents() {
     cancellations.forEach((item) => byReason.set(item.reason, [...(byReason.get(item.reason) ?? []), item]));
     for (const [reason, items] of byReason) await resolveCanonicalEventsByReferences(items, reason);
   }
-  const retained = await listRetainedEventsSafely();
   updateIngestionHealth({
     lastAttemptAt: refreshCompletedAt,
     lastSuccessAt: lastSuccessfulFetchAt,
@@ -323,8 +329,8 @@ async function refreshEvents() {
     producingSources: runs.filter((run) => run.producing).length,
     persistenceAvailable,
   });
-  const liveEvidence = new Set(normalized.flatMap((event) => event.evidence.map((item) => `${sourceFamily(item.source)}|${item.sourceEventId}`)));
-  const operationalEvents = canonicalizeEvents([...normalized, ...retained]).map((event) => {
+  const liveEvidence = new Set(currentEvents.flatMap((event) => event.evidence.map((item) => `${sourceFamily(item.source)}|${item.sourceEventId}`)));
+  const operationalEvents = normalized.map((event) => {
     const presentInCurrentFeeds = event.evidence.some((item) => liveEvidence.has(`${sourceFamily(item.source)}|${item.sourceEventId}`));
     const finalized = finalize(event);
     return { ...finalized, sourcePresence: presentInCurrentFeeds ? "current" as const : "retained" as const, lifecycleStatus: presentInCurrentFeeds ? finalized.lifecycleStatus : "monitoring" as const };
@@ -335,7 +341,7 @@ async function refreshEvents() {
       return counts;
     }, {}),
   ).map(([hazard, count]) => ({ hazard, count }));
-  const events = selectBalancedEvents(operationalEvents.filter((event) => event.observationStatus === "actionable" && event.lifecycleStatus !== "resolved"), 250);
+  const events = selectBalancedEvents(operationalEvents.filter((event) => event.observationStatus !== "expired" && event.lifecycleStatus !== "resolved"), 250);
   const retainedCount = events.filter((event) => event.sourcePresence === "retained").length;
   const fallback = allSourcesUnavailable ? fallbackEvents().map(finalize) : [];
   const fallbackSourceCounts = allSourcesUnavailable
@@ -351,12 +357,12 @@ async function refreshEvents() {
       lastSuccessfulFetchAt,
       producingSourceCount: runs.filter((run) => run.producing).length,
       fallback: allSourcesUnavailable,
-      expiredCount: normalized.filter((event) => event.observationStatus === "expired").length,
-      processedCount: normalized.length,
+      expiredCount: currentEvents.filter((event) => event.observationStatus === "expired").length,
+      processedCount: currentEvents.length,
       retainedCount,
       persistenceAvailable,
       selectionPolicy: { limit: 250, reservedPerHazard: 20, wildfireCap: 100, perSourceCap: 80, firmsIngestionCap: 600, firmsSpatialReserveDegrees: 5 },
-      windowPolicyVersion: "2026.08-phased-v3",
+      windowPolicyVersion: "2026.08-science-v4",
     },
     { headers: { "Cache-Control": "public, max-age=60, s-maxage=120" } },
   );
@@ -648,14 +654,23 @@ async function fetchCmaEventFeed(): Promise<DisasterEvent[]> {
   const body = await readLimitedText(response, 5_000_000, "CMA");
   if (/^\s*</.test(body)) return parseCapFeed(body, "中国气象数据网 CMA", publicSourceUrl(url, "https://data.cma.cn/"));
   const data = JSON.parse(body) as { features?: Array<{ id?: string | number; geometry?: { type?: string; coordinates?: unknown }; properties?: Record<string, unknown> }> };
-  const now = new Date().toISOString();
   return (data.features ?? []).flatMap((feature, index) => {
-    const center = geometryCenter(feature.geometry?.coordinates);
     const properties = feature.properties ?? {};
     const title = String(properties.title ?? properties.event ?? properties.name ?? "气象灾害预警");
     const hazard = textHazard(title);
-    if (!center || !hazard) return [];
-    const issuedAt = validIso(properties.issuedAt ?? properties.sent ?? properties.datetime ?? properties.date) ?? now;
+    const issuedAt = validIso(properties.issuedAt ?? properties.sent ?? properties.datetime ?? properties.date);
+    const validFrom = validIso(properties.onset ?? properties.effective ?? properties.validFrom) ?? issuedAt;
+    const validTo = validIso(properties.expires ?? properties.ends ?? properties.validTo);
+    if (!hazard || !issuedAt || !validFrom || (validTo && +new Date(validTo) <= Date.now())) return [];
+    let geometry: DisasterEvent["geometry"];
+    try {
+      if (!feature.geometry?.type || feature.geometry.coordinates === undefined) return [];
+      geometry = sanitizeGeometry({ type: feature.geometry.type, coordinates: feature.geometry.coordinates });
+    } catch {
+      return [];
+    }
+    const center = pointOnGeometry(geometry);
+    if (!center) return [];
     const sourceSeverity = String(properties.severity ?? properties.level ?? properties.color ?? "气象预警");
     return [baseEvent({
       id: `cma-${String(feature.id ?? properties.id ?? index)}-${issuedAt}`,
@@ -665,11 +680,16 @@ async function fetchCmaEventFeed(): Promise<DisasterEvent[]> {
       longitude: center[0],
       occurredAt: issuedAt,
       updatedAt: validIso(properties.updatedAt ?? properties.updated) ?? issuedAt,
+      activityAt: issuedAt,
+      issuedAt,
+      validFrom,
+      validTo: validTo ?? undefined,
+      phenomenonStage: "warning",
       source: "中国气象数据网 CMA 预警",
       sourceUrl: String(properties.url ?? url),
       sourceSeverity,
       severity: officialColorSeverity(sourceSeverity),
-      geometry: feature.geometry?.type && feature.geometry.coordinates !== undefined ? sanitizeGeometry({ type: feature.geometry.type, coordinates: feature.geometry.coordinates }) : undefined,
+      geometry,
       country: String(properties.area ?? properties.location ?? "中国"),
       description: String(properties.description ?? "来自已授权CMA业务接口；仅接收带点位或面几何、且遥感可直接或间接观测的事件。"),
     })];
@@ -795,6 +815,10 @@ function publicCandidateEvent(candidate: PublicEventCandidate, source: string, p
     occurredAt: candidate.occurredAt,
     updatedAt: candidate.updatedAt,
     activityAt: candidate.activityAt,
+    issuedAt: candidate.issuedAt,
+    validFrom: candidate.validFrom,
+    validTo: candidate.validTo,
+    phenomenonStage: candidate.phenomenonStage,
     source,
     sourceUrl: candidate.sourceUrl,
     sourceSeverity: candidate.sourceSeverity,
@@ -1007,6 +1031,11 @@ async function fetchNhc(): Promise<DisasterEvent[]> {
       longitude,
       occurredAt,
       updatedAt: occurredAt,
+      activityAt: occurredAt,
+      issuedAt: cycloneForecast?.issuedAt ?? occurredAt,
+      validFrom: occurredAt,
+      validTo: cycloneForecast?.forecastValidUntil,
+      phenomenonStage: "observed",
       source: "NOAA NHC",
       sourceUrl,
       sourceSeverity: windKt ? `${windKt} kt` : String(storm.classification ?? "活动中"),
@@ -1061,6 +1090,11 @@ async function fetchNoaaTsunami(url: string, source: string): Promise<DisasterEv
     longitude,
     occurredAt,
     updatedAt,
+    activityAt: updatedAt,
+    issuedAt: updatedAt,
+    validFrom: validIso(tag(xml, "effective") || tag(xml, "onset")) ?? updatedAt,
+    validTo: expiresAt ?? undefined,
+    phenomenonStage: "warning",
     source,
     sourceUrl: decodeXml(tag(xml, "web") || url),
     sourceSeverity: `${eventName}${severityText ? ` · ${severityText}` : ""}`,
@@ -1137,6 +1171,11 @@ function parseJmaTyphoon(payload: unknown, eventId: string, forecastPayload: unk
     longitude: coordinates[0],
     occurredAt,
     updatedAt: cycloneForecast?.issuedAt ?? occurredAt,
+    activityAt: cycloneForecast?.issuedAt ?? occurredAt,
+    issuedAt: cycloneForecast?.issuedAt ?? occurredAt,
+    validFrom: occurredAt,
+    validTo: cycloneForecast?.forecastValidUntil,
+    phenomenonStage: "observed",
     source: "日本气象厅 JMA 台风",
     sourceUrl,
     sourceSeverity: wind !== null ? `最大风速 ${wind} m/s` : pressure !== null ? `中心气压 ${pressure} hPa` : "活动中",
@@ -1251,15 +1290,21 @@ async function fetchGlofas(): Promise<DisasterEvent[]> {
   const url = process.env.GLOFAS_EVENT_FEED_URL;
   if (!url) return [];
   const data = await fetchJson(url) as { features?: Array<{ id?: string | number; geometry?: { type?: string; coordinates?: unknown }; properties?: Record<string, unknown> }> };
-  const now = new Date().toISOString();
   return (data.features ?? []).flatMap((feature) => {
-    const coordinates = feature.geometry?.coordinates;
-    const center = geometryCenter(coordinates);
-    if (!center) return [];
     const p = feature.properties ?? {};
-    const issuedAt = validIso(p.issuedAt ?? p.issued_at ?? p.datetime ?? p.date) ?? now;
-    const forecastAt = validIso(p.onset ?? p.validFrom ?? p.valid_from ?? p.forecastStart ?? p.forecast_start ?? p.forecastTime) ?? issuedAt;
+    const issuedAt = validIso(p.issuedAt ?? p.issued_at ?? p.datetime ?? p.date);
+    const forecastAt = validIso(p.onset ?? p.validFrom ?? p.valid_from ?? p.forecastStart ?? p.forecast_start ?? p.forecastTime);
     const validTo = validIso(p.validTo ?? p.valid_to ?? p.forecastEnd ?? p.forecast_end ?? p.expires);
+    if (!issuedAt || !forecastAt || !validTo || +new Date(validTo) <= Date.now() || +new Date(validTo) <= +new Date(forecastAt)) return [];
+    let geometry: DisasterEvent["geometry"];
+    try {
+      if (!feature.geometry?.type || feature.geometry.coordinates === undefined) return [];
+      geometry = sanitizeGeometry({ type: feature.geometry.type, coordinates: feature.geometry.coordinates });
+    } catch {
+      return [];
+    }
+    const center = pointOnGeometry(geometry);
+    if (!center) return [];
     const returnPeriod = Number(p.returnPeriod ?? p.return_period ?? 0);
     const rawProbability = Number(p.probability ?? p.exceedanceProbability ?? p.exceedance_probability);
     const probability = Number.isFinite(rawProbability) ? Math.max(0, Math.min(1, rawProbability > 1 ? rawProbability / 100 : rawProbability)) : null;
@@ -1275,11 +1320,15 @@ async function fetchGlofas(): Promise<DisasterEvent[]> {
       occurredAt: forecastAt,
       updatedAt: issuedAt,
       activityAt: issuedAt,
+      issuedAt,
+      validFrom: forecastAt,
+      validTo,
+      phenomenonStage: "forecast",
       source: "Copernicus GloFAS",
       sourceUrl: String(p.url ?? "https://global-flood.emergency.copernicus.eu/"),
       sourceSeverity: `${returnPeriod ? `预测重现期 ${returnPeriod} 年` : String(p.severity ?? "洪水预报")}${probability === null ? "" : ` · 超阈概率 ${(probability * 100).toFixed(0)}%`}`,
       severity,
-      geometry: feature.geometry?.type && coordinates !== undefined ? sanitizeGeometry({ type: feature.geometry.type, coordinates }) : undefined,
+      geometry,
       description: `由业务侧 GloFAS 处理链输出的洪水预测目标；目标时间为预测起始时间，更新时间为预报发布时间${validTo ? `，有效期至 ${validTo}` : ""}。它不是已确认洪水，必须经实况或人工复核后下发任务。`,
     });
     return [{ ...event, observable: "conditional" as const, dispatchEligibility: "review_required" as const, aoiApprovalRequired: true }];
@@ -1294,13 +1343,28 @@ async function fetchReliefWeb(): Promise<DisasterEvent[]> {
   return [];
 }
 
-function baseEvent(input: Omit<DisasterEvent, "masterEventId" | "entityKey" | "lifecycleStatus" | "sourcePresence" | "evidence" | "evidenceCount" | "updateHistory" | "updateCount" | "confidenceScore" | "confidenceLevel" | "geometryType" | "geometry" | "activityAt" | "locationQuality" | "locationAccuracyKm" | "aoiApprovalRequired" | "dispatchEligibility" | "observable" | "observationTargets" | "recommendedSensors" | "scope" | "priority" | "priorityBreakdown" | "observationGoldenHours" | "observationWindowHours" | "observationReviewAt" | "observationExpiresAt" | "observationPhase" | "observationStatus"> & { geometry?: DisasterEvent["geometry"]; activityAt?: string }): DisasterEvent {
+function baseEvent(input: Omit<DisasterEvent, "masterEventId" | "entityKey" | "lifecycleStatus" | "sourcePresence" | "evidence" | "evidenceCount" | "updateHistory" | "updateCount" | "confidenceScore" | "confidenceLevel" | "geometryType" | "geometry" | "activityAt" | "issuedAt" | "validFrom" | "validTo" | "phenomenonStage" | "locationQuality" | "locationAccuracyKm" | "aoiApprovalRequired" | "dispatchEligibility" | "observable" | "observationTargets" | "recommendedSensors" | "scope" | "priority" | "priorityBreakdown" | "observationGoldenHours" | "observationWindowHours" | "observationReviewAt" | "observationExpiresAt" | "observationHardReviewAt" | "observationReferenceAt" | "observationRationale" | "observationPolicyVersion" | "observationPhase" | "observationStatus"> & {
+  geometry?: DisasterEvent["geometry"];
+  activityAt?: string;
+  issuedAt?: string;
+  validFrom?: string;
+  validTo?: string;
+  phenomenonStage?: PhenomenonStage;
+}): DisasterEvent {
   const meta = hazardMeta[input.hazard];
   const location = inferLocationProfile(input.source, input.hazard, input.description);
   const confidenceScore = sourceTrust(input.source) - (location.quality === "representative" ? 18 : location.quality === "estimated" ? 8 : 0);
+  const geometry = input.geometry ?? { type: "Point" as const, coordinates: [input.longitude, input.latitude] };
+  const phenomenonStage = input.phenomenonStage ?? "observed";
+  const hasDispatchableArea = geometry.type === "Polygon" || geometry.type === "MultiPolygon" || Boolean(input.cycloneForecast?.impactGeometry);
+  const sourceReady = phenomenonStage === "observed" && location.quality === "precise" && hasDispatchableArea && meta.observable !== "conditional";
   return {
     ...input,
     activityAt: input.activityAt ?? input.occurredAt,
+    issuedAt: input.issuedAt ?? input.updatedAt,
+    validFrom: input.validFrom,
+    validTo: input.validTo,
+    phenomenonStage,
     masterEventId: input.id,
     entityKey: processEntityKey(input),
     lifecycleStatus: "active",
@@ -1324,12 +1388,12 @@ function baseEvent(input: Omit<DisasterEvent, "masterEventId" | "entityKey" | "l
     updateCount: 1,
     confidenceScore,
     confidenceLevel: confidenceLevel(confidenceScore),
-    geometryType: input.geometry?.type ?? "Point",
-    geometry: input.geometry ?? { type: "Point", coordinates: [input.longitude, input.latitude] },
+    geometryType: geometry.type,
+    geometry,
     locationQuality: location.quality,
     locationAccuracyKm: location.accuracyKm,
-    aoiApprovalRequired: location.quality !== "precise",
-    dispatchEligibility: location.quality === "precise" ? "ready" : "review_required",
+    aoiApprovalRequired: !sourceReady,
+    dispatchEligibility: sourceReady ? "ready" : "review_required",
     observable: meta.observable,
     observationTargets: meta.targets,
     recommendedSensors: meta.sensors,
@@ -1340,8 +1404,12 @@ function baseEvent(input: Omit<DisasterEvent, "masterEventId" | "entityKey" | "l
     observationWindowHours: 0,
     observationReviewAt: input.updatedAt,
     observationExpiresAt: input.updatedAt,
+    observationHardReviewAt: input.updatedAt,
+    observationReferenceAt: input.occurredAt,
+    observationRationale: "尚未应用观测期策略",
+    observationPolicyVersion: "2026.08-science-v4",
     observationPhase: "golden",
-    observationStatus: "actionable",
+    observationStatus: sourceReady ? "actionable" : "review_required",
   };
 }
 
@@ -1352,8 +1420,22 @@ function finalize(event: DisasterEvent): DisasterEvent {
     event.activityAt,
     event.hazard,
     event.severity,
+    {
+      phenomenonStage: event.phenomenonStage ?? "observed",
+      issuedAt: event.issuedAt ?? event.updatedAt,
+      validFrom: event.validFrom,
+      validTo: event.validTo,
+      forecastValidUntil: event.cycloneForecast?.forecastValidUntil,
+      targets: event.observationTargets,
+      sensors: event.recommendedSensors,
+    },
   );
-  const priority = calculatePriority(event.severity, scope, event.hazard, event.activityAt, event.observable, event.confidenceScore);
+  const priority = calculatePriority(event.severity, scope, event.hazard, event.occurredAt, event.observable, event.confidenceScore, {
+    phenomenonStage: event.phenomenonStage ?? "observed",
+    issuedAt: event.issuedAt ?? event.updatedAt,
+    validFrom: event.validFrom,
+  });
+  const policyNeedsReview = timeline.requiresReview;
   return {
     ...event,
     scope,
@@ -1369,8 +1451,14 @@ function finalize(event: DisasterEvent): DisasterEvent {
     observationWindowHours: timeline.followupHours,
     observationReviewAt: timeline.reviewAt,
     observationExpiresAt: timeline.expiresAt,
+    observationHardReviewAt: timeline.hardReviewAt,
+    observationReferenceAt: timeline.referenceAt,
+    observationRationale: timeline.rationale,
+    observationPolicyVersion: "2026.08-science-v4",
     observationPhase: timeline.phase,
-    observationStatus: timeline.phase === "archive" ? "expired" : "actionable",
+    observationStatus: timeline.phase === "archive" ? "expired" : policyNeedsReview ? "review_required" : "actionable",
+    dispatchEligibility: policyNeedsReview && event.dispatchEligibility === "ready" ? "review_required" : event.dispatchEligibility,
+    aoiApprovalRequired: policyNeedsReview || event.aoiApprovalRequired,
     lifecycleStatus: timeline.phase === "archive" ? "archived" : timeline.phase === "followup" ? "monitoring" : "active",
   };
 }
@@ -1402,9 +1490,15 @@ function canonicalizeEvents(events: DisasterEvent[]) {
     const location = [...canonicalCandidates].sort((a, b) => locationRank(b.locationQuality) - locationRank(a.locationQuality) || a.locationAccuracyKm - b.locationAccuracyKm)[0];
     const cycloneForecast = candidates.flatMap((event) => event.cycloneForecast ? [event.cycloneForecast] : [])
       .sort((a, b) => +new Date(b.issuedAt) - +new Date(a.issuedAt) || b.track.length - a.track.length)[0];
-    const independentEvidenceCount = new Set(evidence.filter((item) => sourceTrust(item.source) >= 85).map((item) => sourceFamily(item.source))).size;
+    const independentEvidenceCount = new Set(evidence
+      .filter((item) => sourceTrust(item.source) >= 85 && item.role !== "driver" && item.role !== "context")
+      .map((item) => sourceFamily(item.source))).size;
     const confidenceScore = Math.min(99, primary.confidenceScore + Math.min(18, Math.max(0, independentEvidenceCount - 1) * 6));
     const strongestSeverity = [...canonicalCandidates].sort((a, b) => severityRank(b.severity) - severityRank(a.severity) || +new Date(b.updatedAt) - +new Date(a.updatedAt))[0];
+    const temporal = [...canonicalCandidates].sort((a, b) => +new Date(b.issuedAt ?? b.updatedAt) - +new Date(a.issuedAt ?? a.updatedAt))[0];
+    const phenomenonStage = [...canonicalCandidates]
+      .sort((a, b) => phenomenonStageRank(b.phenomenonStage ?? "observed") - phenomenonStageRank(a.phenomenonStage ?? "observed") || +new Date(b.updatedAt) - +new Date(a.updatedAt))[0]
+      .phenomenonStage ?? "observed";
     const entityKey = candidates.map((event) => event.entityKey || processEntityKey(event)).sort((a, b) => entityKeySpecificity(b) - entityKeySpecificity(a))[0];
     return {
       ...primary,
@@ -1428,11 +1522,19 @@ function canonicalizeEvents(events: DisasterEvent[]) {
       locationAccuracyKm: location.locationAccuracyKm,
       aoiApprovalRequired: location.aoiApprovalRequired,
       dispatchEligibility: location.dispatchEligibility,
+      issuedAt: temporal.issuedAt ?? temporal.updatedAt,
+      validFrom: temporal.validFrom,
+      validTo: temporal.validTo,
+      phenomenonStage,
       occurredAt: new Date(Math.min(...candidates.map((event) => +new Date(event.occurredAt)))).toISOString(),
       updatedAt: new Date(Math.max(...candidates.map((event) => +new Date(event.updatedAt)))).toISOString(),
       activityAt: new Date(Math.max(...candidates.map((event) => +new Date(event.activityAt || event.occurredAt)))).toISOString(),
     };
   });
+}
+
+function phenomenonStageRank(value: PhenomenonStage) {
+  return { driver: 1, context: 2, forecast: 3, warning: 4, observed: 5 }[value];
 }
 
 function severityRank(value: DisasterEvent["severity"]) {
@@ -1528,8 +1630,10 @@ function locationRank(quality: DisasterEvent["locationQuality"]) {
   return { precise: 4, estimated: 3, representative: 2, unknown: 1 }[quality];
 }
 
-function evidenceRole(source: string): "detection" | "warning" | "verification" {
-  if (/ReliefWeb|Smithsonian|Copernicus EMS|EMSC/.test(source) || isCmaSurfaceSource(source)) return "verification";
+function evidenceRole(source: string): "detection" | "warning" | "verification" | "driver" | "context" {
+  if (isCmaSurfaceSource(source)) return "driver";
+  if (/ReliefWeb|Smithsonian|Copernicus EMS|LHASA/.test(source)) return "context";
+  if (/EMSC|GeoNet/.test(source)) return "verification";
   if (/WMO|NOAA|JMA|ECCC|CMA 预警/.test(source)) return "warning";
   return "detection";
 }
@@ -1673,20 +1777,30 @@ function sanitizeGeometry(geometry: { type: string; coordinates: unknown }): Dis
     if (closed && coordinates.length < 4) throw new Error("多边形环顶点不足");
     return coordinates;
   };
-  if (geometry.type === "Point") return { type: "Point", coordinates: pair(geometry.coordinates) };
-  if (geometry.type === "LineString") return { type: "LineString", coordinates: line(geometry.coordinates) };
-  if (geometry.type === "Polygon") {
+  let sanitized: DisasterEvent["geometry"];
+  if (geometry.type === "Point") sanitized = { type: "Point", coordinates: pair(geometry.coordinates) };
+  else if (geometry.type === "LineString") sanitized = { type: "LineString", coordinates: line(geometry.coordinates) };
+  else if (geometry.type === "Polygon") {
     if (!Array.isArray(geometry.coordinates) || !geometry.coordinates.length || geometry.coordinates.length > 100) throw new Error("多边形结构无效");
-    return { type: "Polygon", coordinates: geometry.coordinates.map((ring) => line(ring, true)) };
+    sanitized = { type: "Polygon", coordinates: geometry.coordinates.map((ring) => line(ring, true)) };
   }
-  if (geometry.type === "MultiPolygon") {
+  else if (geometry.type === "MultiPolygon") {
     if (!Array.isArray(geometry.coordinates) || !geometry.coordinates.length || geometry.coordinates.length > 100) throw new Error("复合多边形结构无效");
-    return { type: "MultiPolygon", coordinates: geometry.coordinates.map((polygon) => {
+    sanitized = { type: "MultiPolygon", coordinates: geometry.coordinates.map((polygon) => {
       if (!Array.isArray(polygon) || !polygon.length || polygon.length > 100) throw new Error("复合多边形结构无效");
       return polygon.map((ring) => line(ring, true));
     }) };
-  }
-  throw new Error("不支持的几何类型");
+  } else throw new Error("不支持的几何类型");
+  const normalized = sanitized.type === "Polygon" || sanitized.type === "MultiPolygon"
+    ? normalizeAntimeridianGeometry(sanitized)
+    : sanitized;
+  if (!normalized || !validateGeoGeometry(normalized, {
+    maximumVertices: 10_000,
+    maximumRingVertices: 2_000,
+    maximumAreaKm2: 100_000_000,
+    rejectUnsplitAntimeridian: normalized.type !== "LineString",
+  }).ok) throw new Error("几何拓扑无效、自相交或面积超出安全范围");
+  return normalized as DisasterEvent["geometry"];
 }
 
 function pointOnGeometry(geometry: DisasterEvent["geometry"]): [number, number] | null {
@@ -1789,7 +1903,9 @@ function parseCapFeed(xml: string, source: string, sourceUrl: string): DisasterE
     const severity = tag(document, "cap:severity") || tag(document, "severity") || "Moderate";
     const urgency = tag(document, "cap:urgency") || tag(document, "urgency");
     const certainty = tag(document, "cap:certainty") || tag(document, "certainty");
-    const occurredAt = validIso(tag(document, "cap:sent") || tag(document, "sent") || tag(document, "updated") || tag(document, "pubDate")) ?? new Date().toISOString();
+    const issuedAt = validIso(tag(document, "cap:sent") || tag(document, "sent") || tag(document, "updated") || tag(document, "pubDate"));
+    if (!issuedAt) return [];
+    const validFrom = validIso(tag(document, "cap:onset") || tag(document, "onset") || tag(document, "cap:effective") || tag(document, "effective")) ?? issuedAt;
     const linkValue = decodeXml(tag(document, "link"));
     const linkHref = document.match(/<link\b[^>]*\bhref=["']([^"']+)["'][^>]*>/i)?.[1];
     const identifier = tag(document, "cap:identifier") || tag(document, "identifier") || tag(document, "id") || String(index);
@@ -1799,8 +1915,13 @@ function parseCapFeed(xml: string, source: string, sourceUrl: string): DisasterE
       hazard,
       latitude: coordinates[1],
       longitude: coordinates[0],
-      occurredAt,
-      updatedAt: occurredAt,
+      occurredAt: issuedAt,
+      updatedAt: issuedAt,
+      activityAt: issuedAt,
+      issuedAt,
+      validFrom,
+      validTo: expiresAt ?? undefined,
+      phenomenonStage: "warning",
       source,
       sourceUrl: decodeXml(linkValue || linkHref || sourceUrl),
       sourceSeverity: [severity, urgency, certainty].filter(Boolean).join(" · "),
@@ -1832,14 +1953,16 @@ function capGeometryFromDocument(xml: string): DisasterEvent["geometry"] | null 
     const longitude = Number(circleMatch[2]);
     const radiusKm = Number(circleMatch[3]);
     if (!validCoordinates(latitude, longitude)) return null;
-    if (Number.isFinite(radiusKm) && radiusKm > 0 && radiusKm <= 2_000) return { type: "Polygon", coordinates: [geodesicCircle(latitude, longitude, radiusKm)] };
+    if (Number.isFinite(radiusKm) && radiusKm > 0 && radiusKm <= 2_000) {
+      try { return sanitizeGeometry({ type: "Polygon", coordinates: [geodesicCircle(latitude, longitude, radiusKm)] }); } catch { return null; }
+    }
     return { type: "Point", coordinates: [longitude, latitude] };
   }
   const polygon = tag(xml, "cap:polygon") || tag(xml, "polygon");
   const ring = [...polygon.matchAll(/(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)/g)].map((match) => [Number(match[2]), Number(match[1])]);
   if (ring.length >= 3) {
     if (ring[0][0] !== ring[ring.length - 1][0] || ring[0][1] !== ring[ring.length - 1][1]) ring.push([...ring[0]]);
-    return { type: "Polygon", coordinates: [ring] };
+    try { return sanitizeGeometry({ type: "Polygon", coordinates: [ring] }); } catch { return null; }
   }
   return null;
 }
@@ -1866,7 +1989,7 @@ function textHazard(value: string): HazardType | null {
   if (/tsunami|海啸|津波/.test(text)) return "tsunami";
   if (/volcan|eruption|volcanic ash|火山|喷发/.test(text)) return "volcano";
   if (/wildfire|forest fire|bushfire|山火|野火|森林火灾|草原火灾/.test(text)) return "wildfire";
-  if (/flood|inundation|rainstorm|heavy rain|flash flood|洪|暴雨/.test(text)) return "flood";
+  if (/flood|inundation|flash flood|洪水|山洪|内涝/.test(text)) return "flood";
   if (/cyclone|hurricane|typhoon|tropical storm|台风|飓风/.test(text)) return "cyclone";
   if (/landslide|mudslide|debris flow|滑坡|泥石流|山崩/.test(text)) return "landslide";
   if (/drought|干旱/.test(text)) return "drought";

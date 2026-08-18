@@ -1,3 +1,5 @@
+import { validateGeoGeometry } from "./geo-geometry.ts";
+
 export const taskStatuses = ["candidate", "reviewed", "scheduled", "submitted", "acquired", "completed", "failed", "cancelled"] as const;
 export type TaskStatus = (typeof taskStatuses)[number];
 
@@ -19,12 +21,13 @@ export type TaskValidationResult = { ok: true } | { ok: false; errors: string[] 
 
 const allowedTaskFields = new Set([
   "taskId", "eventId", "masterEventId", "entityKey", "title", "hazard", "priority", "latitude", "longitude",
-  "eventOccurredAt", "eventUpdatedAt", "aoiType", "aoiRadiusKm", "aoiWidthKm", "aoiHeightKm", "aoiLengthKm",
+  "eventOccurredAt", "eventUpdatedAt", "eventIssuedAt", "eventValidFrom", "eventValidTo", "phenomenonStage", "aoiType", "aoiRadiusKm", "aoiWidthKm", "aoiHeightKm", "aoiLengthKm",
   "aoiBearingDeg", "sourceGeometry", "customGeometry", "cycloneForecast", "minimumCoveragePercent", "maximumCloudPercent",
   "spatialResolutionMeters", "incidenceAngleMinDeg", "incidenceAngleMaxDeg", "revisitCount", "deliveryDeadline",
   "imagingStart", "imagingEnd", "sensors", "observationTargets", "observationPhase", "source", "sourceUrl",
   "locationQuality", "locationAccuracyKm", "evidenceCount", "aoiApproval", "approvedAt", "approvedBy",
   "approvalReason", "createdAt", "updatedAt", "status", "revision", "eventRevision", "aoiHash",
+  "timeIndexedAoi", "forecastAdvisoryId", "forecastIssuedAt", "forecastValidUntil",
 ]);
 
 export function unknownTaskFields(task: Record<string, unknown>) {
@@ -69,6 +72,7 @@ export function validateSatelliteTask(task: Record<string, unknown>, options: { 
   if (!Number.isFinite(delivery) || (Number.isFinite(end) && delivery < end)) errors.push("交付期限必须是有效时间且不早于成像窗口结束");
   if (!isValidAoi(task)) errors.push("AOI 参数无效或超出安全范围");
   if (task.cycloneForecast !== undefined && !isValidCycloneForecast(task.cycloneForecast)) errors.push("台风官方预报字段无效或超出安全范围");
+  if (task.timeIndexedAoi !== undefined && !isValidTimeIndexedAoi(task.timeIndexedAoi, start, end)) errors.push("逐时台风 AOI 字段无效或超出任务时间窗");
   if (!isValidApproval(task.aoiApproval)) errors.push("AOI 审批状态无效");
   if (options.requireApproved && task.aoiApproval !== "source_verified" && task.aoiApproval !== "operator_confirmed") errors.push("任务尚未通过 AOI 审批");
   if (options.requireApproved && task.aoiApproval === "source_verified" && task.aoiType !== "source") errors.push("来源核验任务必须使用不可修改的来源几何");
@@ -78,6 +82,8 @@ export function validateSatelliteTask(task: Record<string, unknown>, options: { 
   if (options.requireProvenance) {
     if (typeof task.eventRevision !== "string" || !/^[a-f0-9]{16}$/.test(task.eventRevision)) errors.push("缺少有效事件版本指纹");
     if (typeof task.aoiHash !== "string" || !/^[a-f0-9]{16}$/.test(task.aoiHash)) errors.push("缺少有效 AOI 指纹");
+    const forecast = task.cycloneForecast as Record<string, unknown> | undefined;
+    if (forecast?.impactField !== undefined && task.aoiType === "source" && (!Array.isArray(task.timeIndexedAoi) || task.timeIndexedAoi.length === 0)) errors.push("台风预测 AOI 任务缺少与成像窗匹配的逐时影响场");
   }
   if (task.source === "演示数据") errors.push("演示事件禁止进入任务流");
   return errors.length ? { ok: false, errors } : { ok: true };
@@ -119,7 +125,8 @@ function boundedNumber(value: unknown, min: number, max: number, label: string, 
 
 function isValidAoi(task: Record<string, unknown>) {
   const type = task.aoiType;
-  if (type === "source") return isGeometry(task.sourceGeometry);
+  if (type === "source") return isGeometry(task.sourceGeometry, 25_000_000)
+    && ["Polygon", "MultiPolygon"].includes(String((task.sourceGeometry as { type?: unknown })?.type));
   const radius = Number(task.aoiRadiusKm);
   const width = Number(task.aoiWidthKm);
   const height = Number(task.aoiHeightKm);
@@ -129,29 +136,18 @@ function isValidAoi(task: Record<string, unknown>) {
   if (type === "circle") return Number.isFinite(radius) && radius >= 1 && radius <= 1000;
   if (type === "rectangle") return Number.isFinite(width) && width >= 1 && width <= 2000 && Number.isFinite(height) && height >= 1 && height <= 2000;
   if (type === "corridor") return Number.isFinite(width) && width >= 1 && width <= 500 && Number.isFinite(length) && length >= 1 && length <= 3000 && Number.isFinite(bearing) && bearing >= 0 && bearing < 360;
-  if (type === "polygon") return isGeometry(task.customGeometry) && (task.customGeometry as { type?: unknown }).type === "Polygon";
-  if (type === "multi") return isGeometry(task.customGeometry) && (task.customGeometry as { type?: unknown }).type === "MultiPolygon";
+  if (type === "polygon") return isGeometry(task.customGeometry, 2_000_000) && (task.customGeometry as { type?: unknown }).type === "Polygon";
+  if (type === "multi") return isGeometry(task.customGeometry, 2_000_000) && (task.customGeometry as { type?: unknown }).type === "MultiPolygon";
   return false;
 }
 
-function isGeometry(value: unknown) {
-  if (!value || typeof value !== "object") return false;
-  const geometry = value as { type?: unknown; coordinates?: unknown };
-  if (!["Point", "LineString", "Polygon", "MultiPolygon"].includes(String(geometry.type)) || !Array.isArray(geometry.coordinates)) return false;
-  let vertices = 0;
-  const validate = (node: unknown, depth: number): boolean => {
-    if (depth > 5 || !Array.isArray(node)) return false;
-    if (node.length >= 2 && typeof node[0] === "number" && typeof node[1] === "number") {
-      vertices += 1;
-      return vertices <= 10_000 && Number.isFinite(node[0]) && Number.isFinite(node[1]) && node[0] >= -180 && node[0] <= 180 && node[1] >= -90 && node[1] <= 90;
-    }
-    return node.length > 0 && node.length <= 10_000 && node.every((child) => validate(child, depth + 1));
-  };
-  if (!validate(geometry.coordinates, 0)) return false;
-  if (geometry.type === "Point") return Array.isArray(geometry.coordinates) && typeof geometry.coordinates[0] === "number";
-  if (geometry.type === "LineString") return geometry.coordinates.length >= 2;
-  if (geometry.type === "Polygon") return validPolygon(geometry.coordinates);
-  return geometry.coordinates.every((polygon) => validPolygon(polygon));
+function isGeometry(value: unknown, maximumAreaKm2 = 25_000_000) {
+  return validateGeoGeometry(value, {
+    maximumVertices: 10_000,
+    maximumRingVertices: 2_000,
+    maximumAreaKm2,
+    rejectUnsplitAntimeridian: true,
+  }).ok;
 }
 
 function isValidCycloneForecast(value: unknown) {
@@ -202,13 +198,31 @@ function isValidCycloneImpactField(value: unknown) {
   });
 }
 
-function validPolygon(value: unknown) {
-  if (!Array.isArray(value) || !value.length) return false;
-  return value.every((ring) => Array.isArray(ring) && ring.length >= 4 && coordinatesEqual(ring[0], ring[ring.length - 1]));
-}
-
-function coordinatesEqual(left: unknown, right: unknown) {
-  return Array.isArray(left) && Array.isArray(right) && Number(left[0]) === Number(right[0]) && Number(left[1]) === Number(right[1]);
+function isValidTimeIndexedAoi(value: unknown, taskStart: number, taskEnd: number) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 361) return false;
+  let priorStart = Number.NEGATIVE_INFINITY;
+  return value.every((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+    const slice = item as Record<string, unknown>;
+    const validFrom = Date.parse(String(slice.validFrom ?? ""));
+    const validTo = Date.parse(String(slice.validTo ?? ""));
+    const center = slice.center;
+    const leadHours = Number(slice.leadHours);
+    const threshold = slice.thresholdKnots === undefined ? undefined : Number(slice.thresholdKnots);
+    const valid = Number.isFinite(validFrom) && Number.isFinite(validTo) && validTo > validFrom
+      && validFrom >= taskStart && validTo <= taskEnd && validFrom >= priorStart
+      && Number.isInteger(leadHours) && leadHours >= 0 && leadHours <= 360
+      && Array.isArray(center) && center.length === 2
+      && Number.isFinite(Number(center[0])) && Number(center[0]) >= -180 && Number(center[0]) <= 180
+      && Number.isFinite(Number(center[1])) && Number(center[1]) >= -90 && Number(center[1]) <= 90
+      && (slice.centerBasis === "official_node" || slice.centerBasis === "interpolated_official_track")
+      && (threshold === undefined || (Number.isFinite(threshold) && threshold > 0 && threshold <= 250))
+      && (slice.windGeometry === undefined || isGeometry(slice.windGeometry, 25_000_000))
+      && (slice.uncertaintyGeometry === undefined || isGeometry(slice.uncertaintyGeometry, 25_000_000))
+      && (slice.windGeometry !== undefined || slice.uncertaintyGeometry !== undefined);
+    priorStart = validFrom;
+    return valid;
+  });
 }
 
 export function validateTaskAoi(task: Record<string, unknown>, aoi: unknown) {

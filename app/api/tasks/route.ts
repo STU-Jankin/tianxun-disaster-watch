@@ -3,6 +3,7 @@ import { ApiInputError, apiActor, authorizeApiRequest, enforceRateLimit, readJso
 import { unknownTaskFields, validateSatelliteTask } from "../../../lib/task-contract";
 import { aoiFingerprint, eventRevisionFingerprint, geometryEquals } from "../../../lib/event-integrity";
 import { buildTaskAoi } from "../../../lib/task-aoi";
+import { cycloneTaskAoiSlices } from "../../../lib/cyclone-forecast";
 
 export const dynamic = "force-dynamic";
 
@@ -42,6 +43,10 @@ export async function POST(request: Request) {
       return Response.json({ error: "主事件已有新版本，必须刷新事件并重新核对 AOI" }, { status: 409 });
     }
     const sourceGeometry = canonical.event.cycloneForecast?.impactGeometry ?? canonical.event.geometry;
+    const cycloneForecast = canonical.event.cycloneForecast;
+    if (cycloneForecast?.impactField && task.aoiType === "source" && Date.parse(String(task.imagingEnd)) > Date.parse(cycloneForecast.forecastValidUntil)) {
+      return Response.json({ error: "台风逐时影响场任务不能超过当前官方报次有效期；请缩短成像窗或等待新报次" }, { status: 409 });
+    }
     if (task.aoiApproval === "source_verified") {
       if (canonical.event.dispatchEligibility !== "ready") return Response.json({ error: "来源坐标不具备直接下发资格，必须由操作员复核 AOI" }, { status: 409 });
       if (task.aoiType !== "source" || !geometryEquals(task.sourceGeometry as typeof sourceGeometry, sourceGeometry)) {
@@ -61,13 +66,21 @@ export async function POST(request: Request) {
       longitude: canonical.event.longitude,
       eventOccurredAt: canonical.event.occurredAt,
       eventUpdatedAt: canonical.event.updatedAt,
+      eventIssuedAt: canonical.event.issuedAt,
+      eventValidFrom: canonical.event.validFrom,
+      eventValidTo: canonical.event.validTo,
+      phenomenonStage: canonical.event.phenomenonStage,
       observationPhase: canonical.event.observationPhase,
       source: canonical.event.source,
       sourceUrl: canonical.event.sourceUrl,
       locationQuality: canonical.event.locationQuality,
       locationAccuracyKm: canonical.event.locationAccuracyKm,
       evidenceCount: canonical.event.evidenceCount,
-      cycloneForecast: canonical.event.cycloneForecast,
+      cycloneForecast,
+      forecastAdvisoryId: cycloneForecast ? `${cycloneForecast.source}:${cycloneForecast.advisory ?? cycloneForecast.issuedAt}` : undefined,
+      forecastIssuedAt: cycloneForecast?.issuedAt,
+      forecastValidUntil: cycloneForecast?.forecastValidUntil,
+      timeIndexedAoi: cycloneTaskAoiSlices(cycloneForecast, String(task.imagingStart), String(task.imagingEnd)),
       sourceGeometry,
     };
     const draft = { ...task, ...canonicalFields, approvedAt, approvedBy, eventRevision: currentEventRevision };
@@ -79,7 +92,7 @@ export async function POST(request: Request) {
     return Response.json({ task: await upsertSatelliteTask(approvedTask as Parameters<typeof upsertSatelliteTask>[0]), storage: "operational-database" });
   } catch (error) {
     if (error instanceof ApiInputError) return Response.json({ error: error.message }, { status: error.status });
-    if (error instanceof Error && /不允许的任务状态转换|任务已被其他请求更新|任务版本冲突|revision/.test(error.message)) return Response.json({ error: error.message }, { status: 409 });
+    if (error instanceof Error && /不允许的任务状态转换|任务已被其他请求更新|任务版本冲突|任务已取消|revision/.test(error.message)) return Response.json({ error: error.message }, { status: 409 });
     console.error("task save unavailable", error);
     return Response.json({ error: "任务保存失败", requestId: crypto.randomUUID() }, { status: 503 });
   }
@@ -95,7 +108,7 @@ export async function DELETE(request: Request) {
   const revisionValue = parameters.get("revision");
   const revision = revisionValue === null ? undefined : Number(revisionValue);
   if (!taskId || taskId.length > 220) return Response.json({ error: "缺少或无效 taskId" }, { status: 400 });
-  if (revision !== undefined && (!Number.isInteger(revision) || revision < 1)) return Response.json({ error: "revision 必须是正整数" }, { status: 400 });
+  if (revision !== undefined && (!Number.isInteger(revision) || revision < 0)) return Response.json({ error: "revision 必须是非负整数" }, { status: 400 });
   try {
     const result = await deleteSatelliteTask(taskId, revision, apiActor(request));
     return Response.json({ deleted: taskId, ...result });

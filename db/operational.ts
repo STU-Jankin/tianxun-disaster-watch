@@ -1,7 +1,7 @@
-import type { DisasterEvent } from "../lib/disasters";
-import { canTransitionTask } from "../lib/task-contract";
-import { eventHasInvalidIdentity, isValidSourceEventId } from "../lib/event-integrity";
-import { evidenceReassignmentSql } from "../lib/operational-sql";
+import type { DisasterEvent } from "../lib/disasters.ts";
+import { canTransitionTask } from "../lib/task-contract.ts";
+import { eventHasInvalidIdentity, isValidSourceEventId } from "../lib/event-integrity.ts";
+import { evidenceReassignmentSql } from "../lib/operational-sql.ts";
 
 type TaskRecord = Record<string, unknown> & {
   taskId: string;
@@ -134,6 +134,8 @@ export function ensureOperationalSchema() {
     `CREATE TABLE IF NOT EXISTS satellite_tasks (task_id TEXT PRIMARY KEY NOT NULL, event_id TEXT NOT NULL, master_event_id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, priority INTEGER NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL, aoi_type TEXT NOT NULL, aoi_json TEXT NOT NULL, sensors_json TEXT NOT NULL, imaging_start TEXT NOT NULL, imaging_end TEXT NOT NULL, aoi_approval TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, event_revision TEXT NOT NULL DEFAULT '', aoi_hash TEXT NOT NULL DEFAULT '')`,
     `CREATE INDEX IF NOT EXISTS satellite_tasks_status_priority_idx ON satellite_tasks (status, priority)`,
     `CREATE INDEX IF NOT EXISTS satellite_tasks_event_idx ON satellite_tasks (master_event_id)`,
+    `CREATE TABLE IF NOT EXISTS task_cancellation_intents (task_id TEXT PRIMARY KEY NOT NULL, cancelled_at TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS task_cancellation_intents_time_idx ON task_cancellation_intents (cancelled_at)`,
     `CREATE TABLE IF NOT EXISTS task_status_history (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, task_id TEXT NOT NULL, from_status TEXT, to_status TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)`,
     `CREATE INDEX IF NOT EXISTS task_status_history_task_idx ON task_status_history (task_id, changed_at)`,
     `CREATE TRIGGER IF NOT EXISTS satellite_tasks_history_insert AFTER INSERT ON satellite_tasks BEGIN INSERT INTO task_status_history (task_id, from_status, to_status, note) VALUES (NEW.task_id, NULL, NEW.status, 'task created'); END`,
@@ -311,7 +313,11 @@ export async function getSatelliteTask(taskId: string) {
 export async function listSatelliteTaskCancellationIds() {
   await ensureOperationalSchema();
   const db = await database();
-  const result = await db.prepare(`SELECT task_id FROM satellite_tasks WHERE status = 'cancelled' ORDER BY updated_at DESC LIMIT 5000`).all<{ task_id: string }>();
+  const result = await db.prepare(`SELECT task_id FROM (
+      SELECT task_id, updated_at AS cancelled_at FROM satellite_tasks WHERE status = 'cancelled'
+      UNION ALL
+      SELECT task_id, cancelled_at FROM task_cancellation_intents
+    ) GROUP BY task_id ORDER BY MAX(cancelled_at) DESC LIMIT 5000`).all<{ task_id: string }>();
   return result.results.map((row) => row.task_id);
 }
 
@@ -356,6 +362,8 @@ export async function getCanonicalEventForTask(masterEventId: string) {
 export async function upsertSatelliteTask(task: TaskRecord) {
   await ensureOperationalSchema();
   const db = await database();
+  const cancellationIntent = await db.prepare(`SELECT task_id FROM task_cancellation_intents WHERE task_id = ?`).bind(task.taskId).first<{ task_id: string }>();
+  if (cancellationIntent) throw new Error("任务已取消，不允许重新创建；请新建任务");
   const existing = await db.prepare(`SELECT status, revision FROM satellite_tasks WHERE task_id = ?`).bind(task.taskId).first<{ status: string; revision: number }>();
   if (!canTransitionTask(existing?.status ?? null, task.status)) throw new Error(`不允许的任务状态转换：${existing?.status ?? "new"} -> ${task.status}`);
   const suppliedRevision = Number(task.revision ?? 0);
@@ -368,10 +376,13 @@ export async function upsertSatelliteTask(task: TaskRecord) {
   const save = existing
     ? db.prepare(`UPDATE satellite_tasks SET event_id=?, master_event_id=?, title=?, status=?, priority=?, latitude=?, longitude=?, aoi_type=?, aoi_json=?, sensors_json=?, imaging_start=?, imaging_end=?, aoi_approval=?, payload_json=?, updated_at=?, revision=?, event_revision=?, aoi_hash=? WHERE task_id=? AND status=? AND revision=?`)
       .bind(task.eventId, task.masterEventId, task.title, task.status, task.priority, task.latitude, task.longitude, task.aoiType, aoi, JSON.stringify(task.sensors ?? []), task.imagingStart, task.imagingEnd, task.aoiApproval, JSON.stringify(payload), updatedAt, revision, task.eventRevision ?? "", task.aoiHash ?? "", task.taskId, existing.status, existing.revision)
-    : db.prepare(`INSERT INTO satellite_tasks (task_id, event_id, master_event_id, title, status, priority, latitude, longitude, aoi_type, aoi_json, sensors_json, imaging_start, imaging_end, aoi_approval, payload_json, created_at, updated_at, revision, event_revision, aoi_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .bind(task.taskId, task.eventId, task.masterEventId, task.title, task.status, task.priority, task.latitude, task.longitude, task.aoiType, aoi, JSON.stringify(task.sensors ?? []), task.imagingStart, task.imagingEnd, task.aoiApproval, JSON.stringify(payload), task.createdAt, updatedAt, revision, task.eventRevision ?? "", task.aoiHash ?? "");
+    : db.prepare(`INSERT INTO satellite_tasks (task_id, event_id, master_event_id, title, status, priority, latitude, longitude, aoi_type, aoi_json, sensors_json, imaging_start, imaging_end, aoi_approval, payload_json, created_at, updated_at, revision, event_revision, aoi_hash)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE NOT EXISTS (SELECT 1 FROM task_cancellation_intents WHERE task_id = ?)`)
+      .bind(task.taskId, task.eventId, task.masterEventId, task.title, task.status, task.priority, task.latitude, task.longitude, task.aoiType, aoi, JSON.stringify(task.sensors ?? []), task.imagingStart, task.imagingEnd, task.aoiApproval, JSON.stringify(payload), task.createdAt, updatedAt, revision, task.eventRevision ?? "", task.aoiHash ?? "", task.taskId);
   const result = await save.run();
   if (existing && affectedRows(result) === 0) throw new Error("任务已被其他请求更新，请刷新后重试");
+  if (!existing && affectedRows(result) === 0) throw new Error("任务已取消，不允许重新创建；请新建任务");
   return payload;
 }
 
@@ -379,23 +390,31 @@ export async function deleteSatelliteTask(taskId: string, expectedRevision?: num
   await ensureOperationalSchema();
   const db = await database();
   const existing = await db.prepare(`SELECT status, revision, master_event_id, payload_json FROM satellite_tasks WHERE task_id = ?`).bind(taskId).first<{ status: string; revision: number; master_event_id: string; payload_json: string }>();
-  if (!existing) return { state: "already_absent" as const, revision: null };
+  const cancelledAt = new Date().toISOString();
+  if (!existing) {
+    await db.prepare(`INSERT INTO task_cancellation_intents (task_id, cancelled_at, actor, reason) VALUES (?, ?, ?, ?)
+      ON CONFLICT(task_id) DO UPDATE SET cancelled_at=excluded.cancelled_at, actor=excluded.actor, reason=excluded.reason`)
+      .bind(taskId, cancelledAt, actor, reason).run();
+    return { state: "cancellation_recorded" as const, revision: null };
+  }
   if (existing.status === "cancelled") return { state: "already_cancelled" as const, revision: existing.revision };
   if (expectedRevision !== undefined && expectedRevision !== existing.revision) throw new Error(`任务版本冲突：当前为 ${existing.revision}，请求为 ${expectedRevision}`);
   if (!canTransitionTask(existing.status, "cancelled")) throw new Error(`不允许取消状态为 ${existing.status} 的任务`);
-  const cancelledAt = new Date().toISOString();
   const revision = existing.revision + 1;
   let previousPayload: Record<string, unknown> = {};
   try { previousPayload = JSON.parse(existing.payload_json) as Record<string, unknown>; } catch { /* 旧数据仍按规范化列完成取消。 */ }
   const payload = { ...previousPayload, status: "cancelled", revision, updatedAt: cancelledAt, cancelledAt, cancelledBy: actor, cancellationReason: reason };
   const statements = [
+    db.prepare(`INSERT INTO task_cancellation_intents (task_id, cancelled_at, actor, reason) VALUES (?, ?, ?, ?)
+      ON CONFLICT(task_id) DO UPDATE SET cancelled_at=excluded.cancelled_at, actor=excluded.actor, reason=excluded.reason`)
+      .bind(taskId, cancelledAt, actor, reason),
     db.prepare(`UPDATE satellite_tasks SET status = 'cancelled', payload_json = ?, updated_at = ?, revision = ? WHERE task_id = ? AND status = ? AND revision = ?`)
       .bind(JSON.stringify(payload), cancelledAt, revision, taskId, existing.status, existing.revision),
     db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at)
       SELECT ?, 'task_cancelled', ?, ?, ? WHERE changes() > 0`)
       .bind(`task_cancelled:${taskId}:${revision}`, existing.master_event_id, JSON.stringify({ taskId, previousStatus: existing.status, revision, actor, reason }), cancelledAt),
   ];
-  const [result] = await db.batch(statements);
+  const [, result] = await db.batch(statements);
   if (affectedRows(result) === 0) throw new Error("任务已被其他请求更新，请刷新后重试");
   return { state: "cancelled" as const, revision };
 }

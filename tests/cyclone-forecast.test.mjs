@@ -61,3 +61,37 @@ test("geodesic circles remain valid across the international date line", async (
   assert.ok(ring.every(([longitude, latitude]) => longitude >= -180 && longitude <= 180 && latitude >= -90 && latitude <= 90));
   assert.ok(ring.some(([longitude]) => longitude < -179));
 });
+
+test("task AOI slices are clipped to the imaging window and split at the date line", async () => {
+  const { cycloneTaskAoiSlices } = await forecastTools();
+  const forecast = {
+    official: true,
+    source: "test",
+    sourceUrl: "https://example.com/",
+    issuedAt: "2026-08-18T00:00:00Z",
+    forecastValidUntil: "2026-08-18T03:00:00Z",
+    track: [],
+    trackGeometry: { type: "LineString", coordinates: [] },
+    impactBasis: "forecast_wind_radii",
+    note: "test",
+    impactField: {
+      temporalResolutionHours: 1,
+      interpolation: "linear_between_official_nodes",
+      uncertaintyBasis: "not_available",
+      note: "test",
+      frames: [0, 1, 2].map((leadHours) => ({
+        forecastAt: new Date(Date.parse("2026-08-18T00:00:00Z") + leadHours * 3_600_000).toISOString(),
+        leadHours,
+        latitude: 15,
+        longitude: 179.8,
+        centerBasis: leadHours === 0 ? "official_node" : "interpolated_official_track",
+        windFields: [{ thresholdKnots: 34, basis: "official_circular_extent", quadrantsKm: { northeast: 120, southeast: 120, southwest: 120, northwest: 120 } }],
+      })),
+    },
+  };
+  const slices = cycloneTaskAoiSlices(forecast, "2026-08-18T00:30:00Z", "2026-08-18T02:30:00Z");
+  assert.equal(slices.length, 3);
+  assert.equal(slices[0].validFrom, "2026-08-18T00:30:00.000Z");
+  assert.equal(slices.at(-1).validTo, "2026-08-18T02:30:00.000Z");
+  assert.equal(slices[0].windGeometry.type, "MultiPolygon");
+});

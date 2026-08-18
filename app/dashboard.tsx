@@ -13,7 +13,7 @@ import {
 import { allowedTaskStatuses, canTransitionTask, safeHttpUrl, validateSatelliteTask } from "../lib/task-contract";
 import { buildTaskAoi, customAoiPartCount, normalizeCustomAoiGeoJson, type CustomAoiGeometry } from "../lib/task-aoi";
 import { aoiFingerprint, eventRevisionFingerprint } from "../lib/event-integrity";
-import { cycloneUncertaintyGeometry, cycloneWindGeometry } from "../lib/cyclone-forecast";
+import { cycloneTaskAoiSlices, cycloneUncertaintyGeometry, cycloneWindGeometry, type CycloneTaskAoiSlice } from "../lib/cyclone-forecast";
 import { weatherImagingWindows, type WeatherForecastReady, type WeatherForecastResponse } from "../lib/qweather";
 
 type ApiResponse = {
@@ -36,6 +36,8 @@ const scopeOrder: ScopeId[] = ["wuxi", "jiangsu", "china", "global"];
 const severityLabels = { red: "红色", orange: "橙色", yellow: "黄色", blue: "蓝色" };
 const locationQualityLabels: Record<DisasterEvent["locationQuality"], string> = { precise: "精确点位", estimated: "估算点位", representative: "区域代表点", unknown: "位置待核验" };
 const confidenceLabels: Record<DisasterEvent["confidenceLevel"], string> = { high: "高可信", medium: "中可信", low: "低可信" };
+const phenomenonLabels: Record<DisasterEvent["phenomenonStage"], string> = { observed: "实况", forecast: "预报", warning: "预警", driver: "驱动因子", context: "背景资料" };
+const observationPhaseLabels: Record<DisasterEvent["observationPhase"], string> = { forecast: "预报候选期", golden: "黄金观测期", followup: "后续观测期", archive: "已归档" };
 type SortMode = "priority" | "occurred" | "updated";
 type ExportFormat = "json" | "csv" | "geojson";
 type SourceStatus = {
@@ -63,6 +65,10 @@ type SatelliteTask = {
   longitude: number;
   eventOccurredAt: string;
   eventUpdatedAt: string;
+  eventIssuedAt: string;
+  eventValidFrom?: string;
+  eventValidTo?: string;
+  phenomenonStage: DisasterEvent["phenomenonStage"];
   aoiType: AoiType;
   aoiRadiusKm: number;
   aoiWidthKm: number;
@@ -72,6 +78,10 @@ type SatelliteTask = {
   sourceGeometry?: DisasterEvent["geometry"];
   customGeometry?: CustomAoiGeometry;
   cycloneForecast?: DisasterEvent["cycloneForecast"];
+  timeIndexedAoi?: CycloneTaskAoiSlice[];
+  forecastAdvisoryId?: string;
+  forecastIssuedAt?: string;
+  forecastValidUntil?: string;
   minimumCoveragePercent: number;
   maximumCloudPercent: number;
   spatialResolutionMeters: number;
@@ -245,7 +255,9 @@ export function Dashboard() {
         setTasks(merged);
         setTaskSync(Object.fromEntries(merged.map((task) => [task.taskId, {
           state: serverTasks.some((server) => server.taskId === task.taskId) ? "synced" : "local",
-          message: storageMode === "public-read-only" ? "公网入口为只读模式；此任务仅保存在本机" : undefined,
+          message: storageMode === "public-read-only"
+            ? task.revision > 0 ? "该任务曾同步；公网只读入口不能修改或取消" : "公网入口为只读模式；此任务仅保存在本机"
+            : undefined,
         } as TaskSyncState])));
       } catch {
         setTaskStorageMode("unavailable");
@@ -274,7 +286,10 @@ export function Dashboard() {
     taskSaveControllers.current.set(task.taskId, controller);
     setTaskSync((current) => ({ ...current, [task.taskId]: { state: "saving" } }));
     try {
-      const response = await fetch("/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(task), signal: controller.signal });
+      const taskForSave = task.cycloneForecast
+        ? { ...task, timeIndexedAoi: cycloneTaskAoiSlices(task.cycloneForecast, task.imagingStart, task.imagingEnd) }
+        : task;
+      const response = await fetch("/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(taskForSave), signal: controller.signal });
       const result = await response.json() as { task?: Partial<SatelliteTask>; error?: string; errors?: string[] };
       if (!response.ok) throw new Error(result.errors?.join("；") || result.error || "保存失败");
       if ((taskMutationGeneration.current.get(task.taskId) ?? 0) !== generation || !tasksRef.current.some((item) => item.taskId === task.taskId)) return false;
@@ -333,15 +348,24 @@ export function Dashboard() {
     taskMutationGeneration.current.set(taskId, (taskMutationGeneration.current.get(taskId) ?? 0) + 1);
     taskSaveControllers.current.get(taskId)?.abort();
     taskSaveControllers.current.delete(taskId);
-    setTasks((current) => current.filter((task) => task.taskId !== taskId));
-    if (activeTaskId === taskId) setActiveTaskId(null);
     const removeSyncState = () => setTaskSync((current) => { const next = { ...current }; delete next[taskId]; return next; });
-    if (task.revision === 0 || taskStorageMode === "public-read-only" || taskStorageMode === "unavailable") {
+    if ((taskStorageMode === "public-read-only" || taskStorageMode === "unavailable") && task.revision > 0) {
+      setTaskSync((current) => ({ ...current, [taskId]: {
+        state: "error",
+        message: taskStorageMode === "public-read-only"
+          ? "该任务已同步到服务器；公网只读入口不能取消，请从受保护的任务入口操作"
+          : "任务服务不可用，已同步任务不能只从本机删除",
+      } }));
+      return;
+    }
+    setTasks((current) => current.filter((candidate) => candidate.taskId !== taskId));
+    if (activeTaskId === taskId) setActiveTaskId(null);
+    if (taskStorageMode === "public-read-only" || taskStorageMode === "unavailable") {
       removeSyncState();
       return;
     }
     try {
-      const response = await fetch(`/api/tasks?taskId=${encodeURIComponent(taskId)}&revision=${task.revision}`, { method: "DELETE" });
+      const response = await fetch(`/api/tasks?taskId=${encodeURIComponent(taskId)}&revision=${Math.max(0, task.revision)}`, { method: "DELETE" });
       const result = await response.json() as { error?: string };
       if (!response.ok) throw new Error(result.error || `取消任务失败（HTTP ${response.status}）`);
       removeSyncState();
@@ -512,7 +536,7 @@ export function Dashboard() {
           {selected?.cycloneForecast ? <><em /><span><i className="forecast-track-key" />官方路径</span><span><i className="forecast-impact-key" />风圈范围</span><span><i className="forecast-uncertainty-key" />路径不确定区</span></> : null}
         </div>
 
-        {selected && <DetailPanel event={selected} obscured={taskPanelOpen} dispatchBlocked={modeStale} locationZh={locationZh[selected.id]} locationLoading={locationLoading === selected.id} locationState={locationState[selected.id]?.state} onRetryLocation={() => { setLocationState((current) => { const next = { ...current }; delete next[selected.id]; return next; }); setLocationRetry((value) => value + 1); }} taskAdded={tasks.some((task) => taskMatchesEvent(task, selected))} aoiConfirmed={confirmedAois.has(selected.masterEventId)} onConfirmAoi={(confirmed) => setConfirmedAois((current) => { const next = new Set(current); if (confirmed) next.add(selected.masterEventId); else next.delete(selected.masterEventId); return next; })} onAddTask={addTask} onClose={() => setSelected(null)} />}
+        {selected && <DetailPanel event={selected} nowMs={clock} obscured={taskPanelOpen} dispatchBlocked={modeStale} locationZh={locationZh[selected.id]} locationLoading={locationLoading === selected.id} locationState={locationState[selected.id]?.state} onRetryLocation={() => { setLocationState((current) => { const next = { ...current }; delete next[selected.id]; return next; }); setLocationRetry((value) => value + 1); }} taskAdded={tasks.some((task) => taskMatchesEvent(task, selected))} aoiConfirmed={confirmedAois.has(selected.masterEventId)} onConfirmAoi={(confirmed) => setConfirmedAois((current) => { const next = new Set(current); if (confirmed) next.add(selected.masterEventId); else next.delete(selected.masterEventId); return next; })} onAddTask={addTask} onClose={() => setSelected(null)} />}
         {taskPanelOpen && <TaskPanel tasks={tasks} syncState={taskSync} storageMode={taskStorageMode} activeTaskId={activeTaskId} onActivate={reviewTaskAoi} onUpdate={updateTask} onRemove={(taskId) => void removeTask(taskId)} onClose={closeTaskPanel} onRetry={(task) => void saveTask(task)} />}
       </section>
     </main>
@@ -544,7 +568,7 @@ function SortControl({ selected, onChange }: { selected: SortMode; onChange: (va
     <button aria-pressed={selected === "priority"} className={selected === "priority" ? "active" : ""} onClick={() => onChange("priority")}>综合优先</button>
     <button aria-pressed={selected === "occurred"} className={selected === "occurred" ? "active" : ""} onClick={() => onChange("occurred")}>最新发生</button>
     <button aria-pressed={selected === "updated"} className={selected === "updated" ? "active" : ""} onClick={() => onChange("updated")}>最新更新</button>
-    <small>{selected === "priority" ? "时效最高30分，7天半衰" : selected === "occurred" ? "按灾害发生时间" : "按最新有效报次"}</small>
+    <small>{selected === "priority" ? "实况与预报采用不同的时效曲线" : selected === "occurred" ? "按灾害发生/报文发布时间" : "按最新有效报次"}</small>
   </div>;
 }
 
@@ -567,15 +591,16 @@ function circularLongitude(values: number[]) {
 }
 
 function EventCard({ event, active, onClick }: { event: DisasterEvent; active: boolean; onClick: () => void }) {
-  const cardTime = event.updateCount > 1 ? event.updatedAt : event.occurredAt;
+  const referenceTime = event.phenomenonStage === "observed" ? event.occurredAt : event.issuedAt;
+  const cardTime = event.updateCount > 1 ? event.updatedAt : referenceTime;
   return <button data-event-id={event.id} className={`event-card ${event.severity} ${active ? "active" : ""}`} onClick={onClick}>
     <div className="hazard-icon">{hazardMeta[event.hazard].symbol}</div>
     <div className="event-copy">
-      <div className="event-title-row"><h2>{event.title}</h2><span title={event.updateCount > 1 ? `首次 ${formatTimeWithYear(event.occurredAt)} · 最新 ${formatTimeWithYear(event.updatedAt)}` : `${formatTime(event.occurredAt)} · ${relativeTime(event.occurredAt)}`}>{event.updateCount > 1 ? "更新 " : ""}{formatCardTime(cardTime)}</span></div>
+      <div className="event-title-row"><h2>{event.title}</h2><span title={event.updateCount > 1 ? `首次 ${formatTimeWithYear(referenceTime)} · 最新 ${formatTimeWithYear(event.updatedAt)}` : `${formatTime(referenceTime)} · ${relativeTime(referenceTime)}`}>{event.updateCount > 1 ? "更新 " : ""}{formatCardTime(cardTime)}</span></div>
       <p>{event.country || `${event.latitude.toFixed(2)}°, ${event.longitude.toFixed(2)}°`}</p>
       <div className="event-tags">
-        <span className="severity-tag">{severityLabels[event.severity]}预警</span>
-        <span className={`phase-tag ${event.observationPhase}`}>{event.observationPhase === "golden" ? "黄金观测期" : "后续观测期"}</span>
+        <span className="severity-tag">{severityLabels[event.severity]} · {phenomenonLabels[event.phenomenonStage]}</span>
+        <span className={`phase-tag ${event.observationPhase}`}>{observationPhaseLabels[event.observationPhase]}</span>
         {event.sourcePresence === "retained" ? <span className="monitoring-tag">来源暂未复现</span> : null}
         {event.updateCount > 1 ? <span className="update-tag">{event.updateCount}期更新</span> : null}
         <span className={`confidence-tag ${event.confidenceLevel}`}>{confidenceLabels[event.confidenceLevel]} · {event.evidenceCount}源</span>
@@ -950,14 +975,17 @@ function MapView({ scope, events, selected, activeTask, detailOpen, layoutKey, o
   </div>;
 }
 
-function DetailPanel({ event, obscured, dispatchBlocked, locationZh, locationLoading, locationState, onRetryLocation, taskAdded, aoiConfirmed, onConfirmAoi, onAddTask, onClose }: { event: DisasterEvent; obscured: boolean; dispatchBlocked: boolean; locationZh?: string; locationLoading: boolean; locationState?: "resolved" | "fallback" | "error"; onRetryLocation: () => void; taskAdded: boolean; aoiConfirmed: boolean; onConfirmAoi: (confirmed: boolean) => void; onAddTask: (event: DisasterEvent, operatorConfirmed: boolean) => void; onClose: () => void }) {
+function DetailPanel({ event, nowMs, obscured, dispatchBlocked, locationZh, locationLoading, locationState, onRetryLocation, taskAdded, aoiConfirmed, onConfirmAoi, onAddTask, onClose }: { event: DisasterEvent; nowMs: number; obscured: boolean; dispatchBlocked: boolean; locationZh?: string; locationLoading: boolean; locationState?: "resolved" | "fallback" | "error"; onRetryLocation: () => void; taskAdded: boolean; aoiConfirmed: boolean; onConfirmAoi: (confirmed: boolean) => void; onAddTask: (event: DisasterEvent, operatorConfirmed: boolean) => void; onClose: () => void }) {
   const isDemo = event.source === "演示数据";
   const closeRef = useRef<HTMLButtonElement>(null);
   useEffect(() => { if (window.matchMedia("(max-width: 720px)").matches) closeRef.current?.focus(); }, [event.id]);
-  const canDispatch = !dispatchBlocked && !isDemo && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived" && (event.dispatchEligibility === "ready" || aoiConfirmed);
+  const taskWindowValid = Date.parse(event.observationExpiresAt) > nowMs + 3_600_000;
+  const cycloneForecastUsable = !event.cycloneForecast || Date.parse(event.cycloneForecast.forecastValidUntil) > nowMs + 3_600_000;
+  const needsAoiReview = event.aoiApprovalRequired || !cycloneForecastUsable;
+  const canDispatch = !dispatchBlocked && !isDemo && taskWindowValid && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived" && (!needsAoiReview || aoiConfirmed);
   return <aside className="detail-panel" aria-labelledby={`detail-title-${event.id}`} inert={obscured ? true : undefined} aria-hidden={obscured || undefined}>
     <button ref={closeRef} className="detail-close" onClick={onClose} aria-label="关闭详情">×</button>
-    <div className={`detail-kicker ${event.severity}`}><span>{hazardMeta[event.hazard].symbol}</span>{hazardMeta[event.hazard].label} · {severityLabels[event.severity]}预警</div>
+    <div className={`detail-kicker ${event.severity}`}><span>{hazardMeta[event.hazard].symbol}</span>{hazardMeta[event.hazard].label} · {severityLabels[event.severity]} · {phenomenonLabels[event.phenomenonStage]}</div>
     <h2 id={`detail-title-${event.id}`}>{event.title}</h2>
     <div className="detail-location">
       <span>⌖ 中文地点</span>
@@ -973,7 +1001,7 @@ function DetailPanel({ event, obscured, dispatchBlocked, locationZh, locationLoa
       <small>主事件ID：{event.masterEventId}</small>
       {event.sourcePresence === "retained" ? <em>当前短时数据源未再次报告该事件；未据此判定灾害已结束，仍保留至观测期届满或权威撤销。</em> : null}
     </div>
-    <div className="observation-deadline"><span>{event.observationPhase === "golden" ? "距建议复核" : "后续观测剩余"}</span><strong>{remainingObservationTime(event.observationPhase === "golden" ? event.observationReviewAt : event.observationExpiresAt)}</strong><small>{event.observationPhase === "golden" ? `黄金期至 ${formatTime(event.observationReviewAt)}；到期不撤销，转后续观测` : `建议持续复核；兜底归档 ${formatTime(event.observationExpiresAt)}`}</small></div>
+    <div className="observation-deadline"><span>{observationDeadlineLabel(event)}</span><strong>{remainingObservationTime(observationDeadline(event))}</strong><small>{event.observationRationale} 复核点 {formatTimeWithYear(event.observationReviewAt)}；有效期/归档点 {formatTimeWithYear(event.observationExpiresAt)} UTC+08。</small></div>
     <WeatherForecastCard latitude={event.latitude} longitude={event.longitude} maximumCloudPercent={30} />
     {event.cycloneForecast ? <section className="cyclone-forecast-card">
       <h3>官方台风预报 · {event.cycloneForecast.source}</h3>
@@ -994,18 +1022,20 @@ function DetailPanel({ event, obscured, dispatchBlocked, locationZh, locationLoa
     <section><h3>观测目标</h3><div className="target-list">{event.observationTargets.map((target) => <span key={target}>{target}</span>)}</div></section>
     <section><h3>可选载荷</h3><div className="target-list">{payloadOptions.map((payload) => <span key={payload}>{payload}</span>)}</div></section>
     <section><h3>事件摘要</h3><p>{event.description || "暂无详细描述。"}</p></section>
-    <section className="evidence-chain"><h3>证据链</h3>{event.evidence.map((item) => <a key={`${item.source}-${item.sourceEventId}`} href={safeHttpUrl(item.sourceUrl)} target="_blank" rel="noreferrer"><span>{item.source}</span><small>{item.role === "detection" ? "探测" : item.role === "warning" ? "预警" : "核验"} · {formatTime(item.observedAt)}</small></a>)}</section>
+    <section className="evidence-chain"><h3>证据链</h3>{event.evidence.map((item) => <a key={`${item.source}-${item.sourceEventId}`} href={safeHttpUrl(item.sourceUrl)} target="_blank" rel="noreferrer"><span>{item.source}</span><small>{evidenceRoleLabel(item.role)} · {formatTime(item.observedAt)}</small></a>)}</section>
     {event.updateCount > 1 ? <section className="update-history"><h3>过程更新 · 共 {event.updateCount} 期</h3>{event.updateHistory.slice(0, 8).map((item, index) => <a key={`${item.source}-${item.sourceEventId}`} href={safeHttpUrl(item.sourceUrl)} target="_blank" rel="noreferrer"><i>{index === 0 ? "最新" : String(event.updateCount - index).padStart(2, "0")}</i><span><strong>{item.title}</strong><small>{item.source} · {formatTimeWithYear(item.observedAt)}</small></span></a>)}</section> : null}
     <dl>
-      <div><dt>发生时间</dt><dd>{formatTimeWithYear(event.occurredAt)} UTC+08</dd></div>
+      <div><dt>{event.phenomenonStage === "observed" ? "发生时间" : "发布时间"}</dt><dd>{formatTimeWithYear(event.phenomenonStage === "observed" ? event.occurredAt : event.issuedAt)} UTC+08</dd></div>
+      {event.validFrom ? <div><dt>生效时间</dt><dd>{formatTimeWithYear(event.validFrom)} UTC+08</dd></div> : null}
+      {event.validTo ? <div><dt>权威有效至</dt><dd>{formatTimeWithYear(event.validTo)} UTC+08</dd></div> : null}
       <div><dt>最新更新</dt><dd>{formatTimeWithYear(event.updatedAt)} UTC+08</dd></div>
       <div><dt>来源等级</dt><dd>{event.sourceSeverity}</dd></div>
       <div><dt>坐标</dt><dd>{event.latitude.toFixed(3)}°, {event.longitude.toFixed(3)}°</dd></div>
       <div><dt>数据来源</dt><dd>{event.source}</dd></div>
     </dl>
     <a className="source-link" href={safeHttpUrl(event.sourceUrl)} target="_blank" rel="noreferrer">查看权威来源 ↗</a>
-    {event.aoiApprovalRequired ? <div className="aoi-approval"><input id={`aoi-confirm-${event.id}`} type="checkbox" checked={aoiConfirmed} onChange={(change) => onConfirmAoi(change.target.checked)} /><label htmlFor={`aoi-confirm-${event.id}`}><strong>人工核对 AOI</strong><small>地图已用绿色虚线显示完整来源几何；确认前请核对目标类型、范围和代表点误差。</small></label></div> : null}
-    <button className="task-button" onClick={() => onAddTask(event, aoiConfirmed)} disabled={taskAdded || !canDispatch}>{taskAdded ? "已加入卫星任务候选" : dispatchBlocked ? "非实时/数据库降级状态禁止下发" : isDemo ? "演示事件禁止下发" : !canDispatch ? "需先人工核对 AOI" : "加入卫星任务候选"}</button>
+    {needsAoiReview ? <div className="aoi-approval"><input id={`aoi-confirm-${event.id}`} type="checkbox" checked={aoiConfirmed} onChange={(change) => onConfirmAoi(change.target.checked)} /><label htmlFor={`aoi-confirm-${event.id}`}><strong>人工核对 AOI</strong><small>{!cycloneForecastUsable ? "官方台风报次已不足一小时，不再作为预测 AOI；如需灾后复核，请在地图重新圈定实况 AOI。" : "地图已用绿色虚线显示完整来源几何；确认前请核对目标类型、范围和代表点误差。"}</small></label></div> : null}
+    <button className="task-button" onClick={() => onAddTask(event, aoiConfirmed)} disabled={taskAdded || !canDispatch}>{taskAdded ? "已加入卫星任务候选" : dispatchBlocked ? "非实时/数据库降级状态禁止下发" : isDemo ? "演示事件禁止下发" : !taskWindowValid ? "观测期不足一小时，禁止建立任务" : !canDispatch ? "需先人工核对 AOI" : "加入卫星任务候选"}</button>
   </aside>;
 }
 
@@ -1123,7 +1153,7 @@ function TaskPanel({ tasks, syncState, storageMode, activeTaskId, onActivate, on
       {tasks.map((task, index) => <article className={`task-item ${activeTaskId === task.taskId ? "active" : ""}`} key={task.taskId}>
         <div className="task-item-title">
           <i>{String(index + 1).padStart(2, "0")}</i>
-          <div><h3>{task.title}</h3><p>{hazardMeta[task.hazard].label} · 优先级 {task.priority} · {task.observationPhase === "golden" ? "黄金观测期" : "后续观测期"}</p><time>发生时间 · {formatTimeWithYear(task.eventOccurredAt)}</time><button className="show-aoi" onClick={() => onActivate(task.taskId)}>在地图显示 AOI</button></div>
+          <div><h3>{task.title}</h3><p>{hazardMeta[task.hazard].label} · 优先级 {task.priority} · {observationPhaseLabels[task.observationPhase]}</p><time>事件参考时间 · {formatTimeWithYear(task.eventOccurredAt)}</time><button className="show-aoi" onClick={() => onActivate(task.taskId)}>在地图显示 AOI</button></div>
           {canTransitionTask(task.status, "cancelled") ? <button onClick={() => onRemove(task.taskId)} aria-label={`取消${task.title}`}>{task.revision > 0 ? "取消" : "删除草稿"}</button> : null}
         </div>
         <div className="task-coordinates"><span>中心坐标</span><code>{task.latitude.toFixed(6)}, {task.longitude.toFixed(6)}</code><button onClick={() => void copyCoordinates(task).then((copied) => { if (copied) { setCopiedTaskId(task.taskId); window.setTimeout(() => setCopiedTaskId((current) => current === task.taskId ? null : current), 1800); } })}>{copiedTaskId === task.taskId ? "已复制" : "复制"}</button></div>
@@ -1185,7 +1215,7 @@ function ObservationPolicy() {
       {Object.entries(observationWindowPolicy).map(([id, policy]) => (
         <p key={id}><b>{hazardMeta[id as HazardType].label}</b><span>{policy.label}</span><small>{policy.rationale}</small></p>
       ))}
-      <em>表内为黄金期 / 后续期；红、橙、黄事件的后续期兜底上限分别 ×1.5 / ×1.25 / ×1.1。时效得分独立参与排序。</em>
+      <em>表内为首次复核点 / 基准后续期。实况会结合严重度、长期变化目标和可持续复访载荷修正，并设置不可自动延长的强制复核点；预警和预报严格服从权威报次有效期，严重度不延长报文。</em>
     </div>
   </details>;
 }
@@ -1199,11 +1229,35 @@ function EmptyState({ title, detail }: { title: string; detail: string }) {
 }
 
 function relativeTime(value: string) {
-  const minutes = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 60_000));
+  const rawMinutes = Math.round((Date.now() - new Date(value).getTime()) / 60_000);
+  if (rawMinutes < 0) {
+    const future = Math.abs(rawMinutes);
+    if (future < 60) return `${future}分钟后`;
+    if (future < 1_440) return `${Math.ceil(future / 60)}小时后`;
+    return `${Math.ceil(future / 1_440)}天后`;
+  }
+  const minutes = rawMinutes;
   if (minutes < 1) return "刚刚";
   if (minutes < 60) return `${minutes}分钟前`;
   if (minutes < 1_440) return `${Math.floor(minutes / 60)}小时前`;
   return `${Math.floor(minutes / 1_440)}天前`;
+}
+
+function evidenceRoleLabel(role: DisasterEvent["evidence"][number]["role"]) {
+  return { detection: "探测", warning: "预警", verification: "核验", driver: "驱动因子", context: "背景资料" }[role];
+}
+
+function observationDeadline(event: DisasterEvent) {
+  if (event.observationPhase === "forecast") return event.validFrom ?? event.observationReviewAt;
+  if (event.observationPhase === "golden") return event.observationReviewAt;
+  return event.observationExpiresAt;
+}
+
+function observationDeadlineLabel(event: DisasterEvent) {
+  if (event.observationPhase === "forecast") return "距预报生效";
+  if (event.observationPhase === "golden") return "距建议复核";
+  if (event.observationPhase === "archive") return "观测期已结束";
+  return "后续观测剩余";
 }
 
 function formatTime(value: string) {
@@ -1228,11 +1282,18 @@ function remainingObservationTime(value: string) {
 }
 
 function createSatelliteTask(event: DisasterEvent, operatorConfirmed: boolean): SatelliteTask {
-  if (event.dispatchEligibility !== "ready" && !operatorConfirmed) throw new Error("AOI 尚未完成人工核对");
   const now = Date.now();
+  const forecastEnd = event.cycloneForecast ? Date.parse(event.cycloneForecast.forecastValidUntil) : Number.POSITIVE_INFINITY;
+  const cycloneForecastUsable = !event.cycloneForecast || forecastEnd > now + 3_600_000;
+  const sourceVerified = event.dispatchEligibility === "ready" && cycloneForecastUsable;
+  if (!sourceVerified && !operatorConfirmed) throw new Error("AOI 尚未完成人工核对");
+  const requestedStart = event.phenomenonStage === "forecast" || event.phenomenonStage === "warning"
+    ? Math.max(now, Date.parse(event.validFrom ?? event.issuedAt))
+    : now;
   const phaseEnd = new Date(event.observationPhase === "golden" ? event.observationReviewAt : event.observationExpiresAt).getTime();
-  const preferredEnd = Math.min(phaseEnd, now + (event.observationPhase === "golden" ? 72 : 168) * 3_600_000);
-  const officialImpactGeometry = event.cycloneForecast?.impactGeometry;
+  const preferredEnd = Math.min(phaseEnd, cycloneForecastUsable ? forecastEnd : Number.POSITIVE_INFINITY, requestedStart + (event.observationPhase === "golden" ? 72 : 168) * 3_600_000);
+  if (!Number.isFinite(requestedStart) || preferredEnd <= requestedStart) throw new Error("当前权威有效期不足以建立至少一小时的成像窗口");
+  const officialImpactGeometry = cycloneForecastUsable ? event.cycloneForecast?.impactGeometry : undefined;
   const sourceGeometry = officialImpactGeometry ?? event.geometry;
   const task: SatelliteTask = {
     taskId: `TASK-${event.id}-${now}`,
@@ -1246,7 +1307,11 @@ function createSatelliteTask(event: DisasterEvent, operatorConfirmed: boolean): 
     longitude: event.longitude,
     eventOccurredAt: event.occurredAt,
     eventUpdatedAt: event.updatedAt,
-    aoiType: event.dispatchEligibility === "ready" || officialImpactGeometry || event.geometryType !== "Point" ? "source" : "circle",
+    eventIssuedAt: event.issuedAt,
+    eventValidFrom: event.validFrom,
+    eventValidTo: event.validTo,
+    phenomenonStage: event.phenomenonStage,
+    aoiType: sourceVerified || officialImpactGeometry || (!event.cycloneForecast && event.geometryType !== "Point") ? "source" : "circle",
     aoiRadiusKm: defaultAoiRadiusKm[event.hazard],
     aoiWidthKm: Math.max(10, defaultAoiRadiusKm[event.hazard] * 2),
     aoiHeightKm: Math.max(10, defaultAoiRadiusKm[event.hazard] * 2),
@@ -1260,9 +1325,9 @@ function createSatelliteTask(event: DisasterEvent, operatorConfirmed: boolean): 
     incidenceAngleMinDeg: 20,
     incidenceAngleMaxDeg: 45,
     revisitCount: 1,
-    imagingStart: new Date(now).toISOString(),
-    imagingEnd: new Date(Math.max(now + 3_600_000, preferredEnd)).toISOString(),
-    deliveryDeadline: new Date(Math.max(now + 7_200_000, preferredEnd + 24 * 3_600_000)).toISOString(),
+    imagingStart: new Date(requestedStart).toISOString(),
+    imagingEnd: new Date(preferredEnd).toISOString(),
+    deliveryDeadline: new Date(Math.max(requestedStart + 7_200_000, preferredEnd + 24 * 3_600_000)).toISOString(),
     sensors: [],
     observationTargets: event.observationTargets,
     observationPhase: event.observationPhase,
@@ -1271,10 +1336,10 @@ function createSatelliteTask(event: DisasterEvent, operatorConfirmed: boolean): 
     locationQuality: event.locationQuality,
     locationAccuracyKm: event.locationAccuracyKm,
     evidenceCount: event.evidenceCount,
-    aoiApproval: event.dispatchEligibility === "ready" ? "source_verified" : "operator_confirmed",
+    aoiApproval: sourceVerified ? "source_verified" : "operator_confirmed",
     approvedAt: new Date(now).toISOString(),
-    approvedBy: event.dispatchEligibility === "ready" ? event.source : "当前操作员",
-    approvalReason: event.dispatchEligibility === "ready" ? undefined : "已在事件详情地图核对来源几何、位置误差和观测目标",
+    approvedBy: sourceVerified ? event.source : "当前操作员",
+    approvalReason: sourceVerified ? undefined : "已在事件详情地图核对来源几何、位置误差和观测目标",
     createdAt: new Date(now).toISOString(),
     updatedAt: new Date(now).toISOString(),
     status: "candidate",
@@ -1282,6 +1347,10 @@ function createSatelliteTask(event: DisasterEvent, operatorConfirmed: boolean): 
     eventRevision: eventRevisionFingerprint(event),
     aoiHash: "",
   };
+  task.timeIndexedAoi = cycloneTaskAoiSlices(event.cycloneForecast, task.imagingStart, task.imagingEnd);
+  task.forecastAdvisoryId = event.cycloneForecast ? `${event.cycloneForecast.source}:${event.cycloneForecast.advisory ?? event.cycloneForecast.issuedAt}` : undefined;
+  task.forecastIssuedAt = event.cycloneForecast?.issuedAt;
+  task.forecastValidUntil = event.cycloneForecast?.forecastValidUntil;
   return { ...task, aoiHash: aoiFingerprint(taskGeometry(task)) };
 }
 
@@ -1315,6 +1384,10 @@ function downloadTasks(tasks: SatelliteTask[], format: ExportFormat) {
       longitude_wgs84: task.longitude,
       event_occurred_at_utc: task.eventOccurredAt,
       event_updated_at_utc: task.eventUpdatedAt,
+      event_issued_at_utc: task.eventIssuedAt,
+      event_valid_from_utc: task.eventValidFrom ?? "",
+      event_valid_to_utc: task.eventValidTo ?? "",
+      phenomenon_stage: task.phenomenonStage,
       task_revision: task.revision,
       event_revision: task.eventRevision,
       aoi_hash: task.aoiHash,
@@ -1394,6 +1467,10 @@ function migrateSatelliteTask(task: Partial<SatelliteTask>): SatelliteTask {
     longitude: task.longitude ?? 0,
     eventOccurredAt: task.eventOccurredAt ?? task.createdAt ?? now,
     eventUpdatedAt: task.eventUpdatedAt ?? task.eventOccurredAt ?? task.createdAt ?? now,
+    eventIssuedAt: task.eventIssuedAt ?? task.eventUpdatedAt ?? task.eventOccurredAt ?? task.createdAt ?? now,
+    eventValidFrom: task.eventValidFrom,
+    eventValidTo: task.eventValidTo,
+    phenomenonStage: task.phenomenonStage ?? "observed",
     aoiType: task.aoiType ?? "circle",
     aoiRadiusKm: radius,
     aoiWidthKm: task.aoiWidthKm ?? Math.max(10, radius * 2),
@@ -1403,6 +1480,10 @@ function migrateSatelliteTask(task: Partial<SatelliteTask>): SatelliteTask {
     sourceGeometry: task.sourceGeometry,
     customGeometry: task.customGeometry,
     cycloneForecast: task.cycloneForecast,
+    timeIndexedAoi: task.timeIndexedAoi,
+    forecastAdvisoryId: task.forecastAdvisoryId,
+    forecastIssuedAt: task.forecastIssuedAt,
+    forecastValidUntil: task.forecastValidUntil,
     minimumCoveragePercent: task.minimumCoveragePercent ?? 80,
     maximumCloudPercent: task.maximumCloudPercent ?? 30,
     spatialResolutionMeters: task.spatialResolutionMeters ?? 10,

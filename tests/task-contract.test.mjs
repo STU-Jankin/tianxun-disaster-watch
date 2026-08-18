@@ -10,7 +10,7 @@ function validTask() {
   const end = new Date(Date.now() + 7_200_000).toISOString();
   return {
     taskId: "TASK-1", eventId: "EV-1", masterEventId: "ME-1", title: "test", status: "candidate", priority: 80,
-    latitude: 31.5, longitude: 120.3, aoiType: "source", sourceGeometry: { type: "Point", coordinates: [120.3, 31.5] }, aoiRadiusKm: 20, aoiWidthKm: 40, aoiHeightKm: 40,
+    latitude: 31.5, longitude: 120.3, aoiType: "source", sourceGeometry: { type: "Polygon", coordinates: [[[120.2, 31.4], [120.4, 31.4], [120.4, 31.6], [120.2, 31.4]]] }, aoiRadiusKm: 20, aoiWidthKm: 40, aoiHeightKm: 40,
     aoiLengthKm: 60, aoiBearingDeg: 0, imagingStart: start, imagingEnd: end, deliveryDeadline: new Date(Date.now() + 10_800_000).toISOString(),
     sensors: ["SAR"], observationTargets: ["淹没范围"], aoiApproval: "source_verified", source: "USGS", createdAt: new Date().toISOString(),
     minimumCoveragePercent: 80, maximumCloudPercent: 30, spatialResolutionMeters: 10, incidenceAngleMinDeg: 20, incidenceAngleMaxDeg: 45, revisitCount: 1,
@@ -93,4 +93,16 @@ test("enforces auditable task state transitions", async () => {
   assert.equal(canTransitionTask("candidate", "reviewed"), true);
   assert.equal(canTransitionTask("submitted", "acquired"), true);
   assert.equal(canTransitionTask("completed", "candidate"), false);
+});
+
+test("rejects self-intersecting and world-scale AOIs", async () => {
+  const { validateSatelliteTask } = await contract();
+  const task = validTask();
+  task.aoiApproval = "operator_confirmed";
+  task.approvalReason = "人工绘制";
+  task.aoiType = "polygon";
+  task.customGeometry = { type: "Polygon", coordinates: [[[120, 30], [122, 32], [120, 32], [122, 30], [120, 30]]] };
+  assert.equal(validateSatelliteTask(task).ok, false);
+  task.customGeometry = { type: "Polygon", coordinates: [[[-170, -70], [170, -70], [170, 70], [-170, 70], [-170, -70]]] };
+  assert.equal(validateSatelliteTask(task).ok, false);
 });
