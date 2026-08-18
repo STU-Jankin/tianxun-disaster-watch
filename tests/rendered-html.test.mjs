@@ -18,7 +18,7 @@ test("server-renders the disaster watch dashboard", async () => {
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
   const html = await response.text();
   assert.match(html, /星联体·天巡灾情实时预报系统/);
-  assert.match(html, /satellite-union-logo\.png/);
+  assert.match(html, /satellite-union-mark\.png/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
 });
 
@@ -82,7 +82,7 @@ test("uses a white and blue command-center color system", async () => {
   assert.match(css, /--panel:\s*#ffffff;/);
   assert.match(css, /--teal:\s*#0868be;/);
   assert.match(css, /Blue-white command-center theme/);
-  assert.match(css, /\.brand-logo-frame\s*\{[^}]*background:\s*#fff url\("\/satellite-union-logo\.png"\)/s);
+  assert.match(css, /\.brand-logo-frame\s*\{[^}]*background:\s*#fff url\("\/satellite-union-logo\.png"\) center \/ contain no-repeat;/s);
 });
 
 test("keeps map selection resilient while event geometry is being refreshed", async () => {
@@ -170,8 +170,18 @@ test("keeps the public Nginx trial read-only and leaves internal services unexpo
   const { readFile } = await import("node:fs/promises");
   const nginx = await readFile(new URL("../vps/nginx/tianxun-public-readonly.conf", import.meta.url), "utf8");
   assert.match(nginx, /listen 80 default_server/);
-  assert.equal(nginx.match(/tianxun-proxy-secret\.conf/g)?.length, 3);
+  assert.equal(nginx.match(/tianxun-proxy-secret\.conf/g)?.length, 4);
+  assert.match(nginx, /location = \/api\/weather[\s\S]*limit_req[\s\S]*tianxun-proxy-secret\.conf/);
   assert.match(nginx, /location = \/api\/tasks[\s\S]*public-read-only[\s\S]*return 403/);
   assert.match(nginx, /location ~ \^\/api\/\(changes\|visibility\)[\s\S]*return 403/);
   assert.doesNotMatch(nginx, /listen\s+(?:127\.0\.0\.1:)?(?:3000|8644)/);
+});
+
+test("adds on-demand hourly weather to event details and satellite tasks", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  for (const text of ["逐小时天气 · QWeather", "光学气象窗口", "加载该 AOI 天气", "SAR不受云层遮挡"]) assert.ok(dashboard.includes(text));
+  assert.match(dashboard, /weatherImagingWindows/);
+  assert.match(css, /\.weather-card/);
 });

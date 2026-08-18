@@ -14,6 +14,7 @@ import { allowedTaskStatuses, canTransitionTask, safeHttpUrl, validateSatelliteT
 import { buildTaskAoi, customAoiPartCount, normalizeCustomAoiGeoJson, type CustomAoiGeometry } from "../lib/task-aoi";
 import { aoiFingerprint, eventRevisionFingerprint } from "../lib/event-integrity";
 import { cycloneUncertaintyGeometry, cycloneWindGeometry } from "../lib/cyclone-forecast";
+import { weatherImagingWindows, type WeatherForecastReady, type WeatherForecastResponse } from "../lib/qweather";
 
 type ApiResponse = {
   events: DisasterEvent[];
@@ -115,6 +116,12 @@ type VisibilityState = {
   state: "idle" | "loading" | "ready" | "needs_config" | "error";
   message?: string;
   windows: VisibilityWindow[];
+};
+
+type WeatherLoadState = {
+  state: "idle" | "loading" | "ready" | "needs_config" | "error";
+  message?: string;
+  forecast?: WeatherForecastReady;
 };
 
 const taskStorageKey = "tianxun-satellite-task-candidates-v1";
@@ -967,6 +974,7 @@ function DetailPanel({ event, obscured, dispatchBlocked, locationZh, locationLoa
       {event.sourcePresence === "retained" ? <em>当前短时数据源未再次报告该事件；未据此判定灾害已结束，仍保留至观测期届满或权威撤销。</em> : null}
     </div>
     <div className="observation-deadline"><span>{event.observationPhase === "golden" ? "距建议复核" : "后续观测剩余"}</span><strong>{remainingObservationTime(event.observationPhase === "golden" ? event.observationReviewAt : event.observationExpiresAt)}</strong><small>{event.observationPhase === "golden" ? `黄金期至 ${formatTime(event.observationReviewAt)}；到期不撤销，转后续观测` : `建议持续复核；兜底归档 ${formatTime(event.observationExpiresAt)}`}</small></div>
+    <WeatherForecastCard latitude={event.latitude} longitude={event.longitude} maximumCloudPercent={30} />
     {event.cycloneForecast ? <section className="cyclone-forecast-card">
       <h3>官方台风预报 · {event.cycloneForecast.source}</h3>
       <div className="forecast-validity"><span>发布 {formatTimeWithYear(event.cycloneForecast.issuedAt)} UTC+08</span><span>有效至 {formatTimeWithYear(event.cycloneForecast.forecastValidUntil)} UTC+08</span></div>
@@ -1001,11 +1009,53 @@ function DetailPanel({ event, obscured, dispatchBlocked, locationZh, locationLoa
   </aside>;
 }
 
+function WeatherForecastCard({ latitude, longitude, maximumCloudPercent, compact = false, enabled = true, onRequest }: { latitude: number; longitude: number; maximumCloudPercent: number; compact?: boolean; enabled?: boolean; onRequest?: () => void }) {
+  const [load, setLoad] = useState<WeatherLoadState>({ state: enabled ? "loading" : "idle" });
+  const [retry, setRetry] = useState(0);
+  useEffect(() => {
+    if (!enabled) return;
+    const controller = new AbortController();
+    const start = window.setTimeout(() => {
+      setLoad({ state: "loading" });
+      const params = new URLSearchParams({ latitude: String(latitude), longitude: String(longitude), hours: "72" });
+      fetch(`/api/weather?${params}`, { signal: controller.signal, cache: "no-store" })
+        .then(async (response) => ({ response, result: await response.json() as WeatherForecastResponse }))
+        .then(({ response, result }) => {
+          if (result.state === "ready") setLoad({ state: "ready", forecast: result });
+          else setLoad({ state: result.state === "needs_config" ? "needs_config" : "error", message: result.message || `天气请求失败（HTTP ${response.status}）` });
+        })
+        .catch((error) => { if (!controller.signal.aborted) setLoad({ state: "error", message: error instanceof Error ? error.message : "天气请求失败" }); });
+    }, 0);
+    return () => { window.clearTimeout(start); controller.abort(); };
+  }, [enabled, latitude, longitude, retry]);
+
+  if (!enabled) return <section className={`weather-card ${compact ? "compact" : ""}`}><div className="weather-heading"><h3>逐小时天气 · QWeather</h3><span>按需查询</span></div><p>仅在需要规划该任务时加载，避免消耗免费调用额度。</p><button className="weather-load" onClick={onRequest}>加载该 AOI 天气</button></section>;
+  const forecast = load.forecast;
+  const windows = forecast ? weatherImagingWindows(forecast.hourly, maximumCloudPercent) : [];
+  const sample = forecast?.hourly.filter((_, index) => index % 3 === 0).slice(0, compact ? 4 : 8) ?? [];
+  return <section className={`weather-card ${compact ? "compact" : ""}`} aria-live="polite">
+    <div className="weather-heading"><h3>逐小时天气 · QWeather</h3><span>{load.state === "ready" ? "3–5 km格点" : load.state === "loading" ? "连接中" : load.state === "needs_config" ? "待配置" : "不可用"}</span></div>
+    {load.state === "loading" ? <div className="weather-loading">正在获取未来72小时预报…</div> : null}
+    {load.state === "needs_config" ? <div className="weather-message"><strong>尚未配置免费天气接口</strong><p>{load.message}</p><a href="https://console.qweather.com/" target="_blank" rel="noreferrer">前往和风天气控制台 ↗</a></div> : null}
+    {load.state === "error" ? <div className="weather-message error" role="alert"><strong>天气预报暂不可用</strong><p>{load.message}</p><button onClick={() => setRetry((value) => value + 1)}>重试</button></div> : null}
+    {forecast ? <>
+      <div className="weather-validity"><span>模式更新 {formatTimeWithYear(forecast.issuedAt)} UTC+08</span><span>查询 {forecast.latitude.toFixed(2)}°, {forecast.longitude.toFixed(2)}°</span></div>
+      <div className="weather-hours">{sample.map((hour) => <div key={hour.validAt} className={hour.opticalSuitability}>
+        <time>{formatTime(hour.validAt)}</time><strong>{hour.condition} · {hour.temperatureC}℃</strong><span>云 {hour.cloudPercent == null ? "--" : `${hour.cloudPercent}%`} · 雨 {hour.precipitationMm} mm</span><small>{hour.windDirection} {hour.windSpeedKmh} km/h</small>
+      </div>)}</div>
+      <div className="weather-windows"><strong>光学气象窗口 · 云量≤{maximumCloudPercent}%</strong>{windows.length ? windows.map((window) => <div key={window.start}><time>{formatTimeWithYear(window.start)} — {formatTimeWithYear(window.end)}</time><small>云量 {window.minimumCloudPercent}–{window.maximumCloudPercent}% · 最大降水 {window.maximumPrecipitationMm} mm</small></div>) : <p>未来72小时暂无连续2小时满足条件的窗口；SAR不受云层遮挡，可继续结合降水与风场人工评估。</p>}</div>
+      <p className="weather-note">{forecast.note}</p>
+      <a className="weather-source" href={safeHttpUrl(forecast.sourceUrl)} target="_blank" rel="noreferrer">数据：QWeather · 查看来源 ↗</a>
+    </> : null}
+  </section>;
+}
+
 function TaskPanel({ tasks, syncState, storageMode, activeTaskId, onActivate, onUpdate, onRemove, onClose, onRetry }: { tasks: SatelliteTask[]; syncState: Record<string, TaskSyncState>; storageMode: TaskStorageMode; activeTaskId: string | null; onActivate: (taskId: string) => void; onUpdate: (taskId: string, patch: Partial<SatelliteTask>) => void; onRemove: (taskId: string) => void; onClose: () => void; onRetry: (task: SatelliteTask) => void }) {
   const [visibility, setVisibility] = useState<Record<string, VisibilityState>>({});
   const [copiedTaskId, setCopiedTaskId] = useState<string | null>(null);
   const [exportError, setExportError] = useState("");
   const [aoiImportError, setAoiImportError] = useState<Record<string, string>>({});
+  const [weatherTaskId, setWeatherTaskId] = useState<string | null>(activeTaskId);
   const panelRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
@@ -1078,6 +1128,7 @@ function TaskPanel({ tasks, syncState, storageMode, activeTaskId, onActivate, on
         </div>
         <div className="task-coordinates"><span>中心坐标</span><code>{task.latitude.toFixed(6)}, {task.longitude.toFixed(6)}</code><button onClick={() => void copyCoordinates(task).then((copied) => { if (copied) { setCopiedTaskId(task.taskId); window.setTimeout(() => setCopiedTaskId((current) => current === task.taskId ? null : current), 1800); } })}>{copiedTaskId === task.taskId ? "已复制" : "复制"}</button></div>
         <div className={`task-quality ${task.aoiApproval}`}><span>{locationQualityLabels[task.locationQuality]} · ±{task.locationAccuracyKm} km</span><b>{task.aoiApproval === "source_verified" ? "来源可下发" : "已人工核对"}</b><small>{task.evidenceCount} 条证据 · {task.masterEventId}</small></div>
+        <WeatherForecastCard latitude={task.latitude} longitude={task.longitude} maximumCloudPercent={task.maximumCloudPercent} compact enabled={weatherTaskId === task.taskId} onRequest={() => setWeatherTaskId(task.taskId)} />
         {task.cycloneForecast ? <div className="task-forecast-summary"><strong>官方预报已随任务保存</strong><span>{task.cycloneForecast.track.length} 个官方中心节点{task.cycloneForecast.impactField ? ` · ${task.cycloneForecast.impactField.frames.length} 个逐时时间片` : ""} · 至 {formatTimeWithYear(task.cycloneForecast.forecastValidUntil)} UTC+08</span><small>{task.cycloneForecast.impactGeometry ? `${task.cycloneForecast.impactThreshold || "官方风圈"}已作为默认来源 AOI` : "本报次没有官方风圈；默认 AOI 仍以当前中心设置"}</small></div> : null}
         <div className={`task-sync ${syncState[task.taskId]?.state ?? "local"}`} role="status">{syncState[task.taskId]?.state === "saving" ? "正在同步…" : syncState[task.taskId]?.state === "synced" ? "已同步到业务数据库" : syncState[task.taskId]?.state === "error" ? <>同步失败：{syncState[task.taskId]?.message ?? "请重试"} <button onClick={() => onRetry(task)}>重试同步</button></> : "仅保存在本机"}</div>
     <div className="aoi-type-selector" aria-label="AOI目标类型">

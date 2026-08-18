@@ -18,6 +18,14 @@ import { eventHasInvalidIdentity, firstValidSourceEventId, isValidSourceEventId 
 import { updateIngestionHealth } from "../../../lib/runtime-health";
 import { floodProcessEntityKey, sameFloodRegion } from "../../../lib/process-identity";
 import { selectFirmsEvents } from "../../../lib/event-selection";
+import {
+  buildCmaSurfaceRequestUrl,
+  cmaSurfaceConfiguration,
+  CMA_SURFACE_PUBLIC_URL,
+  CMA_SURFACE_SOURCE,
+  isCmaSurfaceSource,
+  parseCmaSurfacePayload,
+} from "../../../lib/cma-surface";
 
 export const dynamic = "force-dynamic";
 
@@ -106,6 +114,7 @@ function hashText(value: string) {
 }
 
 async function refreshEvents() {
+  const cmaSurface = cmaSurfaceConfiguration();
   const connectors: SourceConnector[] = [
     {
       name: "中国地震台网",
@@ -129,7 +138,7 @@ async function refreshEvents() {
       fetcher: fetchJiangsuWater,
     },
     {
-      name: "中国气象数据网 CMA",
+      name: "中国气象数据网 CMA 预警",
       tier: "中国第二批",
       role: "事件",
       setupUrl: "https://data.cma.cn/",
@@ -137,7 +146,16 @@ async function refreshEvents() {
         ready: Boolean(process.env.CMA_EVENT_FEED_URL),
         message: "注册并获授权后配置 CMA_EVENT_FEED_URL（CAP 或 GeoJSON）",
       },
-      fetcher: fetchCma,
+      fetcher: fetchCmaEventFeed,
+    },
+    {
+      name: "中国气象数据网 CMA · 地面观测",
+      tier: "中国第二批",
+      role: "核验",
+      setupUrl: CMA_SURFACE_PUBLIC_URL,
+      config: { ready: cmaSurface.ready, message: cmaSurface.message },
+      successMessage: "在线；逐三小时资料约滞后2天，只核验时空匹配的既有洪水/台风，不独立生成任务",
+      fetcher: fetchCmaSurface,
     },
     { name: "USGS", tier: "基础", role: "事件", setupUrl: "https://earthquake.usgs.gov/earthquakes/feed/", fetcher: fetchUsgs },
     { name: "EONET", tier: "基础", role: "事件", setupUrl: "https://eonet.gsfc.nasa.gov/", fetcher: fetchEonet },
@@ -231,7 +249,9 @@ async function refreshEvents() {
   if (runs.some((run) => run.online)) lastSuccessfulFetchAt = refreshCompletedAt;
   const cancellations = cancellationBuffer.splice(0);
   const collected = runs.flatMap((run) => run.events);
-  const normalized = canonicalizeEvents(collected.filter((event) => !eventHasInvalidIdentity(event))).map(finalize);
+  const normalized = canonicalizeEvents(collected.filter((event) => !eventHasInvalidIdentity(event)))
+    .filter((event) => event.evidence.some((item) => !isCmaSurfaceSource(item.source)))
+    .map(finalize);
   const allSourcesUnavailable = runs.every((source) => !source.online);
   const sourceCounts = runs.map((run) => ({
     name: run.name,
@@ -568,7 +588,7 @@ async function fetchJiangsuWater(): Promise<DisasterEvent[]> {
   });
 }
 
-async function fetchCma(): Promise<DisasterEvent[]> {
+async function fetchCmaEventFeed(): Promise<DisasterEvent[]> {
   const url = process.env.CMA_EVENT_FEED_URL;
   if (!url) return [];
   const safeUrl = validateExternalFeedUrl(url);
@@ -599,7 +619,7 @@ async function fetchCma(): Promise<DisasterEvent[]> {
       longitude: center[0],
       occurredAt: issuedAt,
       updatedAt: validIso(properties.updatedAt ?? properties.updated) ?? issuedAt,
-      source: "中国气象数据网 CMA",
+      source: "中国气象数据网 CMA 预警",
       sourceUrl: String(properties.url ?? url),
       sourceSeverity,
       severity: officialColorSeverity(sourceSeverity),
@@ -608,6 +628,36 @@ async function fetchCma(): Promise<DisasterEvent[]> {
       description: String(properties.description ?? "来自已授权CMA业务接口；仅接收带点位或面几何、且遥感可直接或间接观测的事件。"),
     })];
   });
+}
+
+async function fetchCmaSurface(): Promise<DisasterEvent[]> {
+  const configuration = cmaSurfaceConfiguration();
+  if (!configuration.ready || !configuration.config) return [];
+  const requestUrl = buildCmaSurfaceRequestUrl(configuration.config);
+  let response: Response;
+  try {
+    response = await fetch(requestUrl, {
+      headers: { Accept: "application/json", "User-Agent": "Tianxun-Disaster-Watch/0.1" },
+      signal: AbortSignal.timeout(12_000),
+      redirect: "error",
+    });
+  } catch {
+    throw new Error("CMA 地面观测请求失败；未记录含凭据的请求地址");
+  }
+  if (!response.ok) throw new Error(`CMA 地面观测返回 HTTP ${response.status}`);
+  const body = await readLimitedText(response, 5_000_000, "CMA 地面观测");
+  let payload: unknown;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    throw new Error("CMA 地面观测返回了无效 JSON");
+  }
+  return parseCmaSurfacePayload(payload, configuration.config.timeZone).map((candidate) => baseEvent({
+    ...candidate,
+    source: CMA_SURFACE_SOURCE,
+    sourceUrl: CMA_SURFACE_PUBLIC_URL,
+    severity: "blue",
+  }));
 }
 
 async function fetchUsgs(): Promise<DisasterEvent[]> {
@@ -1217,7 +1267,9 @@ function canonicalizeEvents(events: DisasterEvent[]) {
   }
 
   return groups.map((candidates) => {
-    const primary = [...candidates].sort((a, b) => eventAuthority(b) - eventAuthority(a) || +new Date(b.updatedAt) - +new Date(a.updatedAt))[0];
+    const authoritativeCandidates = candidates.filter((event) => !isCmaSurfaceSource(event.source));
+    const canonicalCandidates = authoritativeCandidates.length ? authoritativeCandidates : candidates;
+    const primary = [...canonicalCandidates].sort((a, b) => eventAuthority(b) - eventAuthority(a) || +new Date(b.updatedAt) - +new Date(a.updatedAt))[0];
     const evidence = [...new Map(candidates.flatMap((event) => event.evidence)
       .sort((a, b) => +new Date(b.observedAt) - +new Date(a.observedAt))
       .map((item) => [`${sourceFamily(item.source)}|${item.sourceEventId}`, item])).values()];
@@ -1228,12 +1280,12 @@ function canonicalizeEvents(events: DisasterEvent[]) {
     })))
       .sort((a, b) => +new Date(b.observedAt) - +new Date(a.observedAt))
       .map((item) => [`${sourceFamily(item.source)}|${item.sourceEventId}`, item])).values()].slice(0, 50);
-    const location = [...candidates].sort((a, b) => locationRank(b.locationQuality) - locationRank(a.locationQuality) || a.locationAccuracyKm - b.locationAccuracyKm)[0];
+    const location = [...canonicalCandidates].sort((a, b) => locationRank(b.locationQuality) - locationRank(a.locationQuality) || a.locationAccuracyKm - b.locationAccuracyKm)[0];
     const cycloneForecast = candidates.flatMap((event) => event.cycloneForecast ? [event.cycloneForecast] : [])
       .sort((a, b) => +new Date(b.issuedAt) - +new Date(a.issuedAt) || b.track.length - a.track.length)[0];
     const independentEvidenceCount = new Set(evidence.filter((item) => sourceTrust(item.source) >= 85).map((item) => sourceFamily(item.source))).size;
     const confidenceScore = Math.min(99, primary.confidenceScore + Math.min(18, Math.max(0, independentEvidenceCount - 1) * 6));
-    const strongestSeverity = [...candidates].sort((a, b) => severityRank(b.severity) - severityRank(a.severity) || +new Date(b.updatedAt) - +new Date(a.updatedAt))[0];
+    const strongestSeverity = [...canonicalCandidates].sort((a, b) => severityRank(b.severity) - severityRank(a.severity) || +new Date(b.updatedAt) - +new Date(a.updatedAt))[0];
     const entityKey = candidates.map((event) => event.entityKey || processEntityKey(event)).sort((a, b) => entityKeySpecificity(b) - entityKeySpecificity(a))[0];
     return {
       ...primary,
@@ -1284,6 +1336,13 @@ const mergePolicy: Record<HazardType, { hours: number; kilometers: number }> = {
 function isSamePhysicalEvent(a: DisasterEvent, b: DisasterEvent) {
   if (a.hazard !== b.hazard) return false;
   if (a.id === b.id && isValidSourceEventId(a.id)) return true;
+  const surfaceObservation = isCmaSurfaceSource(a.source) ? a : isCmaSurfaceSource(b.source) ? b : null;
+  const authoritativeEvent = surfaceObservation === a ? b : surfaceObservation === b ? a : null;
+  if (surfaceObservation && authoritativeEvent && !isCmaSurfaceSource(authoritativeEvent.source)) {
+    const referenceTimes = [authoritativeEvent.activityAt, authoritativeEvent.updatedAt, authoritativeEvent.occurredAt];
+    const closestHours = Math.min(...referenceTimes.map((value) => Math.abs(+new Date(surfaceObservation.occurredAt) - +new Date(value)) / 3_600_000));
+    return closestHours <= 96 && distanceKm(a.latitude, a.longitude, b.latitude, b.longitude) <= mergePolicy[a.hazard].kilometers;
+  }
   const entityA = a.entityKey || processEntityKey(a);
   const entityB = b.entityKey || processEntityKey(b);
   if (sameNamedProcess(entityA, entityB)) return true;
@@ -1318,6 +1377,7 @@ function distanceKm(latA: number, lonA: number, latB: number, lonB: number) {
 }
 
 function inferLocationProfile(source: string, hazard: HazardType, description?: string): { quality: DisasterEvent["locationQuality"]; accuracyKm: number } {
+  if (isCmaSurfaceSource(source)) return { quality: "precise", accuracyKm: 2 };
   if (/太湖流域管理局|江苏省水利厅/.test(source) || /AOI锚点|代表点/.test(description ?? "")) return { quality: "representative", accuracyKm: 100 };
   if (/FIRMS/.test(source) && /0\.25°网格聚合/.test(description ?? "")) return { quality: "estimated", accuracyKm: 20 };
   if (/GDACS|EONET|GloFAS|WMO|Smithsonian|LHASA/.test(source)) return { quality: "estimated", accuracyKm: hazard === "cyclone" ? 25 : hazard === "flood" ? 50 : 20 };
@@ -1326,6 +1386,8 @@ function inferLocationProfile(source: string, hazard: HazardType, description?: 
 }
 
 function sourceTrust(source: string) {
+  if (isCmaSurfaceSource(source)) return 88;
+  if (/中国气象数据网 CMA 预警/.test(source)) return 90;
   if (/中国地震台网/.test(source)) return 92;
   if (/USGS/.test(source)) return 91;
   if (/NOAA|JMA|GeoNet/.test(source)) return 90;
@@ -1336,7 +1398,7 @@ function sourceTrust(source: string) {
 }
 
 function eventAuthority(event: DisasterEvent) {
-  return sourceTrust(event.source) + locationRank(event.locationQuality) * 4 + Math.min(5, event.evidenceCount);
+  return sourceTrust(event.source) + locationRank(event.locationQuality) * 4 + Math.min(5, event.evidenceCount) - (isCmaSurfaceSource(event.source) ? 30 : 0);
 }
 
 function locationRank(quality: DisasterEvent["locationQuality"]) {
@@ -1344,8 +1406,8 @@ function locationRank(quality: DisasterEvent["locationQuality"]) {
 }
 
 function evidenceRole(source: string): "detection" | "warning" | "verification" {
-  if (/ReliefWeb|Smithsonian/.test(source)) return "verification";
-  if (/WMO|NOAA|JMA/.test(source)) return "warning";
+  if (/ReliefWeb|Smithsonian/.test(source) || isCmaSurfaceSource(source)) return "verification";
+  if (/WMO|NOAA|JMA|CMA 预警/.test(source)) return "warning";
   return "detection";
 }
 

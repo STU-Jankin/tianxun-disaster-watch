@@ -8,6 +8,8 @@
 
 - 接入 USGS 地震、NASA EONET、GDACS、NOAA NHC、日本气象厅 JMA、USGS HANS、Smithsonian GVP 与 NASA LHASA。
 - 第一优先级的 NASA FIRMS、WMO SWIC/CAP、Copernicus GloFAS，以及第二优先级的 OCHA ReliefWeb 已有独立连接器；需要密钥或订阅地址的源会明确显示“待配置”，配置字段见 `.env.example`。
+- 中国气象数据网 CMA 支持两条独立链路：带几何的 CAP/GeoJSON 预警流，以及 `SURF_CHN_MUL_HOR_3H` 地面站核验流。后者按官方目录约滞后2天、每日更新，只把强降水和大风观测并入时空匹配的既有洪水/台风证据链，不单独创建灾害或任务，也不会替换权威事件中心和等级。
+- QWeather 第一阶段逐小时格点预报按事件或任务 AOI 坐标查询未来72小时天气，在详情和任务候选中显示云量、降水、风速以及连续光学气象窗口。预报采用30分钟服务端缓存和每日新点位预算，不改变灾害等级，也不把数值模式结果冒充站点实况或官方预警。
 - 统一地震、火灾、洪水、气旋、火山、滑坡、干旱等事件模型。
 - 将不同来源的同一物理事件按灾种时空阈值合并为主事件，并保留来源证据链、可信度和事件生命周期。
 - 对有编号或名称的持续过程建立灾害实体键：同一台风、编号洪水、火山活动和季度干旱只显示一个主事件；同源连续通报作为“更新历史”，不同来源才计为独立证据。
@@ -39,6 +41,10 @@ npm run dev
 访问 `http://localhost:3000`。
 
 运行前将 `.env.example` 复制为 `.env.local`，填入获批的数据源和仿真服务配置。数据库使用 `.openai/hosting.json` 中的 `DB` 绑定；本地开发会自动初始化与 `drizzle/0000_operational_core.sql` 一致的表结构。
+
+CMA 地面观测默认使用无锡 58354、宜兴 58346、江阴 58351、苏州 58349 四站；仓库内的官方站点索引可校验并支持任意1至30个订购站号。真实账号和密码只能写入未被 Git 跟踪的 `.env.local` 或 VPS `/etc/tianxun/engine.env`。官方文档给出的旧接口会把账号密码放在明文 HTTP 查询串中，因此系统默认拒绝调用；生产环境应优先配置 `CMA_SURFACE_API_URL` 为 HTTPS 凭据转发网关。只有明确接受明文传输风险时，才可将 `CMA_SURFACE_ALLOW_INSECURE_HTTP` 设为 `true`。
+
+QWeather 需要先在控制台创建免费项目，将专属 API Host 和 API KEY 分别写入 `QWEATHER_API_HOST`、`QWEATHER_API_KEY`。凭据只由 `/api/weather` 服务端代理读取，浏览器不会获得密钥。生产环境也可改用 `QWEATHER_PROJECT_ID`、`QWEATHER_CREDENTIAL_ID`、`QWEATHER_PRIVATE_KEY` 配置 Ed25519 JWT；系统优先使用 API KEY 以便第一阶段快速验证。默认最多引入120个新坐标/日，并把同一0.01°格点结果缓存30分钟，用于保护免费额度。
 
 ## 验证
 

@@ -11,7 +11,7 @@ const notoSans = Noto_Sans_SC({
 export const metadata: Metadata = {
   title: "星联体·天巡灾情实时预报系统",
   description: "全球灾害事件实时发现、遥感可观测性筛选和卫星任务候选生成。",
-  icons: { icon: "/satellite-union-logo.png", shortcut: "/satellite-union-logo.png" },
+  icons: { icon: "/satellite-union-mark.png", shortcut: "/satellite-union-mark.png" },
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
