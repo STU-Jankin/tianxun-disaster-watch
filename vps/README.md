@@ -153,6 +153,6 @@ sudo bash /opt/tianxun/current/vps/scripts/backup.sh
 
 ## 公网只读试用入口
 
-`vps/nginx/tianxun-public-readonly.conf` 可把页面、事件、地点解析、逐小时天气和健康检查通过 Nginx 暴露到 80 端口，同时让 Node 引擎与 Hermes 继续只监听回环地址。天气接口只代理经过坐标校验、频率限制、30分钟缓存和每日新点位预算的只读查询，不向浏览器泄露 QWeather 凭据。该配置不会公开已有卫星任务，并拒绝任务写入、删除、变更流和可见性仿真请求。生产环境若要开放任务规划，必须先配置域名、HTTPS 和用户级认证，不能仅靠共享代理密钥。
+`vps/nginx/tianxun-public-readonly.conf` 可把页面、事件、地点解析、逐小时天气和健康检查通过 Nginx 暴露到 80 端口，同时让 Node 引擎与 Hermes 继续只监听回环地址。天气接口只代理经过坐标校验、频率限制和30分钟缓存的只读查询；免密钥 MET Norway 是默认底座，QWeather 仅作可选增强且凭据不会返回浏览器。该配置不会公开已有卫星任务，并拒绝任务写入、删除、变更流和可见性仿真请求。生产环境若要开放任务规划，必须先配置域名、HTTPS 和用户级认证，不能仅靠共享代理密钥。
 
 站点配置依赖两个运行时 snippet：`/etc/nginx/snippets/tianxun-proxy-common.conf` 使用仓库模板；`/etc/nginx/snippets/tianxun-proxy-secret.conf` 必须在服务器上生成，权限设为 `0600`，内容为 `proxy_set_header X-Tianxun-Proxy-Secret <64位随机值>;`。同一个随机值写入 `/etc/tianxun/engine.env` 的 `TIANXUN_TRUSTED_PROXY_SECRET` 后重启引擎。不要把实际密钥提交到仓库。

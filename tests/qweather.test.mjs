@@ -64,9 +64,12 @@ test("QWeather JWT uses Ed25519 and contains only the documented claims", async 
   assert.ok(signature.length > 40);
 });
 
-test("weather API source enforces authentication, rate limits, caching and a daily location budget", async () => {
+test("weather API source enforces authentication, rate limits, caching and a QWeather budget with no-key fallback", async () => {
   const { readFile } = await import("node:fs/promises");
   const route = await readFile(new URL("../app/api/weather/route.ts", import.meta.url), "utf8");
   for (const guard of ["authorizeApiRequest", "enforceRateLimit", "QWEATHER_DAILY_UNIQUE_LOCATION_LIMIT", "X-Tianxun-Weather-Cache", "latitude.toFixed(2)"]) assert.ok(route.includes(guard));
+  for (const fallback of ["fetchMetWeather", "MET Norway", "metWeatherUserAgent"]) assert.ok(route.includes(fallback));
+  assert.match(route, /redirect: "manual"/);
+  assert.doesNotMatch(route, /redirect: "error"/);
   assert.doesNotMatch(route, /QWEATHER_API_KEY[^\n]*Response/);
 });

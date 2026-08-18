@@ -1029,12 +1029,12 @@ function WeatherForecastCard({ latitude, longitude, maximumCloudPercent, compact
     return () => { window.clearTimeout(start); controller.abort(); };
   }, [enabled, latitude, longitude, retry]);
 
-  if (!enabled) return <section className={`weather-card ${compact ? "compact" : ""}`}><div className="weather-heading"><h3>逐小时天气 · QWeather</h3><span>按需查询</span></div><p>仅在需要规划该任务时加载，避免消耗免费调用额度。</p><button className="weather-load" onClick={onRequest}>加载该 AOI 天气</button></section>;
+  if (!enabled) return <section className={`weather-card ${compact ? "compact" : ""}`}><div className="weather-heading"><h3>逐小时天气 · 全球预报</h3><span>按需查询</span></div><p>默认使用免密钥全球预报；已配置和风天气时优先使用其高分辨率格点并自动降级。</p><button className="weather-load" onClick={onRequest}>加载该 AOI 天气</button></section>;
   const forecast = load.forecast;
   const windows = forecast ? weatherImagingWindows(forecast.hourly, maximumCloudPercent) : [];
   const sample = forecast?.hourly.filter((_, index) => index % 3 === 0).slice(0, compact ? 4 : 8) ?? [];
   return <section className={`weather-card ${compact ? "compact" : ""}`} aria-live="polite">
-    <div className="weather-heading"><h3>逐小时天气 · QWeather</h3><span>{load.state === "ready" ? "3–5 km格点" : load.state === "loading" ? "连接中" : load.state === "needs_config" ? "待配置" : "不可用"}</span></div>
+    <div className="weather-heading"><h3>逐小时天气 · 全球预报</h3><span>{load.state === "ready" && forecast ? `${forecast.provider} · ${forecast.resolution}` : load.state === "loading" ? "连接中" : load.state === "needs_config" ? "待配置" : "不可用"}</span></div>
     {load.state === "loading" ? <div className="weather-loading">正在获取未来72小时预报…</div> : null}
     {load.state === "needs_config" ? <div className="weather-message"><strong>尚未配置免费天气接口</strong><p>{load.message}</p><a href="https://console.qweather.com/" target="_blank" rel="noreferrer">前往和风天气控制台 ↗</a></div> : null}
     {load.state === "error" ? <div className="weather-message error" role="alert"><strong>天气预报暂不可用</strong><p>{load.message}</p><button onClick={() => setRetry((value) => value + 1)}>重试</button></div> : null}
@@ -1045,7 +1045,7 @@ function WeatherForecastCard({ latitude, longitude, maximumCloudPercent, compact
       </div>)}</div>
       <div className="weather-windows"><strong>光学气象窗口 · 云量≤{maximumCloudPercent}%</strong>{windows.length ? windows.map((window) => <div key={window.start}><time>{formatTimeWithYear(window.start)} — {formatTimeWithYear(window.end)}</time><small>云量 {window.minimumCloudPercent}–{window.maximumCloudPercent}% · 最大降水 {window.maximumPrecipitationMm} mm</small></div>) : <p>未来72小时暂无连续2小时满足条件的窗口；SAR不受云层遮挡，可继续结合降水与风场人工评估。</p>}</div>
       <p className="weather-note">{forecast.note}</p>
-      <a className="weather-source" href={safeHttpUrl(forecast.sourceUrl)} target="_blank" rel="noreferrer">数据：QWeather · 查看来源 ↗</a>
+      <a className="weather-source" href={safeHttpUrl(forecast.sourceUrl)} target="_blank" rel="noreferrer">数据：{forecast.provider} · 查看来源 ↗</a>
     </> : null}
   </section>;
 }

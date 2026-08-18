@@ -23,8 +23,8 @@ export type WeatherImagingWindow = {
 
 export type WeatherForecastReady = {
   state: "ready";
-  provider: "QWeather";
-  product: "grid-weather-hourly";
+  provider: "QWeather" | "MET Norway";
+  product: string;
   latitude: number;
   longitude: number;
   issuedAt: string;
@@ -32,7 +32,7 @@ export type WeatherForecastReady = {
   sourceUrl: string;
   attribution: string[];
   license: string[];
-  resolution: "3-5 km";
+  resolution: string;
   timeZone: "UTC";
   hourly: WeatherForecastHour[];
   note: string;
@@ -40,7 +40,7 @@ export type WeatherForecastReady = {
 
 export type WeatherForecastResponse = WeatherForecastReady | {
   state: "needs_config" | "error";
-  provider: "QWeather";
+  provider: "QWeather" | "MET Norway";
   message: string;
 };
 

@@ -157,6 +157,8 @@ test("implements stale-data, map resize, AOI preview and server task gates", asy
   assert.match(taskRoute, /authorizeApiRequest/);
   assert.match(eventRoute, /recordCapCancellations/);
   assert.match(eventRoute, /confidenceCode/);
+  assert.match(eventRoute, /aoiApprovalRequired: location\.aoiApprovalRequired/);
+  assert.match(eventRoute, /dispatchEligibility: location\.dispatchEligibility/);
   assert.match(eventRoute, /windKt/);
   assert.match(eventRoute, /parseNhcTrackKml/);
   assert.match(eventRoute, /buildJmaCycloneForecast/);
@@ -181,7 +183,7 @@ test("adds on-demand hourly weather to event details and satellite tasks", async
   const { readFile } = await import("node:fs/promises");
   const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
   const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
-  for (const text of ["逐小时天气 · QWeather", "光学气象窗口", "加载该 AOI 天气", "SAR不受云层遮挡"]) assert.ok(dashboard.includes(text));
+  for (const text of ["逐小时天气 · 全球预报", "光学气象窗口", "加载该 AOI 天气", "SAR不受云层遮挡", "forecast.provider"]) assert.ok(dashboard.includes(text));
   assert.match(dashboard, /weatherImagingWindows/);
   assert.match(css, /\.weather-card/);
 });

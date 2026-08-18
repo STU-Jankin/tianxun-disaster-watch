@@ -6,6 +6,7 @@ import {
   qweatherConfiguration,
   type WeatherForecastReady,
 } from "../../../lib/qweather";
+import { buildMetWeatherUrl, metWeatherUserAgent, parseMetWeatherForecast } from "../../../lib/met-weather";
 
 export const dynamic = "force-dynamic";
 
@@ -26,15 +27,10 @@ export async function GET(request: Request) {
   const longitude = Number(input.searchParams.get("longitude"));
   const requestedHours = Number(input.searchParams.get("hours") ?? 72);
   if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
-    return Response.json({ state: "error", provider: "QWeather", message: "天气查询坐标无效" }, { status: 400 });
+    return Response.json({ state: "error", provider: "MET Norway", message: "天气查询坐标无效" }, { status: 400 });
   }
   if (requestedHours !== 24 && requestedHours !== 72) {
-    return Response.json({ state: "error", provider: "QWeather", message: "逐小时预报只支持24或72小时" }, { status: 400 });
-  }
-
-  const configuration = qweatherConfiguration();
-  if (!configuration.ready || !configuration.config) {
-    return Response.json({ state: "needs_config", provider: "QWeather", message: configuration.message }, { headers: { "Cache-Control": "private, max-age=60" } });
+    return Response.json({ state: "error", provider: "MET Norway", message: "逐小时预报只支持24或72小时" }, { status: 400 });
   }
 
   const hours = requestedHours as 24 | 72;
@@ -42,34 +38,77 @@ export async function GET(request: Request) {
   const cache = weatherState.__tianxunWeatherCache ??= new Map();
   const cached = cache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return weatherResponse(cached.value, "hit");
-  if (!reserveDailyLocation(cacheKey)) {
-    return Response.json({ state: "error", provider: "QWeather", message: "今日新天气点位已达到免费额度保护上限，请明日重试或提高受控限额" }, { status: 429 });
+  const failures: string[] = [];
+  const configuration = qweatherConfiguration();
+  if (configuration.ready && configuration.config) {
+    if (reserveDailyLocation(cacheKey)) {
+      try {
+        const forecast = await fetchQWeather(configuration.config, latitude, longitude, hours);
+        rememberForecast(cache, cacheKey, forecast);
+        return weatherResponse(forecast, "miss");
+      } catch (error) {
+        failures.push(weatherError("QWeather", error));
+      }
+    } else {
+      failures.push("QWeather 今日新点位额度已满");
+    }
   }
 
   try {
-    const response = await fetch(buildQWeatherForecastUrl(configuration.config, latitude, longitude, hours), {
-      headers: {
-        Accept: "application/json",
-        "Accept-Encoding": "gzip",
-        "User-Agent": "Tianxun-Disaster-Watch/0.1",
-        ...await qweatherAuthorizationHeaders(configuration.config),
-      },
-      signal: AbortSignal.timeout(10_000),
-      redirect: "error",
-    });
-    if (!response.ok) throw new Error(`QWeather 返回 HTTP ${response.status}`);
-    const declared = Number(response.headers.get("content-length") ?? 0);
-    if (declared > 2_000_000) throw new Error("QWeather 响应超过安全上限");
-    const text = await response.text();
-    if (new TextEncoder().encode(text).byteLength > 2_000_000) throw new Error("QWeather 响应超过安全上限");
-    const forecast = parseQWeatherForecast(JSON.parse(text), { latitude, longitude });
-    cache.set(cacheKey, { value: forecast, expiresAt: Date.now() + 30 * 60_000 });
-    if (cache.size > 500) for (const [key, value] of cache) if (value.expiresAt <= Date.now()) cache.delete(key);
+    const forecast = await fetchMetWeather(latitude, longitude, hours);
+    rememberForecast(cache, cacheKey, forecast);
     return weatherResponse(forecast, "miss");
   } catch (error) {
-    const message = error instanceof SyntaxError ? "QWeather 返回了无效 JSON" : error instanceof Error ? error.message : "QWeather 请求失败";
-    return Response.json({ state: "error", provider: "QWeather", message }, { status: 502, headers: { "Cache-Control": "no-store" } });
+    failures.push(weatherError("MET Norway", error));
+    return Response.json({ state: "error", provider: "MET Norway", message: failures.join("；").slice(0, 360) }, { status: 502, headers: { "Cache-Control": "no-store" } });
   }
+}
+
+async function fetchQWeather(config: NonNullable<ReturnType<typeof qweatherConfiguration>["config"]>, latitude: number, longitude: number, hours: 24 | 72) {
+  const response = await fetch(buildQWeatherForecastUrl(config, latitude, longitude, hours), {
+    headers: {
+      Accept: "application/json",
+      "Accept-Encoding": "gzip",
+      "User-Agent": "Tianxun-Disaster-Watch/0.1",
+      ...await qweatherAuthorizationHeaders(config),
+    },
+    signal: AbortSignal.timeout(10_000),
+    redirect: "manual",
+  });
+  if (!response.ok) throw new Error(`返回 HTTP ${response.status}`);
+  return parseQWeatherForecast(await limitedJson(response, "QWeather"), { latitude, longitude });
+}
+
+async function fetchMetWeather(latitude: number, longitude: number, hours: 24 | 72) {
+  const response = await fetch(buildMetWeatherUrl(latitude, longitude), {
+    headers: { Accept: "application/json", "Accept-Encoding": "gzip", "User-Agent": metWeatherUserAgent() },
+    signal: AbortSignal.timeout(12_000),
+    redirect: "manual",
+  });
+  if (!response.ok) throw new Error(`返回 HTTP ${response.status}`);
+  return parseMetWeatherForecast(await limitedJson(response, "MET Norway"), { latitude, longitude }, hours);
+}
+
+async function limitedJson(response: Response, provider: string) {
+  const declared = Number(response.headers.get("content-length") ?? 0);
+  if (declared > 2_000_000) throw new Error(`${provider} 响应超过安全上限`);
+  const text = await response.text();
+  if (new TextEncoder().encode(text).byteLength > 2_000_000) throw new Error(`${provider} 响应超过安全上限`);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`${provider} 返回了无效 JSON`);
+  }
+}
+
+function rememberForecast(cache: Map<string, WeatherCacheEntry>, cacheKey: string, forecast: WeatherForecastReady) {
+  cache.set(cacheKey, { value: forecast, expiresAt: Date.now() + 30 * 60_000 });
+  if (cache.size > 500) for (const [key, value] of cache) if (value.expiresAt <= Date.now()) cache.delete(key);
+}
+
+function weatherError(provider: string, error: unknown) {
+  const reason = error instanceof Error ? error.message : "请求失败";
+  return `${provider}：${reason.replace(/[\r\n]+/g, " ").slice(0, 150)}`;
 }
 
 function reserveDailyLocation(cacheKey: string) {

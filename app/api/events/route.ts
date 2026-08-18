@@ -26,6 +26,13 @@ import {
   isCmaSurfaceSource,
   parseCmaSurfacePayload,
 } from "../../../lib/cma-surface";
+import {
+  parseCopernicusActivations,
+  parseEcccAlerts,
+  parseEmscEvents,
+  parseNwsAlerts,
+  type PublicEventCandidate,
+} from "../../../lib/public-event-sources";
 
 export const dynamic = "force-dynamic";
 
@@ -47,6 +54,10 @@ const endpoints = {
   smithsonianVolcanoes: "https://volcano.si.edu/news/WeeklyVolcanoRSS.xml",
   lhasa: "https://gis.earthdata.nasa.gov/gis05/rest/services/Landslides/LHASA_Exposure/MapServer/0/query",
   reliefWeb: "https://api.reliefweb.int/v2/disasters",
+  nwsAlerts: "https://api.weather.gov/alerts/active",
+  emsc: "https://www.seismicportal.eu/fdsnws/event/1/query",
+  ecccAlerts: "https://api.weather.gc.ca/collections/weather-alerts/items?f=json&limit=500&filter=properties.status_en%3C%3E%27ended%27",
+  copernicusRapidMapping: "https://rapidmapping.emergency.copernicus.eu/backend/dashboard-api/public-activations-info/",
 };
 
 type SourceState = "online" | "offline" | "needs_config";
@@ -81,6 +92,7 @@ const cancellationBuffer: CancellationReference[] = [];
 let eventsCache: { body: string; status: number; contentType: string; expiresAt: number; etag: string } | null = null;
 let eventsRefresh: Promise<NonNullable<typeof eventsCache>> | null = null;
 let lastSuccessfulFetchAt: string | null = null;
+let copernicusCache: { events: DisasterEvent[]; expiresAt: number } | null = null;
 
 export async function GET(request: Request) {
   const unauthorized = authorizeApiRequest(request);
@@ -158,6 +170,14 @@ async function refreshEvents() {
       fetcher: fetchCmaSurface,
     },
     { name: "USGS", tier: "基础", role: "事件", setupUrl: "https://earthquake.usgs.gov/earthquakes/feed/", fetcher: fetchUsgs },
+    {
+      name: "EMSC SeismicPortal",
+      tier: "第一优先级",
+      role: "核验",
+      setupUrl: "https://www.seismicportal.eu/fdsn-wsevent.html",
+      successMessage: "在线；M4.5+近实时目录作为地震独立证据，与USGS/CENC按时空阈值聚合",
+      fetcher: fetchEmsc,
+    },
     { name: "EONET", tier: "基础", role: "事件", setupUrl: "https://eonet.gsfc.nasa.gov/", fetcher: fetchEonet },
     { name: "GDACS", tier: "基础", role: "事件", setupUrl: "https://www.gdacs.org/", fetcher: fetchGdacs },
     {
@@ -169,6 +189,22 @@ async function refreshEvents() {
       fetcher: fetchFirms,
     },
     { name: "NOAA NHC", tier: "第一优先级", role: "事件", setupUrl: "https://www.nhc.noaa.gov/productexamples/", fetcher: fetchNhc },
+    {
+      name: "NOAA/NWS Alerts",
+      tier: "第一优先级",
+      role: "预报",
+      setupUrl: "https://www.weather.gov/documentation/services-web-api",
+      successMessage: "在线；仅纳入带官方面几何且可遥感观测的生效告警，告警区下发前需人工复核",
+      fetcher: fetchNwsAlerts,
+    },
+    {
+      name: "ECCC GeoMet Alerts",
+      tier: "第一优先级",
+      role: "预报",
+      setupUrl: "https://eccc-msc.github.io/open-data/msc-data/alerts/readme_alerts-geomet_en/",
+      successMessage: "在线；仅纳入带官方面几何且可遥感观测的加拿大生效告警，告警区不冒充受灾边界",
+      fetcher: fetchEcccAlerts,
+    },
     {
       name: "NOAA NTWC 海啸",
       tier: "第一优先级",
@@ -216,6 +252,14 @@ async function refreshEvents() {
       setupUrl: "https://global-flood.emergency.copernicus.eu/",
       config: { ready: Boolean(process.env.GLOFAS_EVENT_FEED_URL), message: "需要配置业务侧 GLOFAS_EVENT_FEED_URL" },
       fetcher: fetchGlofas,
+    },
+    {
+      name: "Copernicus EMS Rapid Mapping",
+      tier: "第二优先级",
+      role: "核验",
+      setupUrl: "https://mapping.emergency.copernicus.eu/about/how-to-harvest-cems-mapping-data/emergency-response-data/",
+      successMessage: "在线；官方AOI用于成像与制图任务核验，不把AOI边界冒充最终受灾范围",
+      fetcher: fetchCopernicusRapidMapping,
     },
     { name: "USGS HANS", tier: "第二优先级", role: "事件", setupUrl: "https://volcanoes.usgs.gov/hans-public/", fetcher: fetchUsgsVolcanoes },
     {
@@ -360,15 +404,17 @@ function isTransientConnectorError(error: unknown) {
   return /abort|timeout|timed out|fetch failed|econnreset|econnrefused|enotfound|eai_again|HTTP (?:408|425|429|5\d\d)|\b(?:408|425|429|5\d\d)\b/i.test(message);
 }
 
-async function fetchJson(url: string) {
+const officialUserAgent = "Tianxun-Disaster-Watch/0.1 github.com/STU-Jankin/tianxun-disaster-watch";
+
+async function fetchJson(url: string, options: { maximumBytes?: number; timeoutMs?: number; headers?: Record<string, string> } = {}) {
   const safeUrl = validateExternalFeedUrl(url);
   const response = await fetch(safeUrl, {
-    headers: { "User-Agent": "Tianxun-Disaster-Watch/0.1" },
-    signal: AbortSignal.timeout(8_000),
+    headers: { Accept: "application/json,application/geo+json", "User-Agent": officialUserAgent, ...options.headers },
+    signal: AbortSignal.timeout(options.timeoutMs ?? 8_000),
     redirect: "manual",
   });
   if (!response.ok) throw new Error(`上游返回 HTTP ${response.status}`);
-  return JSON.parse(await readLimitedText(response, 5_000_000, "JSON"));
+  return JSON.parse(await readLimitedText(response, options.maximumBytes ?? 5_000_000, "JSON"));
 }
 
 async function fetchText(url: string) {
@@ -689,6 +735,79 @@ async function fetchUsgs(): Promise<DisasterEvent[]> {
       description: p.tsunami ? "存在海啸标记，建议同步检查沿岸观测需求。" : "适合触发震后形变、滑坡与建成区损毁观测。",
     });
   });
+}
+
+async function fetchEmsc(): Promise<DisasterEvent[]> {
+  const start = new Date(Date.now() - 48 * 3_600_000).toISOString();
+  const params = new URLSearchParams({ format: "json", starttime: start, minmag: "4.5", orderby: "time", limit: "100" });
+  return parseEmscEvents(await fetchJson(`${endpoints.emsc}?${params}`, { maximumBytes: 4_000_000, timeoutMs: 10_000 }))
+    .map((candidate) => publicCandidateEvent(candidate, "EMSC SeismicPortal", "emsc"));
+}
+
+async function fetchNwsAlerts(): Promise<DisasterEvent[]> {
+  const payload = await fetchJson(endpoints.nwsAlerts, {
+    maximumBytes: 15_000_000,
+    timeoutMs: 12_000,
+    headers: { Accept: "application/geo+json" },
+  });
+  return parseNwsAlerts(payload).map((candidate) => publicCandidateEvent(candidate, "NOAA/NWS Alerts", "nws"));
+}
+
+async function fetchEcccAlerts(): Promise<DisasterEvent[]> {
+  const payload = await fetchJson(endpoints.ecccAlerts, { maximumBytes: 15_000_000, timeoutMs: 12_000 });
+  return parseEcccAlerts(payload).map((candidate) => publicCandidateEvent(candidate, "ECCC GeoMet Alerts", "eccc"));
+}
+
+async function fetchCopernicusRapidMapping(): Promise<DisasterEvent[]> {
+  if (copernicusCache && copernicusCache.expiresAt > Date.now()) return copernicusCache.events;
+  const listUrl = new URL(endpoints.copernicusRapidMapping);
+  listUrl.search = new URLSearchParams({ limit: "30", ordering: "-lastUpdate" }).toString();
+  const overview = await fetchJson(listUrl.toString(), { maximumBytes: 3_000_000, timeoutMs: 12_000 }) as { results?: unknown[] };
+  const recent = (Array.isArray(overview.results) ? overview.results : []).filter((item): item is Record<string, unknown> => {
+    if (!item || typeof item !== "object" || Array.isArray(item) || typeof item.code !== "string") return false;
+    const updated = validIso(item.lastUpdate ?? item.activationTime);
+    return !item.closed || Boolean(updated && Date.now() - +new Date(updated) <= 7 * 86_400_000);
+  }).slice(0, 8);
+  const details = await Promise.allSettled(recent.map((item) => {
+    const url = new URL("https://rapidmapping.emergency.copernicus.eu/backend/dashboard-api/public-activations/");
+    url.searchParams.set("code", String(item.code));
+    return fetchJson(url.toString(), { maximumBytes: 12_000_000, timeoutMs: 15_000 });
+  }));
+  const records = details.flatMap((result) => result.status === "fulfilled" && result.value && typeof result.value === "object" && Array.isArray((result.value as { results?: unknown }).results)
+    ? (result.value as { results: unknown[] }).results
+    : []);
+  const candidates = parseCopernicusActivations({ results: records.length ? records : recent });
+  const events = candidates.map((candidate) => publicCandidateEvent(candidate, "Copernicus EMS Rapid Mapping", "copernicus-ems"));
+  copernicusCache = { events, expiresAt: Date.now() + 15 * 60_000 };
+  return events;
+}
+
+function publicCandidateEvent(candidate: PublicEventCandidate, source: string, prefix: string) {
+  const geometry = sanitizeGeometry(candidate.geometry);
+  const center = pointOnGeometry(geometry);
+  if (!center) throw new Error(`${source} 几何中心无效`);
+  const event = baseEvent({
+    id: `${prefix}-${candidate.sourceEventId}`,
+    title: candidate.title,
+    hazard: candidate.hazard,
+    latitude: center[1],
+    longitude: center[0],
+    occurredAt: candidate.occurredAt,
+    updatedAt: candidate.updatedAt,
+    activityAt: candidate.activityAt,
+    source,
+    sourceUrl: candidate.sourceUrl,
+    sourceSeverity: candidate.sourceSeverity,
+    severity: candidate.severity,
+    magnitude: candidate.magnitude,
+    magnitudeUnit: candidate.magnitudeUnit,
+    geometry,
+    country: candidate.country,
+    description: candidate.description,
+  });
+  return candidate.requiresReview
+    ? { ...event, aoiApprovalRequired: true, dispatchEligibility: "review_required" as const }
+    : event;
 }
 
 async function fetchEonet(): Promise<DisasterEvent[]> {
@@ -1307,8 +1426,8 @@ function canonicalizeEvents(events: DisasterEvent[]) {
       cycloneForecast,
       locationQuality: location.locationQuality,
       locationAccuracyKm: location.locationAccuracyKm,
-      aoiApprovalRequired: location.locationQuality !== "precise",
-      dispatchEligibility: location.locationQuality === "precise" ? "ready" as const : "review_required" as const,
+      aoiApprovalRequired: location.aoiApprovalRequired,
+      dispatchEligibility: location.dispatchEligibility,
       occurredAt: new Date(Math.min(...candidates.map((event) => +new Date(event.occurredAt)))).toISOString(),
       updatedAt: new Date(Math.max(...candidates.map((event) => +new Date(event.updatedAt)))).toISOString(),
       activityAt: new Date(Math.max(...candidates.map((event) => +new Date(event.activityAt || event.occurredAt)))).toISOString(),
@@ -1380,8 +1499,9 @@ function inferLocationProfile(source: string, hazard: HazardType, description?: 
   if (isCmaSurfaceSource(source)) return { quality: "precise", accuracyKm: 2 };
   if (/太湖流域管理局|江苏省水利厅/.test(source) || /AOI锚点|代表点/.test(description ?? "")) return { quality: "representative", accuracyKm: 100 };
   if (/FIRMS/.test(source) && /0\.25°网格聚合/.test(description ?? "")) return { quality: "estimated", accuracyKm: 20 };
+  if (/NWS Alerts|ECCC GeoMet/.test(source)) return { quality: "precise", accuracyKm: 1 };
   if (/GDACS|EONET|GloFAS|WMO|Smithsonian|LHASA/.test(source)) return { quality: "estimated", accuracyKm: hazard === "cyclone" ? 25 : hazard === "flood" ? 50 : 20 };
-  if (/中国地震台网|USGS|FIRMS|NOAA|JMA|GeoNet/.test(source)) return { quality: "precise", accuracyKm: hazard === "wildfire" ? 1 : hazard === "cyclone" ? 10 : 5 };
+  if (/中国地震台网|USGS|EMSC|FIRMS|NOAA|JMA|GeoNet|Copernicus EMS Rapid Mapping/.test(source)) return { quality: "precise", accuracyKm: hazard === "wildfire" ? 1 : hazard === "cyclone" ? 10 : 5 };
   return { quality: "unknown", accuracyKm: 100 };
 }
 
@@ -1390,6 +1510,9 @@ function sourceTrust(source: string) {
   if (/中国气象数据网 CMA 预警/.test(source)) return 90;
   if (/中国地震台网/.test(source)) return 92;
   if (/USGS/.test(source)) return 91;
+  if (/EMSC/.test(source)) return 90;
+  if (/ECCC GeoMet/.test(source)) return 90;
+  if (/Copernicus EMS Rapid Mapping/.test(source)) return 88;
   if (/NOAA|JMA|GeoNet/.test(source)) return 90;
   if (/FIRMS/.test(source)) return 89;
   if (/GDACS|EONET|WMO|Smithsonian|LHASA/.test(source)) return 78;
@@ -1406,8 +1529,8 @@ function locationRank(quality: DisasterEvent["locationQuality"]) {
 }
 
 function evidenceRole(source: string): "detection" | "warning" | "verification" {
-  if (/ReliefWeb|Smithsonian/.test(source) || isCmaSurfaceSource(source)) return "verification";
-  if (/WMO|NOAA|JMA|CMA 预警/.test(source)) return "warning";
+  if (/ReliefWeb|Smithsonian|Copernicus EMS|EMSC/.test(source) || isCmaSurfaceSource(source)) return "verification";
+  if (/WMO|NOAA|JMA|ECCC|CMA 预警/.test(source)) return "warning";
   return "detection";
 }
 
