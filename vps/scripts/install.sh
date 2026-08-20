@@ -51,7 +51,7 @@ install -d -o root -g root -m 0755 "$install_root/releases" "$release_dir"
 # Copy an explicit release allow-list. This prevents local .env files, VCS
 # history, editor state, test fixtures and cached databases from ever entering
 # the release directory, even briefly.
-for directory in app db drizzle lib public vps; do
+for directory in .openai app build db drizzle lib public vps worker; do
   [[ -d "$project_dir/$directory" ]] || { echo "Missing release directory: $directory" >&2; exit 1; }
   cp -a "$project_dir/$directory" "$release_dir/"
 done

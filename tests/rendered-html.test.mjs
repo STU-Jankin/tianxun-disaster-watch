@@ -234,6 +234,16 @@ test("keeps the public Nginx trial read-only and leaves internal services unexpo
   assert.doesNotMatch(nginx, /listen\s+(?:127\.0\.0\.1:)?(?:3000|8644)/);
 });
 
+test("includes every Vinext build dependency in the hardened VPS release allow-list", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const installer = await readFile(new URL("../vps/scripts/install.sh", import.meta.url), "utf8");
+  const viteConfig = await readFile(new URL("../vite.config.ts", import.meta.url), "utf8");
+  assert.match(viteConfig, /\.\/\.openai\/hosting\.json/);
+  assert.match(viteConfig, /\.\/build\/sites-vite-plugin\.ts/);
+  assert.match(viteConfig, /main: "\.\/worker\/index\.ts"/);
+  assert.match(installer, /for directory in \.openai app build db drizzle lib public vps worker/);
+});
+
 test("adds on-demand hourly weather to event details and satellite tasks", async () => {
   const { readFile } = await import("node:fs/promises");
   const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
