@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Tianxun satellite TLEs once per day
+
+[Timer]
+OnCalendar=*-*-* 02:35:00 UTC
+RandomizedDelaySec=30min
+Persistent=true
+Unit=tianxun-orbit-refresh.service
+
+[Install]
+WantedBy=timers.target

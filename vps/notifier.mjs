@@ -60,8 +60,8 @@ export function changeNotifications(previous, event, config) {
   if (Number(previous.priority) < config.minPriority && Number(event.priority) >= config.minPriority) {
     changes.push({ type: "priority", label: `优先级升至 ${number(event.priority, 0)}` });
   }
-  if (Number(event.evidenceCount) > Number(previous.evidenceCount) && Number(event.priority) >= config.minPriority - 10) {
-    changes.push({ type: "evidence", label: `新增来源证据，现有 ${number(event.evidenceCount, 0)} 个来源` });
+  if (sourceEvidenceCount(event) > sourceEvidenceCount(previous) && Number(event.priority) >= config.minPriority - 10) {
+    changes.push({ type: "evidence", label: `新增独立来源，现有 ${number(sourceEvidenceCount(event), 0)} 个来源` });
   }
   if (locationRank(event.locationQuality) > locationRank(previous.locationQuality)) {
     changes.push({ type: "location", label: `定位质量提升：${locationLabel(previous.locationQuality)} → ${locationLabel(event.locationQuality)}` });
@@ -113,7 +113,7 @@ export function buildEventMessage(event, changeLabel) {
     `- AOI/目标：${clean(event.geometryType || "Point", 30)} · ${targets}`,
     forecast,
     `- 可选载荷：${sensors}`,
-    `- 证据/来源：${number(event.evidenceCount, 0)} 条来源证据，过程更新 ${number(event.updateCount, 0)} 次 · ${source}`,
+    `- 证据/来源：${number(sourceEvidenceCount(event), 0)} 个独立来源，过程公告 ${number(event.bulletinCount ?? event.updateCount, 0)} 期 · ${source}`,
     `- 事件键：\`${clean(event.entityKey || event.masterEventId || event.id, 180)}\``,
   ].filter(Boolean).join("\n");
 }
@@ -141,8 +141,10 @@ export function defaultConfig(env = process.env) {
 export async function runOnce(config = defaultConfig(), fetchImpl = fetch) {
   const db = openDatabase(config.dbPath);
   const startedAt = new Date().toISOString();
+  let runError = "";
   try {
     const payload = await fetchEvents(config, fetchImpl);
+    let operationalChangeError = "";
     processSourceHealth(db, Array.isArray(payload.sourceStatus) ? payload.sourceStatus : [], config);
     if (!payload.fallback) {
       processEvents(db, Array.isArray(payload.events) ? payload.events : [], payload, config);
@@ -151,24 +153,28 @@ export async function runOnce(config = defaultConfig(), fetchImpl = fetch) {
         processOperationalChanges(db, changePayload.changes, changePayload.cursor);
         setMeta(db, "operational_change_error", "");
       } catch (changeError) {
-        setMeta(db, "operational_change_error", clean(changeError instanceof Error ? changeError.message : changeError, 300));
+        operationalChangeError = clean(changeError instanceof Error ? changeError.message : changeError, 300);
+        runError = `变更流处理失败：${operationalChangeError}`;
+        setMeta(db, "operational_change_error", operationalChangeError);
       }
       setMeta(db, "consecutive_collection_failures", "0");
-      recordRun(db, startedAt, "ok", Array.isArray(payload.events) ? payload.events.length : 0, "");
+      recordRun(db, startedAt, operationalChangeError ? "degraded" : "ok", Array.isArray(payload.events) ? payload.events.length : 0, operationalChangeError);
     } else {
       const message = "全部上游源不可用，API 返回了演示回退数据；未更新事件基线。";
+      runError = message;
       recordCollectionProblem(db, message, config);
       recordRun(db, startedAt, "degraded", 0, message);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    runError = message;
     recordCollectionProblem(db, `采集请求失败：${clean(message, 300)}`, config);
     recordRun(db, startedAt, "failed", 0, message);
   }
 
   const result = await deliverPending(db, config, fetchImpl);
   db.close();
-  return result;
+  return runError && !result.error ? { ...result, error: runError } : result;
 }
 
 function openDatabase(filename) {
@@ -343,7 +349,7 @@ function processEvents(db, events, payload, config) {
         String(event.masterEventId || event.id || key),
         String(event.severity || "blue"),
         Number(event.priority || 0),
-        Number(event.evidenceCount || 0),
+        sourceEvidenceCount(event),
         Number(event.updateCount || 0),
         String(event.locationQuality || "unknown"),
         String(event.dispatchEligibility || "review_required"),
@@ -568,10 +574,17 @@ function eventKey(event) {
   return clean(event.entityKey || event.masterEventId || event.id, 220);
 }
 
+function sourceEvidenceCount(event) {
+  const explicit = Number(event?.independentSourceCount);
+  if (Number.isFinite(explicit)) return explicit;
+  if (Array.isArray(event?.evidence)) return new Set(event.evidence.map((item) => clean(item?.source, 160).split(" · ")[0])).size;
+  return Number(event?.evidenceCount || 0);
+}
+
 function changeVersion(event, type) {
   if (type === "severity") return String(event.severity);
   if (type === "priority") return String(Math.floor(Number(event.priority) / 5) * 5);
-  if (type === "evidence") return String(event.evidenceCount || 0);
+  if (type === "evidence") return String(sourceEvidenceCount(event));
   if (type === "location" || type === "dispatch") return `${event.locationQuality}:${event.dispatchEligibility}`;
   if (type === "track") return `${Number(event.latitude).toFixed(1)}:${Number(event.longitude).toFixed(1)}`;
   if (type === "forecast") return String(event.cycloneForecast?.issuedAt || event.updatedAt);

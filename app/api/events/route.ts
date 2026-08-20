@@ -16,7 +16,7 @@ import { listRetainedCanonicalEvents, persistCanonicalEvents, resolveCanonicalEv
 import { circularGeometryCenter, cycloneSeverityFromKnots, firmsConfidenceScore, firmsHeatSeverity, latestTrackPoint } from "../../../lib/source-normalization";
 import { authorizeApiRequest } from "../../../lib/api-security";
 import { buildHourlyCycloneImpactField, buildJmaCycloneForecast, extractKmlFromKmz, parseNhcConeKml, parseNhcTrackKml, parseNhcWindRadiiKml } from "../../../lib/cyclone-forecast";
-import { eventHasInvalidIdentity, firstValidSourceEventId, isValidSourceEventId } from "../../../lib/event-integrity";
+import { eventHasInvalidIdentity, firstValidSourceEventId, isValidSourceEventId, latestEventVersionsByMasterId } from "../../../lib/event-integrity";
 import { updateIngestionHealth } from "../../../lib/runtime-health";
 import { floodProcessEntityKey, sameFloodRegion } from "../../../lib/process-identity";
 import { selectFirmsEvents } from "../../../lib/event-selection";
@@ -35,6 +35,13 @@ import {
   parseNwsAlerts,
   type PublicEventCandidate,
 } from "../../../lib/public-event-sources";
+import {
+  combinePolygonGeometries,
+  geoJsonBoundaryGeometry,
+  nveWarningBoundaryKeys,
+  parseNveLandslideWarning,
+  parseUsgsGroundFailureDetails,
+} from "../../../lib/landslide-sources";
 
 export const dynamic = "force-dynamic";
 
@@ -43,6 +50,7 @@ const endpoints = {
   taihu: "https://www.tba.gov.cn/",
   jiangsuWater: "https://jswater.jiangsu.gov.cn/",
   usgs: "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.geojson",
+  usgsGroundFailure: "https://earthquake.usgs.gov/fdsnws/event/1/query",
   eonet: "https://eonet.gsfc.nasa.gov/api/v3/events/geojson?status=open&days=30&limit=100",
   gdacs: "https://www.gdacs.org/xml/rss.xml",
   firms: "https://firms.modaps.eosdis.nasa.gov/api/area/csv",
@@ -54,7 +62,9 @@ const endpoints = {
   usgsVolcanoes: "https://volcanoes.usgs.gov/hans-public/api/volcano/getElevatedVolcanoes",
   geonetVolcanoes: "https://api.geonet.org.nz/volcano/val",
   smithsonianVolcanoes: "https://volcano.si.edu/news/WeeklyVolcanoRSS.xml",
-  lhasa: "https://gis.earthdata.nasa.gov/gis05/rest/services/Landslides/LHASA_Exposure/MapServer/0/query",
+  lhasa: "https://gis.earthdata.nasa.gov/gis05/rest/services/Landslides/LHASA_Exposure/FeatureServer/0/query",
+  nveLandslide: "https://api01.nve.no/hydrology/forecast/landslide/v1.0.10/api/Warning/2",
+  nveBoundary: "https://api.kartverket.no/kommuneinfo/v1",
   reliefWeb: "https://api.reliefweb.int/v2/disasters",
   nwsAlerts: "https://api.weather.gov/alerts/active",
   emsc: "https://www.seismicportal.eu/fdsnws/event/1/query",
@@ -95,6 +105,8 @@ let eventsCache: { body: string; status: number; contentType: string; expiresAt:
 let eventsRefresh: Promise<NonNullable<typeof eventsCache>> | null = null;
 let lastSuccessfulFetchAt: string | null = null;
 let copernicusCache: { events: DisasterEvent[]; expiresAt: number } | null = null;
+let usgsGroundFailureCache: { events: DisasterEvent[]; expiresAt: number } | null = null;
+const nveBoundaryCache = new Map<string, { geometry: { type: string; coordinates: unknown }; expiresAt: number }>();
 
 export async function GET(request: Request) {
   const unauthorized = authorizeApiRequest(request);
@@ -173,6 +185,14 @@ async function refreshEvents() {
     },
     { name: "USGS", tier: "基础", role: "事件", setupUrl: "https://earthquake.usgs.gov/earthquakes/feed/", fetcher: fetchUsgs },
     {
+      name: "USGS Ground Failure",
+      tier: "第一优先级",
+      role: "预报",
+      setupUrl: "https://earthquake.usgs.gov/data/ground-failure/",
+      successMessage: "在线；只纳入黄色及以上震生滑坡概率产品，模型覆盖框不冒充已发生滑坡边界，任务必须人工复核",
+      fetcher: fetchUsgsGroundFailure,
+    },
+    {
       name: "EMSC SeismicPortal",
       tier: "第一优先级",
       role: "核验",
@@ -206,6 +226,14 @@ async function refreshEvents() {
       setupUrl: "https://eccc-msc.github.io/open-data/msc-data/alerts/readme_alerts-geomet_en/",
       successMessage: "在线；仅纳入带官方面几何且可遥感观测的加拿大生效告警，告警区不冒充受灾边界",
       fetcher: fetchEcccAlerts,
+    },
+    {
+      name: "NVE Jordskredvarsling",
+      tier: "第一优先级",
+      role: "预报",
+      setupUrl: "https://api.nve.no/doc/jordskredvarsling/",
+      successMessage: "在线；仅纳入2级及以上生效预警，并用 Kartverket 官方市县边界构建预警面，不冒充滑坡影响边界",
+      fetcher: fetchNveLandslideWarnings,
     },
     {
       name: "NOAA NTWC 海啸",
@@ -275,10 +303,10 @@ async function refreshEvents() {
     { name: "Smithsonian GVP", tier: "第二优先级", role: "核验", setupUrl: "https://volcano.si.edu/reports_weekly.cfm", fetcher: fetchSmithsonianVolcanoes },
     {
       name: "NASA LHASA",
-      tier: "第二优先级",
+      tier: "第一优先级",
       role: "预报",
       setupUrl: "https://landslides.nasa.gov/",
-      successMessage: "在线；当前图层为行政区暴露度面，仅作背景，不冒充实时滑坡点",
+      successMessage: "在线；官方风险面未返回产品批次时间，本系统不把读取时间伪装成预报时间，暂只做源健康核验并禁止自动下发",
       fetcher: fetchLhasa,
     },
     {
@@ -294,7 +322,7 @@ async function refreshEvents() {
   const refreshCompletedAt = new Date().toISOString();
   if (runs.some((run) => run.online)) lastSuccessfulFetchAt = refreshCompletedAt;
   const cancellations = cancellationBuffer.splice(0);
-  const collected = runs.flatMap((run) => run.events);
+  const collected = runs.flatMap((run) => run.events).filter(isOperationalEventValid);
   const currentEvents = canonicalizeEvents(collected.filter((event) => !eventHasInvalidIdentity(event)))
     .filter((event) => event.evidence.some((item) => !isCmaSurfaceSource(item.source)))
     .map(finalize);
@@ -315,8 +343,8 @@ async function refreshEvents() {
     producing: run.producing,
     count: currentEvents.filter((event) => event.evidence.some((item) => item.source.startsWith(run.name))).length,
   }));
-  let persistenceAvailable = true;
-  if (!allSourcesUnavailable) persistenceAvailable = await persistCanonicalEvents(normalized);
+  const persistedEvents = allSourcesUnavailable ? normalized : await persistCanonicalEvents(normalized);
+  const persistenceAvailable = persistedEvents !== null;
   if (cancellations.length) {
     const byReason = new Map<string, CancellationReference[]>();
     cancellations.forEach((item) => byReason.set(item.reason, [...(byReason.get(item.reason) ?? []), item]));
@@ -325,12 +353,15 @@ async function refreshEvents() {
   updateIngestionHealth({
     lastAttemptAt: refreshCompletedAt,
     lastSuccessAt: lastSuccessfulFetchAt,
+    configuredSources: runs.filter((run) => run.state !== "needs_config").length,
+    totalSources: runs.length,
     onlineSources: runs.filter((run) => run.online).length,
     producingSources: runs.filter((run) => run.producing).length,
+    eventCapableSources: runs.filter((run) => run.online && run.role !== "核验").length,
     persistenceAvailable,
   });
   const liveEvidence = new Set(currentEvents.flatMap((event) => event.evidence.map((item) => `${sourceFamily(item.source)}|${item.sourceEventId}`)));
-  const operationalEvents = normalized.map((event) => {
+  const operationalEvents = latestEventVersionsByMasterId(persistedEvents ?? normalized).map((event) => {
     const presentInCurrentFeeds = event.evidence.some((item) => liveEvidence.has(`${sourceFamily(item.source)}|${item.sourceEventId}`));
     const finalized = finalize(event);
     return { ...finalized, sourcePresence: presentInCurrentFeeds ? "current" as const : "retained" as const, lifecycleStatus: presentInCurrentFeeds ? finalized.lifecycleStatus : "monitoring" as const };
@@ -523,9 +554,10 @@ function publicSourceUrl(value: string, fallback: string) {
 
 async function fetchCenc(): Promise<DisasterEvent[]> {
   const html = await fetchText(endpoints.cenc);
-  return [...html.matchAll(/<tr[^>]*id=["']earthquake_subao_guid_catalog_tr_[^"']+["'][^>]*>([\s\S]*?)<\/tr>/gi)]
+  return [...html.matchAll(/<tr[^>]*id=["']earthquake_subao_guid_catalog_tr_([^"']+)["'][^>]*>([\s\S]*?)<\/tr>/gi)]
     .flatMap((match) => {
-      const cellHtml = [...match[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map((cell) => cell[1]);
+      const catalogId = firstValidSourceEventId(match[1]);
+      const cellHtml = [...match[2].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map((cell) => cell[1]);
       const cells = cellHtml.map((cell) => stripHtml(decodeXml(cell)));
       const dateIndex = cells.findIndex((cell) => /^\d{4}-\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2}:\d{2}$/.test(cell));
       if (dateIndex < 0 || cells.length < dateIndex + 7) return [];
@@ -540,7 +572,7 @@ async function fetchCenc(): Promise<DisasterEvent[]> {
       if (!occurredAt || !Number.isFinite(latitude) || !Number.isFinite(longitude) || !Number.isFinite(magnitude)) return [];
       if (eventKind && !eventKind.includes("天然地震")) return [];
       return [baseEvent({
-        id: `cenc-${occurredAt}-${latitude.toFixed(3)}-${longitude.toFixed(3)}-m${magnitude.toFixed(1)}`,
+        id: `cenc-${catalogId ?? `${occurredAt}-${latitude.toFixed(3)}-${longitude.toFixed(3)}`}`,
         title: `${location || "未命名地区"} M${magnitude.toFixed(1)} 地震`,
         hazard: "earthquake",
         latitude,
@@ -652,7 +684,7 @@ async function fetchCmaEventFeed(): Promise<DisasterEvent[]> {
   });
   if (!response.ok) throw new Error(`${response.status} CMA`);
   const body = await readLimitedText(response, 5_000_000, "CMA");
-  if (/^\s*</.test(body)) return parseCapFeed(body, "中国气象数据网 CMA", publicSourceUrl(url, "https://data.cma.cn/"));
+  if (/^\s*</.test(body)) return parseCapFeed(body, "中国气象数据网 CMA 预警", publicSourceUrl(url, "https://data.cma.cn/"));
   const data = JSON.parse(body) as { features?: Array<{ id?: string | number; geometry?: { type?: string; coordinates?: unknown }; properties?: Record<string, unknown> }> };
   return (data.features ?? []).flatMap((feature, index) => {
     const properties = feature.properties ?? {};
@@ -757,6 +789,39 @@ async function fetchUsgs(): Promise<DisasterEvent[]> {
   });
 }
 
+async function fetchUsgsGroundFailure(): Promise<DisasterEvent[]> {
+  if (usgsGroundFailureCache && usgsGroundFailureCache.expiresAt > Date.now()) return usgsGroundFailureCache.events;
+  const overviewUrl = new URL(endpoints.usgsGroundFailure);
+  overviewUrl.search = new URLSearchParams({
+    format: "geojson",
+    producttype: "ground-failure",
+    starttime: new Date(Date.now() - 7 * 86_400_000).toISOString(),
+    orderby: "time",
+    limit: "12",
+  }).toString();
+  const overview = await fetchJson(overviewUrl.toString(), { maximumBytes: 3_000_000, timeoutMs: 12_000 }) as { features?: unknown[] };
+  const ids = (Array.isArray(overview.features) ? overview.features : [])
+    .flatMap((feature) => feature && typeof feature === "object" && !Array.isArray(feature) && typeof (feature as { id?: unknown }).id === "string"
+      ? [(feature as { id: string }).id]
+      : [])
+    .filter((id) => isValidSourceEventId(id));
+  if (!ids.length) {
+    usgsGroundFailureCache = { events: [], expiresAt: Date.now() + 10 * 60_000 };
+    return [];
+  }
+  const details = await Promise.allSettled(ids.map((eventId) => {
+    const detailUrl = new URL(endpoints.usgsGroundFailure);
+    detailUrl.search = new URLSearchParams({ eventid: eventId, format: "geojson" }).toString();
+    return fetchJson(detailUrl.toString(), { maximumBytes: 4_000_000, timeoutMs: 12_000 });
+  }));
+  const fulfilled = details.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+  if (!fulfilled.length) throw new Error("USGS Ground Failure 详情均读取失败");
+  const candidates = fulfilled.flatMap((payload) => parseUsgsGroundFailureDetails(payload));
+  const events = candidates.map((candidate) => publicCandidateEvent(candidate, "USGS Ground Failure", "usgs-ground-failure"));
+  usgsGroundFailureCache = { events, expiresAt: Date.now() + 10 * 60_000 };
+  return events;
+}
+
 async function fetchEmsc(): Promise<DisasterEvent[]> {
   const start = new Date(Date.now() - 48 * 3_600_000).toISOString();
   const params = new URLSearchParams({ format: "json", starttime: start, minmag: "4.5", orderby: "time", limit: "100" });
@@ -778,6 +843,44 @@ async function fetchEcccAlerts(): Promise<DisasterEvent[]> {
   return parseEcccAlerts(payload).map((candidate) => publicCandidateEvent(candidate, "ECCC GeoMet Alerts", "eccc"));
 }
 
+async function fetchNveLandslideWarnings(): Promise<DisasterEvent[]> {
+  const payload = await fetchJson(endpoints.nveLandslide, { maximumBytes: 5_000_000, timeoutMs: 12_000 });
+  if (!Array.isArray(payload)) throw new Error("NVE 返回结构异常");
+  const warnings = payload.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    .filter((warning) => Number(warning.ActivityLevel) >= 2)
+    .slice(0, 16);
+  if (!warnings.length) return [];
+  const candidates: PublicEventCandidate[] = [];
+  let boundaryFailures = 0;
+  for (const warning of warnings) {
+    const keys = nveWarningBoundaryKeys(warning);
+    const results = await Promise.allSettled(keys.map(fetchNveBoundary));
+    const geometries = results.flatMap((result) => result.status === "fulfilled" && result.value ? [result.value] : []);
+    boundaryFailures += results.filter((result) => result.status === "rejected").length;
+    const candidate = parseNveLandslideWarning(warning, combinePolygonGeometries(geometries));
+    if (candidate) candidates.push(candidate);
+  }
+  if (!candidates.length && boundaryFailures) throw new Error("NVE 有生效预警，但 Kartverket 官方边界读取失败");
+  return candidates.map((candidate) => publicCandidateEvent(candidate, "NVE Jordskredvarsling", "nve-landslide"));
+}
+
+async function fetchNveBoundary(key: { kind: "kommuner" | "fylker"; id: string }) {
+  const cacheKey = `${key.kind}:${key.id}`;
+  const cached = nveBoundaryCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.geometry;
+  const path = `${key.kind}/${encodeURIComponent(key.id)}/omrade`;
+  let payload: unknown;
+  try {
+    payload = await fetchJson(`${endpoints.nveBoundary}/${path}`, { maximumBytes: 4_000_000, timeoutMs: 15_000, headers: { Accept: "application/geo+json,application/json" } });
+  } catch {
+    payload = await fetchJson(`https://ws.geonorge.no/kommuneinfo/v1/${path}`, { maximumBytes: 4_000_000, timeoutMs: 15_000, headers: { Accept: "application/geo+json,application/json" } });
+  }
+  const geometry = geoJsonBoundaryGeometry(payload);
+  if (!geometry) throw new Error(`Kartverket ${cacheKey} 几何无效`);
+  nveBoundaryCache.set(cacheKey, { geometry, expiresAt: Date.now() + 7 * 86_400_000 });
+  return geometry;
+}
+
 async function fetchCopernicusRapidMapping(): Promise<DisasterEvent[]> {
   if (copernicusCache && copernicusCache.expiresAt > Date.now()) return copernicusCache.events;
   const listUrl = new URL(endpoints.copernicusRapidMapping);
@@ -797,7 +900,17 @@ async function fetchCopernicusRapidMapping(): Promise<DisasterEvent[]> {
     ? (result.value as { results: unknown[] }).results
     : []);
   const candidates = parseCopernicusActivations({ results: records.length ? records : recent });
-  const events = candidates.map((candidate) => publicCandidateEvent(candidate, "Copernicus EMS Rapid Mapping", "copernicus-ems"));
+  // One malformed third-party AOI must not take the whole official connector
+  // offline. Invalid records are rejected individually by the shared topology
+  // gate; valid activations from the same response remain available.
+  const events = candidates.flatMap((candidate) => {
+    try {
+      return [publicCandidateEvent(candidate, "Copernicus EMS Rapid Mapping", "copernicus-ems")];
+    } catch (error) {
+      console.warn(`Copernicus EMS activation skipped (${candidate.sourceEventId})`, error instanceof Error ? error.message : "invalid geometry");
+      return [];
+    }
+  });
   copernicusCache = { events, expiresAt: Date.now() + 15 * 60_000 };
   return events;
 }
@@ -925,7 +1038,7 @@ async function fetchFirms(): Promise<DisasterEvent[]> {
     const latitude = Number(row.latitude);
     const longitude = Number(row.longitude);
     if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
-    const cell = `${Math.round(latitude * 4) / 4},${Math.round(longitude * 4) / 4}`;
+      const cell = `${Math.round(latitude * 10) / 10},${Math.round(longitude * 10) / 10}`;
     cells.set(cell, [...(cells.get(cell) ?? []), row]);
   });
   const events = [...cells.entries()]
@@ -951,12 +1064,12 @@ async function fetchFirms(): Promise<DisasterEvent[]> {
         severity: firmsHeatSeverity(frp),
         magnitude: frp,
         magnitudeUnit: "MW FRP",
-        description: `同一0.25°网格聚合 ${detections.length} 个VIIRS近实时热异常（置信度 ${confidenceCode || "未知"}）；它不是已确认森林火灾，必须结合地表覆盖、常年热源和其他证据复核。`,
+        description: `同一0.1°网格聚合 ${detections.length} 个VIIRS近实时热异常（置信度 ${confidenceCode || "未知"}）；它不是已确认森林火灾，必须结合地表覆盖、常年热源和其他证据复核。`,
       });
       const detectionConfidence = Math.min(event.confidenceScore, confidence);
       return { ...event, confidenceScore: detectionConfidence, confidenceLevel: confidenceLevel(detectionConfidence), observable: "conditional" as const, dispatchEligibility: "review_required" as const, aoiApprovalRequired: true };
     });
-  // A global VIIRS day can contain tens of thousands of 0.25° cells. Keeping
+  // A global VIIRS day can contain tens of thousands of 0.1° cells. Keeping
   // every low-confidence cell makes canonicalization and SQLite persistence
   // monopolize the single web process for minutes. Preserve broad geographic
   // coverage first, then fill the remaining budget with the strongest cells.
@@ -1262,17 +1375,19 @@ async function fetchSmithsonianVolcanoes(): Promise<DisasterEvent[]> {
 
 async function fetchLhasa(): Promise<DisasterEvent[]> {
   const params = new URLSearchParams({
-    where: "1=1",
-    returnCountOnly: "true",
+    where: "h_haz>0",
+    outFields: "objectid",
+    resultRecordCount: "1",
     returnGeometry: "false",
     f: "json",
   });
   const data = await fetchJson(`${endpoints.lhasa}?${params}`) as {
-    count?: number;
+    features?: unknown[];
   };
-  if (!Number.isFinite(Number(data.count))) throw new Error("LHASA 返回结构异常");
-  // 先对官方服务做轻量健康检查。LHASA输出是行政区面风险图，不能用国家/地区质心冒充灾害精确坐标，
-  // 因而保持在线预报源状态，但只在后续接入正式面几何处理链后生成任务事件。
+  if (!Array.isArray(data.features)) throw new Error("LHASA 返回结构异常");
+  // 该公开 FeatureServer 确实提供行政区风险/暴露度面，但没有产品批次时间、编辑时间或 timeInfo。
+  // 读取响应时间不能替代模型发布时间，因此这里只验证高风险面是否可查询，不制造“本轮新预报”。
+  // 当 NASA 提供带批次时间的矢量流后，才能安全进入实时事件及任务链。
   return [];
 }
 
@@ -1377,6 +1492,8 @@ function baseEvent(input: Omit<DisasterEvent, "masterEventId" | "entityKey" | "l
       role: evidenceRole(input.source),
     }],
     evidenceCount: 1,
+    independentSourceCount: 1,
+    bulletinCount: 1,
     updateHistory: [{
       source: input.source,
       sourceUrl: input.sourceUrl,
@@ -1430,7 +1547,10 @@ function finalize(event: DisasterEvent): DisasterEvent {
       sensors: event.recommendedSensors,
     },
   );
-  const priority = calculatePriority(event.severity, scope, event.hazard, event.occurredAt, event.observable, event.confidenceScore, {
+  // 对持续型已观测过程使用上游“实质活动时间”计算时效；预报/预警仍由
+  // calculateTimeScore 内部使用权威发布时间与有效期，缓存读取时间不会续期。
+  const priorityReferenceAt = event.phenomenonStage === "observed" ? event.activityAt : event.occurredAt;
+  const priority = calculatePriority(event.severity, scope, event.hazard, priorityReferenceAt, event.observable, event.confidenceScore, {
     phenomenonStage: event.phenomenonStage ?? "observed",
     issuedAt: event.issuedAt ?? event.updatedAt,
     validFrom: event.validFrom,
@@ -1474,8 +1594,11 @@ function canonicalizeEvents(events: DisasterEvent[]) {
   }
 
   return groups.map((candidates) => {
-    const authoritativeCandidates = candidates.filter((event) => !isCmaSurfaceSource(event.source));
-    const canonicalCandidates = authoritativeCandidates.length ? authoritativeCandidates : candidates;
+    const latestCandidates = [...new Map([...candidates]
+      .sort((a, b) => +new Date(b.updatedAt) - +new Date(a.updatedAt))
+      .map((event) => [`${sourceFamily(event.source)}|${stablePrimaryId(event.id)}`, event])).values()];
+    const authoritativeCandidates = latestCandidates.filter((event) => !isCmaSurfaceSource(event.source));
+    const canonicalCandidates = authoritativeCandidates.length ? authoritativeCandidates : latestCandidates;
     const primary = [...canonicalCandidates].sort((a, b) => eventAuthority(b) - eventAuthority(a) || +new Date(b.updatedAt) - +new Date(a.updatedAt))[0];
     const evidence = [...new Map(candidates.flatMap((event) => event.evidence)
       .sort((a, b) => +new Date(b.observedAt) - +new Date(a.observedAt))
@@ -1486,7 +1609,7 @@ function canonicalizeEvents(events: DisasterEvent[]) {
       sourceSeverity: event.sourceSeverity,
     })))
       .sort((a, b) => +new Date(b.observedAt) - +new Date(a.observedAt))
-      .map((item) => [`${sourceFamily(item.source)}|${item.sourceEventId}`, item])).values()].slice(0, 50);
+      .map((item) => [`${sourceFamily(item.source)}|${item.sourceEventId}|${item.observedAt}|${item.sourceSeverity}`, item])).values()].slice(0, 100);
     const location = [...canonicalCandidates].sort((a, b) => locationRank(b.locationQuality) - locationRank(a.locationQuality) || a.locationAccuracyKm - b.locationAccuracyKm)[0];
     const cycloneForecast = candidates.flatMap((event) => event.cycloneForecast ? [event.cycloneForecast] : [])
       .sort((a, b) => +new Date(b.issuedAt) - +new Date(a.issuedAt) || b.track.length - a.track.length)[0];
@@ -1494,7 +1617,7 @@ function canonicalizeEvents(events: DisasterEvent[]) {
       .filter((item) => sourceTrust(item.source) >= 85 && item.role !== "driver" && item.role !== "context")
       .map((item) => sourceFamily(item.source))).size;
     const confidenceScore = Math.min(99, primary.confidenceScore + Math.min(18, Math.max(0, independentEvidenceCount - 1) * 6));
-    const strongestSeverity = [...canonicalCandidates].sort((a, b) => severityRank(b.severity) - severityRank(a.severity) || +new Date(b.updatedAt) - +new Date(a.updatedAt))[0];
+    const strongestSeverity = [...candidates].sort((a, b) => severityRank(b.severity) - severityRank(a.severity) || +new Date(b.updatedAt) - +new Date(a.updatedAt))[0];
     const temporal = [...canonicalCandidates].sort((a, b) => +new Date(b.issuedAt ?? b.updatedAt) - +new Date(a.issuedAt ?? a.updatedAt))[0];
     const phenomenonStage = [...canonicalCandidates]
       .sort((a, b) => phenomenonStageRank(b.phenomenonStage ?? "observed") - phenomenonStageRank(a.phenomenonStage ?? "observed") || +new Date(b.updatedAt) - +new Date(a.updatedAt))[0]
@@ -1507,8 +1630,13 @@ function canonicalizeEvents(events: DisasterEvent[]) {
       entityKey,
       evidence,
       evidenceCount: evidence.length,
-      severity: strongestSeverity.severity,
-      sourceSeverity: strongestSeverity.sourceSeverity,
+      independentSourceCount: new Set(evidence.map((item) => sourceFamily(item.source))).size,
+      bulletinCount: updateHistory.length,
+      // Current status follows the newest snapshot from the most authoritative
+      // event source; a later context-only catalogue must not overwrite it.
+      severity: primary.severity,
+      sourceSeverity: primary.sourceSeverity,
+      peakSeverity: strongestSeverity.severity,
       updateHistory,
       updateCount: updateHistory.length,
       confidenceScore,
@@ -1560,9 +1688,10 @@ function isSamePhysicalEvent(a: DisasterEvent, b: DisasterEvent) {
   const surfaceObservation = isCmaSurfaceSource(a.source) ? a : isCmaSurfaceSource(b.source) ? b : null;
   const authoritativeEvent = surfaceObservation === a ? b : surfaceObservation === b ? a : null;
   if (surfaceObservation && authoritativeEvent && !isCmaSurfaceSource(authoritativeEvent.source)) {
-    const referenceTimes = [authoritativeEvent.activityAt, authoritativeEvent.updatedAt, authoritativeEvent.occurredAt];
-    const closestHours = Math.min(...referenceTimes.map((value) => Math.abs(+new Date(surfaceObservation.occurredAt) - +new Date(value)) / 3_600_000));
-    return closestHours <= 96 && distanceKm(a.latitude, a.longitude, b.latitude, b.longitude) <= mergePolicy[a.hazard].kilometers;
+    // A nearby station observation is a driver/verification signal, not proof
+    // that it belongs to this disaster. Attach it only after an upstream source
+    // supplies an explicit correlation identity (not available in this feed).
+    return false;
   }
   const entityA = a.entityKey || processEntityKey(a);
   const entityB = b.entityKey || processEntityKey(b);
@@ -1600,9 +1729,9 @@ function distanceKm(latA: number, lonA: number, latB: number, lonB: number) {
 function inferLocationProfile(source: string, hazard: HazardType, description?: string): { quality: DisasterEvent["locationQuality"]; accuracyKm: number } {
   if (isCmaSurfaceSource(source)) return { quality: "precise", accuracyKm: 2 };
   if (/太湖流域管理局|江苏省水利厅/.test(source) || /AOI锚点|代表点/.test(description ?? "")) return { quality: "representative", accuracyKm: 100 };
-  if (/FIRMS/.test(source) && /0\.25°网格聚合/.test(description ?? "")) return { quality: "estimated", accuracyKm: 20 };
-  if (/NWS Alerts|ECCC GeoMet/.test(source)) return { quality: "precise", accuracyKm: 1 };
-  if (/GDACS|EONET|GloFAS|WMO|Smithsonian|LHASA/.test(source)) return { quality: "estimated", accuracyKm: hazard === "cyclone" ? 25 : hazard === "flood" ? 50 : 20 };
+  if (/FIRMS/.test(source) && /0\.1°网格聚合/.test(description ?? "")) return { quality: "estimated", accuracyKm: 8 };
+  if (/NWS Alerts|ECCC GeoMet|NVE Jordskredvarsling/.test(source)) return { quality: "precise", accuracyKm: 1 };
+  if (/USGS Ground Failure|GDACS|EONET|GloFAS|WMO|Smithsonian|LHASA/.test(source)) return { quality: "estimated", accuracyKm: hazard === "cyclone" ? 25 : hazard === "flood" ? 50 : 20 };
   if (/中国地震台网|USGS|EMSC|FIRMS|NOAA|JMA|GeoNet|Copernicus EMS Rapid Mapping/.test(source)) return { quality: "precise", accuracyKm: hazard === "wildfire" ? 1 : hazard === "cyclone" ? 10 : 5 };
   return { quality: "unknown", accuracyKm: 100 };
 }
@@ -1613,6 +1742,7 @@ function sourceTrust(source: string) {
   if (/中国地震台网/.test(source)) return 92;
   if (/USGS/.test(source)) return 91;
   if (/EMSC/.test(source)) return 90;
+  if (/NVE Jordskredvarsling/.test(source)) return 90;
   if (/ECCC GeoMet/.test(source)) return 90;
   if (/Copernicus EMS Rapid Mapping/.test(source)) return 88;
   if (/NOAA|JMA|GeoNet/.test(source)) return 90;
@@ -1634,7 +1764,7 @@ function evidenceRole(source: string): "detection" | "warning" | "verification" 
   if (isCmaSurfaceSource(source)) return "driver";
   if (/ReliefWeb|Smithsonian|Copernicus EMS|LHASA/.test(source)) return "context";
   if (/EMSC|GeoNet/.test(source)) return "verification";
-  if (/WMO|NOAA|JMA|ECCC|CMA 预警/.test(source)) return "warning";
+  if (/USGS Ground Failure|NVE Jordskredvarsling|WMO|NOAA|JMA|ECCC|CMA 预警/.test(source)) return "warning";
   return "detection";
 }
 
@@ -1864,6 +1994,24 @@ function validIso(value: unknown) {
   if (value === undefined || value === null || value === "") return null;
   const date = new Date(typeof value === "number" && value < 10_000_000_000 ? value * 1000 : value as string | number);
   return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+function isOperationalEventValid(event: DisasterEvent) {
+  const dates = [event.occurredAt, event.updatedAt, event.activityAt, event.issuedAt];
+  if (!event || !Object.hasOwn(hazardMeta, event.hazard) || !["red", "orange", "yellow", "blue"].includes(event.severity)) return false;
+  if (!event.title?.trim() || event.title.length > 500 || !event.source?.trim() || event.source.length > 240) return false;
+  if (!validCoordinates(event.latitude, event.longitude) || dates.some((value) => !Number.isFinite(Date.parse(value)))) return false;
+  if (Date.parse(event.updatedAt) < Date.parse(event.occurredAt) - 366 * 86_400_000) return false;
+  if (event.validFrom && !Number.isFinite(Date.parse(event.validFrom))) return false;
+  if (event.validTo && (!Number.isFinite(Date.parse(event.validTo)) || (event.validFrom && Date.parse(event.validTo) <= Date.parse(event.validFrom)))) return false;
+  if (!validateGeoGeometry(event.geometry, {
+    maximumVertices: 10_000,
+    maximumRingVertices: 2_000,
+    maximumAreaKm2: 100_000_000,
+    rejectUnsplitAntimeridian: event.geometry.type !== "LineString",
+    allowOverlappingMultiPolygon: event.hazard === "cyclone",
+  }).ok) return false;
+  return !eventHasInvalidIdentity(event);
 }
 
 function chinaLocalIso(value: string) {

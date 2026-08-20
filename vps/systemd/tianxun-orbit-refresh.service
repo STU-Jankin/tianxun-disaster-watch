@@ -1,0 +1,31 @@
+[Unit]
+Description=Refresh Tianxun tracked satellite TLE cache
+After=network-online.target tianxun-engine.service
+Wants=network-online.target tianxun-engine.service
+
+[Service]
+Type=oneshot
+User=tianxun-engine
+Group=tianxun-engine
+WorkingDirectory=/opt/tianxun/current
+EnvironmentFile=/etc/tianxun/engine.env
+ExecStart=/usr/bin/node /opt/tianxun/current/vps/refresh-orbits.mjs
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+MemoryMax=128M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

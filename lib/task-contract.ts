@@ -1,7 +1,8 @@
 import { validateGeoGeometry } from "./geo-geometry.ts";
 
-export const taskStatuses = ["candidate", "reviewed", "scheduled", "submitted", "acquired", "completed", "failed", "cancelled"] as const;
+export const taskStatuses = ["candidate", "reviewed", "scheduled", "submitted", "cancellation_requested", "cancel_acknowledged", "cancel_rejected", "acquired", "completed", "failed", "cancelled"] as const;
 export type TaskStatus = (typeof taskStatuses)[number];
+export const operatorEditableTaskStatuses: TaskStatus[] = ["candidate", "reviewed"];
 
 export const aoiTypes = ["source", "point", "circle", "rectangle", "corridor", "polygon", "multi"] as const;
 export const sensorOptions = ["高分辨率光学", "宽幅光学", "多光谱", "高光谱", "SAR", "热红外", "微波辐射计", "激光雷达"] as const;
@@ -10,7 +11,10 @@ const transitions: Record<TaskStatus, TaskStatus[]> = {
   candidate: ["reviewed", "cancelled"],
   reviewed: ["candidate", "scheduled", "cancelled"],
   scheduled: ["reviewed", "submitted", "cancelled"],
-  submitted: ["acquired", "failed", "cancelled"],
+  submitted: ["cancellation_requested", "acquired", "failed"],
+  cancellation_requested: ["cancel_acknowledged", "cancel_rejected", "failed"],
+  cancel_acknowledged: [],
+  cancel_rejected: ["submitted", "cancellation_requested", "failed"],
   acquired: ["completed", "failed"],
   completed: [],
   failed: ["reviewed", "cancelled"],
@@ -28,6 +32,9 @@ const allowedTaskFields = new Set([
   "locationQuality", "locationAccuracyKm", "evidenceCount", "aoiApproval", "approvedAt", "approvedBy",
   "approvalReason", "createdAt", "updatedAt", "status", "revision", "eventRevision", "aoiHash",
   "timeIndexedAoi", "forecastAdvisoryId", "forecastIssuedAt", "forecastValidUntil",
+  "satelliteId", "instrumentId", "imagingMode", "opportunityId", "orbitVersion", "visibilityComputedAt",
+  "dispatchId", "dispatchAcceptedAt", "acquisitionId", "acquiredAt", "productIds", "completedAt",
+  "cancellationRequestId", "cancellationRequestedAt", "cancellationAcknowledgedAt", "externalStatusReason",
 ]);
 
 export function unknownTaskFields(task: Record<string, unknown>) {
@@ -55,6 +62,7 @@ export function validateSatelliteTask(task: Record<string, unknown>, options: { 
   else if (end - start > 366 * 86_400_000) errors.push("单个成像窗口不能超过 366 天");
 
   if (!taskStatuses.includes(task.status as TaskStatus)) errors.push("任务状态不在允许范围内");
+  validateExecutionProvenance(task, errors);
   if (!aoiTypes.includes(task.aoiType as (typeof aoiTypes)[number])) errors.push("AOI 类型不在允许范围内");
   if (!Array.isArray(task.sensors) || task.sensors.length > sensorOptions.length) errors.push("载荷字段必须是受限数组");
   else if (task.sensors.some((sensor) => !sensorOptions.includes(sensor as (typeof sensorOptions)[number]))) errors.push("包含未知载荷");
@@ -80,8 +88,8 @@ export function validateSatelliteTask(task: Record<string, unknown>, options: { 
   const revision = Number(task.revision ?? 0);
   if (!Number.isInteger(revision) || revision < 0) errors.push("任务 revision 必须是非负整数");
   if (options.requireProvenance) {
-    if (typeof task.eventRevision !== "string" || !/^[a-f0-9]{16}$/.test(task.eventRevision)) errors.push("缺少有效事件版本指纹");
-    if (typeof task.aoiHash !== "string" || !/^[a-f0-9]{16}$/.test(task.aoiHash)) errors.push("缺少有效 AOI 指纹");
+    if (typeof task.eventRevision !== "string" || !/^[a-f0-9]{64}$/.test(task.eventRevision)) errors.push("缺少有效事件版本指纹");
+    if (typeof task.aoiHash !== "string" || !/^[a-f0-9]{64}$/.test(task.aoiHash)) errors.push("缺少有效 AOI 指纹");
     const forecast = task.cycloneForecast as Record<string, unknown> | undefined;
     if (forecast?.impactField !== undefined && task.aoiType === "source" && (!Array.isArray(task.timeIndexedAoi) || task.timeIndexedAoi.length === 0)) errors.push("台风预测 AOI 任务缺少与成像窗匹配的逐时影响场");
   }
@@ -101,6 +109,11 @@ export function allowedTaskStatuses(from: string): TaskStatus[] {
   return [from as TaskStatus, ...transitions[from as TaskStatus]];
 }
 
+export function allowedOperatorTaskStatuses(from: string): TaskStatus[] {
+  if (!operatorEditableTaskStatuses.includes(from as TaskStatus)) return taskStatuses.includes(from as TaskStatus) ? [from as TaskStatus] : ["candidate"];
+  return [from as TaskStatus, ...transitions[from as TaskStatus].filter((status) => operatorEditableTaskStatuses.includes(status))];
+}
+
 export function safeHttpUrl(value: unknown, fallback = "#") {
   try {
     const url = new URL(String(value));
@@ -112,6 +125,36 @@ export function safeHttpUrl(value: unknown, fallback = "#") {
 
 function isValidApproval(value: unknown) {
   return value === "source_verified" || value === "operator_confirmed";
+}
+
+function validateExecutionProvenance(task: Record<string, unknown>, errors: string[]) {
+  const status = task.status as TaskStatus;
+  const requireText = (field: string, label: string) => {
+    if (typeof task[field] !== "string" || !String(task[field]).trim() || String(task[field]).length > 220) errors.push(`${label}缺失或无效`);
+  };
+  if (["scheduled", "submitted", "cancellation_requested", "cancel_acknowledged", "cancel_rejected", "acquired", "completed"].includes(status)) {
+    for (const [field, label] of [["satelliteId", "卫星ID"], ["instrumentId", "载荷ID"], ["imagingMode", "成像模式"], ["opportunityId", "成像机会ID"], ["orbitVersion", "轨道版本"], ["visibilityComputedAt", "可见性计算时间"]]) requireText(field, label);
+  }
+  if (["submitted", "cancellation_requested", "cancel_acknowledged", "cancel_rejected", "acquired", "completed"].includes(status)) {
+    requireText("dispatchId", "下发回执ID");
+    requireText("dispatchAcceptedAt", "下发确认时间");
+  }
+  if (["cancellation_requested", "cancel_acknowledged", "cancel_rejected"].includes(status)) {
+    requireText("cancellationRequestId", "撤回请求ID");
+    requireText("cancellationRequestedAt", "撤回请求时间");
+  }
+  if (status === "cancel_acknowledged") requireText("cancellationAcknowledgedAt", "撤回确认时间");
+  if (["acquired", "completed"].includes(status)) {
+    requireText("acquisitionId", "成像回执ID");
+    requireText("acquiredAt", "成像回执时间");
+  }
+  if (status === "completed") {
+    if (!Array.isArray(task.productIds) || task.productIds.length === 0 || task.productIds.length > 100 || task.productIds.some((value) => typeof value !== "string" || !value.trim() || value.length > 220)) errors.push("完成状态必须包含有效产品ID");
+    requireText("completedAt", "产品完成时间");
+  }
+  for (const field of ["visibilityComputedAt", "dispatchAcceptedAt", "cancellationRequestedAt", "cancellationAcknowledgedAt", "acquiredAt", "completedAt"]) {
+    if (task[field] !== undefined && !Number.isFinite(Date.parse(String(task[field])))) errors.push(`${field} 必须是有效时间`);
+  }
 }
 
 function boundedNumber(value: unknown, min: number, max: number, label: string, errors: string[], integer = false) {
@@ -156,7 +199,10 @@ function isValidCycloneForecast(value: unknown) {
   if (forecast.official !== true || typeof forecast.source !== "string" || forecast.source.length > 120 || !safeHttpUrl(forecast.sourceUrl, "")) return false;
   if (!Number.isFinite(Date.parse(String(forecast.issuedAt ?? ""))) || !Number.isFinite(Date.parse(String(forecast.forecastValidUntil ?? "")))) return false;
   if (!Array.isArray(forecast.track) || forecast.track.length < 2 || forecast.track.length > 30 || !isGeometry(forecast.trackGeometry)) return false;
-  if (forecast.uncertaintyGeometry !== undefined && !isGeometry(forecast.uncertaintyGeometry)) return false;
+  // Official forecast circles may overlap by design. They are display/evidence
+  // geometry, not an operator-authored AOI, so overlap is acceptable while
+  // every individual polygon must still be topologically valid and bounded.
+  if (forecast.uncertaintyGeometry !== undefined && !isForecastUncertaintyGeometry(forecast.uncertaintyGeometry)) return false;
   if (forecast.impactGeometry !== undefined && !isGeometry(forecast.impactGeometry)) return false;
   if (forecast.impactField !== undefined && !isValidCycloneImpactField(forecast.impactField)) return false;
   if (!["forecast_wind_radii", "current_wind_extent", "uncertainty_only"].includes(String(forecast.impactBasis))) return false;
@@ -196,6 +242,16 @@ function isValidCycloneImpactField(value: unknown) {
         && Boolean(quadrants) && ["northeast", "southeast", "southwest", "northwest"].every((key) => Number.isFinite(Number(quadrants?.[key])) && Number(quadrants?.[key]) >= 0 && Number(quadrants?.[key]) <= 3000);
     });
   });
+}
+
+function isForecastUncertaintyGeometry(value: unknown) {
+  return validateGeoGeometry(value, {
+    maximumVertices: 10_000,
+    maximumRingVertices: 2_000,
+    maximumAreaKm2: 25_000_000,
+    rejectUnsplitAntimeridian: true,
+    allowOverlappingMultiPolygon: true,
+  }).ok;
 }
 
 function isValidTimeIndexedAoi(value: unknown, taskStart: number, taskEnd: number) {

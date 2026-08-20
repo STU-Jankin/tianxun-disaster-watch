@@ -40,6 +40,7 @@ export const satelliteTasks = sqliteTable("satellite_tasks", {
   taskId: text("task_id").primaryKey(),
   eventId: text("event_id").notNull(),
   masterEventId: text("master_event_id").notNull(),
+  owner: text("owner").notNull().default("legacy"),
   title: text("title").notNull(),
   status: text("status").notNull(),
   priority: integer("priority").notNull(),
@@ -60,7 +61,33 @@ export const satelliteTasks = sqliteTable("satellite_tasks", {
 }, (table) => [
   index("satellite_tasks_status_priority_idx").on(table.status, table.priority),
   index("satellite_tasks_event_idx").on(table.masterEventId),
+  index("satellite_tasks_owner_status_idx").on(table.owner, table.status),
 ]);
+
+export const taskCancellationIntents = sqliteTable("task_cancellation_intents", {
+  taskId: text("task_id").primaryKey(),
+  owner: text("owner").notNull().default("legacy"),
+  cancelledAt: text("cancelled_at").notNull(),
+  actor: text("actor").notNull(),
+  reason: text("reason").notNull(),
+}, (table) => [index("task_cancellation_intents_owner_time_idx").on(table.owner, table.cancelledAt)]);
+
+export const taskExportPackages = sqliteTable("task_export_packages", {
+  packageId: text("package_id").primaryKey(),
+  format: text("format").notNull(),
+  taskIdsJson: text("task_ids_json").notNull(),
+  payloadSha256: text("payload_sha256").notNull(),
+  actor: text("actor").notNull(),
+  createdAt: text("created_at").notNull(),
+});
+
+export const satelliteOrbits = sqliteTable("satellite_orbits", {
+  noradId: integer("norad_id").primaryKey(),
+  payloadJson: text("payload_json").notNull().default("{}"),
+  lastAttemptAt: text("last_attempt_at").notNull(),
+  lastSuccessAt: text("last_success_at"),
+  lastError: text("last_error"),
+}, (table) => [index("satellite_orbits_success_idx").on(table.lastSuccessAt)]);
 
 export const taskStatusHistory = sqliteTable("task_status_history", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -70,6 +97,22 @@ export const taskStatusHistory = sqliteTable("task_status_history", {
   note: text("note").notNull().default(""),
   changedAt: text("changed_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 }, (table) => [index("task_status_history_task_idx").on(table.taskId, table.changedAt)]);
+
+export const taskRevisionHistory = sqliteTable("task_revision_history", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  taskId: text("task_id").notNull(),
+  revision: integer("revision").notNull(),
+  owner: text("owner").notNull(),
+  actor: text("actor").notNull(),
+  fromStatus: text("from_status"),
+  toStatus: text("to_status").notNull(),
+  reason: text("reason").notNull(),
+  payloadJson: text("payload_json").notNull(),
+  changedAt: text("changed_at").notNull(),
+}, (table) => [
+  uniqueIndex("task_revision_history_task_revision_uidx").on(table.taskId, table.revision),
+  index("task_revision_history_owner_time_idx").on(table.owner, table.changedAt),
+]);
 
 export const eventTombstones = sqliteTable("event_tombstones", {
   source: text("source").notNull(),

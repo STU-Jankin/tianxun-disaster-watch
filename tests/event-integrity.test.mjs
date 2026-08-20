@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 
@@ -8,6 +9,7 @@ import {
   firstValidSourceEventId,
   geometryEquals,
   isValidSourceEventId,
+  latestEventVersionsByMasterId,
 } from "../lib/event-integrity.ts";
 import { classifyScope } from "../lib/disasters.ts";
 import { floodProcessEntityKey, sameFloodRegion } from "../lib/process-identity.ts";
@@ -35,7 +37,19 @@ test("AOI fingerprints and geometry comparisons are key-order deterministic", ()
   const right = { coordinates: [120.2, 31.5], type: "Point" };
   assert.equal(geometryEquals(left, right), true);
   assert.equal(aoiFingerprint(left), aoiFingerprint(right));
+  assert.equal(aoiFingerprint(left), createHash("sha256").update(JSON.stringify(right)).digest("hex"));
+  assert.equal(aoiFingerprint(left).length, 64);
   assert.notEqual(aoiFingerprint(left), aoiFingerprint({ type: "Point", coordinates: [120.3, 31.5] }));
+});
+
+test("keeps exactly the newest event version for each persisted master id", () => {
+  const version = (id, masterEventId, updatedAt) => ({ id, masterEventId, updatedAt, issuedAt: updatedAt, activityAt: updatedAt, updateCount: 1 });
+  const oldTyphoon = version("jma-old", "ME-jma-TC2621", "2026-08-19T18:45:00Z");
+  const currentTyphoon = version("jma-current", "ME-jma-TC2621", "2026-08-20T00:50:00Z");
+  const earthquake = version("usgs-1", "ME-usgs-1", "2026-08-19T20:00:00Z");
+  const result = latestEventVersionsByMasterId([currentTyphoon, earthquake, oldTyphoon]);
+  assert.equal(result.length, 2);
+  assert.equal(result.find((event) => event.masterEventId === "ME-jma-TC2621")?.id, "jma-current");
 });
 
 test("priority scopes require both coordinates and administrative evidence", () => {

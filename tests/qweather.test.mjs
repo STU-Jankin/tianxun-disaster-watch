@@ -14,7 +14,7 @@ test("QWeather configuration requires a dedicated HTTPS API Host and keeps the A
   assert.equal(configured.ready, true);
   assert.ok(configured.config);
   const url = buildQWeatherForecastUrl(configured.config, 31.491, 120.312, 72);
-  assert.match(url, /^https:\/\/abc123\.def\.qweatherapi\.com\/v7\/grid-weather\/72h\?/);
+  assert.match(url, /^https:\/\/abc123\.def\.qweatherapi\.com\/v7\/weather\/72h\?/);
   assert.match(url, /location=120\.31%2C31\.49/);
   assert.doesNotMatch(url, /synthetic-key/);
   assert.deepEqual(await qweatherAuthorizationHeaders(configured.config), { "X-QW-Api-Key": "synthetic-key" });
@@ -34,6 +34,8 @@ test("QWeather parser preserves provenance and derives conservative optical wind
     refer: { sources: ["QWeather"], license: ["QWeather Developers License"] },
   }, { latitude: 31.49, longitude: 120.31 }, "2026-08-18T00:30:00Z");
   assert.equal(forecast.state, "ready");
+  assert.equal(forecast.product, "weather-hourly");
+  assert.equal(forecast.resolution, "坐标匹配城市/区域");
   assert.equal(forecast.hourly[0].opticalSuitability, "good");
   assert.equal(forecast.hourly[2].opticalSuitability, "poor");
   assert.equal(forecast.sourceUrl, "https://www.qweather.com/weather/wuxi-101190201.html");

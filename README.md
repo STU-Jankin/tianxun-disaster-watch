@@ -6,9 +6,10 @@
 
 ## 当前能力
 
-- 接入 USGS 与 EMSC 地震、NASA EONET、GDACS、NOAA NHC 与 NWS Alerts、加拿大 ECCC GeoMet、日本气象厅 JMA、Copernicus EMS Rapid Mapping、USGS HANS、Smithsonian GVP 与 NASA LHASA。
+- 接入 USGS 与 EMSC 地震、USGS Ground Failure 震生滑坡概率、NVE Jordskredvarsling 官方区域预警、NASA EONET、GDACS、NOAA NHC 与 NWS Alerts、加拿大 ECCC GeoMet、日本气象厅 JMA、Copernicus EMS Rapid Mapping、USGS HANS、Smithsonian GVP 与 NASA LHASA。
+- USGS Ground Failure 仅把黄色及以上模型产品作为“预报”并强制复核；NVE 使用 Kartverket 官方市县 Polygon/MultiPolygon 恢复预警适用区；NASA LHASA 公开暴露度面没有产品批次时间，当前只做源健康核验，不以读取时间伪造实时预报，也不进入自动派发。
 - 第一优先级的 NASA FIRMS、WMO SWIC/CAP、Copernicus GloFAS，以及第二优先级的 OCHA ReliefWeb 已有独立连接器；需要密钥或订阅地址的源会明确显示“待配置”，配置字段见 `.env.example`。
-- 中国气象数据网 CMA 支持两条独立链路：带几何的 CAP/GeoJSON 预警流，以及 `SURF_CHN_MUL_HOR_3H` 地面站核验流。后者按官方目录约滞后2天、每日更新，只把强降水和大风观测并入时空匹配的既有洪水/台风证据链，不单独创建灾害或任务，也不会替换权威事件中心和等级。
+- 中国气象数据网 CMA 支持两条独立链路：带几何的 CAP/GeoJSON 预警流，以及 `SURF_CHN_MUL_HOR_3H` 地面站核验流。后者按官方目录约滞后2天、每日更新，仅作为独立核验数据读取；在没有预警编号、流域或台风编号等确定关联键时，不自动并入灾害、不单独创建任务，也不会替换权威事件中心和等级。
 - 免密钥的 MET Norway Locationforecast 为全球默认逐小时天气底座；配置 QWeather 后优先使用其格点预报，失败或额度耗尽时自动回退。二者均按事件或任务 AOI 查询未来72小时云量、降水、风速和光学气象窗口，采用30分钟服务端缓存，且不改变灾害等级，也不把数值模式结果冒充站点实况或官方预警。
 - 统一地震、火灾、洪水、气旋、火山、滑坡、干旱等事件模型。
 - 将不同来源的同一物理事件按灾种时空阈值合并为主事件，并保留来源证据链、可信度和事件生命周期。
@@ -17,15 +18,16 @@
 - 标记直接可观测、灾后可观测和条件可观测事件。
 - 自动生成观测目标和任务优先级；综合分由严重度、重点范围、遥感适用性、时效和证据可信度共同构成，低可信度事件会被显式扣分。
 - 支持“综合优先”“最新发生”和“最近更新”三种排序，避免持续更新过程与真正新发生事件混为一谈。
-- 按灾种划分黄金观测期、后续观测期和历史库；黄金期结束后进入复核阶段，不再直接撤销。
+- 按灾种和现象阶段划分黄金观测期、后续观测期、强制复核点与历史库；预报/预警以权威有效期为硬上限，实况只允许上游实质活动时间续期，缓存读取时间不能续期。
 - 短时数据源不再报告某事件时，系统会从 D1 延续该主事件并标为“来源暂未复现”，直至观测期届满或权威撤销，避免把 Feed 滚动窗口误当成灾害结束。
 - 支持全球地图、灾种筛选、地区搜索与四级重点范围。
-- 台风事件显示官方中心预报路径，并严格区分路径概率锥/70%预报圆与风圈影响范围：NHC 采用预报风圈，JMA 采用当前强风警戒域；不使用自行外推替代官方报次。
+- 台风事件显示官方逐时中心路径、象限风圈和不确定区组成的 4D 影响场，并严格区分路径概率锥/70%预报圆与风圈影响范围；逐时时间片只在官方节点之间插值，不越过本报次有效期，也不使用自行外推替代官方报次。
 - 事件详情按需反向解析中文地点，同时保留权威来源原文用于核对。
 - 可将事件加入独立卫星任务侧栏；站点部署使用 Cloudflare D1，VPS 后台使用 SQLite，本机缓存仅作离线回退；候选项直接显示灾害发生时间，可编辑成像时间窗，并从完整载荷清单中多选。
-- AOI支持点目标、圆形面、矩形面与线状走廊；有官方台风风圈时默认作为来源 AOI，GeoJSON按类型导出对应几何。
-- 任务 AOI、事件版本和任务版本由服务端绑定并生成指纹；并发修改、事件更新或来源几何变化后必须重新核对，不能拿旧任务静默下发。
-- 可向卫星仿真系统导出带 WGS84 坐标、完整 AOI、来源证据、版本号与约束条件的 JSON、CSV 和 GeoJSON 任务包。
+- AOI 支持点、圆、矩形、走廊、地图手绘 Polygon/MultiPolygon、GeoJSON 上传与最多多块离散目标；自交、世界级范围和超量顶点会在前后端共同拒绝。
+- 任务 AOI、完整事件状态和任务版本由服务端绑定并以 SHA-256 生成指纹；并发修改、权威报次更新、来源几何变化或观测期结束后必须重新核对，不能拿旧任务静默导出。
+- 服务端可生成带包 ID、快照校验和、WGS84 AOI、来源证据、版本号、逐时台风影响切片与约束条件的 JSON、CSV 和 GeoJSON 仿真输入包；该包明确不代表已排程或已下发。
+- 任务按已认证用户隔离；操作员只可维护候选/已复核状态，排程、下发、成像和产品完成状态预留给带机会、轨道和外部回执的执行适配器。每个任务 revision 都保存操作者、状态和不可变审计快照。
 - 提供 `/api/visibility` 正式仿真适配接口；配置 `SATELLITE_VISIBILITY_API_URL` 后转发标准化任务和 AOI，未配置时明确返回“待配置”而不生成虚假窗口。
 - 数据源异常时独立降级，并在全部源不可用时显示演示数据。
 
@@ -40,7 +42,7 @@ npm run dev
 
 访问 `http://localhost:3000`。
 
-运行前将 `.env.example` 复制为 `.env.local`，填入获批的数据源和仿真服务配置。数据库使用 `.openai/hosting.json` 中的 `DB` 绑定；本地开发会自动初始化与 `drizzle/0000_operational_core.sql` 一致的表结构。
+运行前将 `.env.example` 复制为 `.env.local`，填入获批的数据源和仿真服务配置。数据库使用 `.openai/hosting.json` 中的 `DB` 绑定；本地开发会自动初始化并迁移 `drizzle/` 中声明的表结构。
 
 CMA 地面观测默认使用无锡 58354、宜兴 58346、江阴 58351、苏州 58349 四站；仓库内的官方站点索引可校验并支持任意1至30个订购站号。真实账号和密码只能写入未被 Git 跟踪的 `.env.local` 或 VPS `/etc/tianxun/engine.env`。官方文档给出的旧接口会把账号密码放在明文 HTTP 查询串中，因此系统默认拒绝调用；生产环境应优先配置 `CMA_SURFACE_API_URL` 为 HTTPS 凭据转发网关。只有明确接受明文传输风险时，才可将 `CMA_SURFACE_ALLOW_INSECURE_HTTP` 设为 `true`。
 
@@ -58,10 +60,10 @@ npm audit
 
 ## VPS 后台与飞书通知
 
-`vps/scripts/install.sh` 只把采集引擎、SQLite 状态库和 Hermes 通知器部署到回环地址，不开放网页端口。安装后先在 `/etc/tianxun/engine.env` 与 `/etc/tianxun/notifier.env` 写入同一个随机 `TIANXUN_API_TOKEN`，配置 Hermes 与飞书，再手工运行一次 `systemctl start tianxun-notifier.service`。验证成功后才启用五分钟定时器：
+`vps/scripts/install.sh` 把采集引擎、SQLite 状态库、独立两分钟采集器和 Hermes 通知器部署到回环地址；是否开放只读网页由独立 Nginx 配置决定。安装器生成管理、操作员和执行器三种独立令牌。配置 Hermes 与飞书后，再手工运行一次 `systemctl start tianxun-notifier.service`；验证成功后才启用五分钟通知定时器：
 
 ```bash
 systemctl enable --now tianxun-notifier.timer
 ```
 
-安装器会同时启用每日 SQLite 在线备份，默认保留 14 天，位置为 `/var/backups/tianxun`；主机需预装 `sqlite3` 与 `curl`。`vps/scripts/healthcheck.sh` 用于核对引擎、Hermes 与通知定时器状态。
+安装器会同时启用独立灾害采集、每日 TLE 更新和每日 SQLite 在线备份。备份默认保留 14 天并带 SHA-256 校验，位置为 `/var/backups/tianxun`；`vps/scripts/restore.sh` 提供受限路径、停写和完整性校验的恢复流程。`vps/scripts/healthcheck.sh` 核对 readiness、Hermes、各定时器、通知死信和最近备份。

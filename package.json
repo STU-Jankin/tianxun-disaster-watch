@@ -20,6 +20,7 @@
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "react-server-dom-webpack": "19.2.8",
+    "satellite.js": "6.0.1",
     "vinext": "1.0.0-beta.6",
     "vite": "8.2.1"
   },

@@ -8,6 +8,27 @@
       "when": 1786586400000,
       "tag": "0000_operational_core",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1787184000000,
+      "tag": "0001_task_integrity_and_orbits",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1787187600000,
+      "tag": "0002_task_ownership",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1787191200000,
+      "tag": "0003_task_revision_audit",
+      "breakpoints": true
     }
   ]
 }

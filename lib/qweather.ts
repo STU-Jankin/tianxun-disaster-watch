@@ -102,7 +102,11 @@ export async function qweatherAuthorizationHeaders(config: QWeatherConfig, now =
 }
 
 export function buildQWeatherForecastUrl(config: QWeatherConfig, latitude: number, longitude: number, hours: 24 | 72) {
-  const url = new URL(`/v7/grid-weather/${hours}h`, config.origin);
+  // New QWeather credentials can return `deprecated` for the legacy grid
+  // product while the coordinate-based city/region hourly product remains
+  // available. Keep coordinates in the request so arbitrary disaster AOIs
+  // still resolve without a separate GeoAPI lookup.
+  const url = new URL(`/v7/weather/${hours}h`, config.origin);
   url.search = new URLSearchParams({ location: `${longitude.toFixed(2)},${latitude.toFixed(2)}`, lang: "zh", unit: "m" }).toString();
   return url.toString();
 }
@@ -117,7 +121,7 @@ export function parseQWeatherForecast(payload: unknown, coordinates: { latitude:
   return {
     state: "ready",
     provider: "QWeather",
-    product: "grid-weather-hourly",
+    product: "weather-hourly",
     latitude: coordinates.latitude,
     longitude: coordinates.longitude,
     issuedAt: validIso(payload.updateTime) ?? fetchedAt,
@@ -125,10 +129,10 @@ export function parseQWeatherForecast(payload: unknown, coordinates: { latitude:
     sourceUrl: safeQWeatherSource(payload.fxLink),
     attribution: stringArray(refer.sources),
     license: stringArray(refer.license),
-    resolution: "3-5 km",
+    resolution: "坐标匹配城市/区域",
     timeZone: "UTC",
     hourly,
-    note: "3–5 km数值模式格点预报，不等同于站点实况或官方灾害预警；光学适用性仅依据云量和降水进行初筛。",
+    note: "基于查询坐标匹配的城市/区域逐小时预报，不等同于AOI中心点实况、站点观测或官方灾害预警；光学适用性仅依据云量和降水进行初筛。",
   };
 }
 
@@ -240,7 +244,7 @@ function safeQWeatherSource(value: unknown) {
   } catch {
     // Use the public documentation page when the upstream link is absent.
   }
-  return "https://dev.qweather.com/docs/api/weather/grid-weather-hourly-forecast/";
+  return "https://dev.qweather.com/docs/api/weather/weather-hourly-forecast/";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

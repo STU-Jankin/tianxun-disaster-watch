@@ -62,6 +62,22 @@ test("geodesic circles remain valid across the international date line", async (
   assert.ok(ring.some(([longitude]) => longitude < -179));
 });
 
+test("NHC 0..360 cones retain all date-line vertices and omit artificial map seams", async () => {
+  const { parseNhcConeKml } = await forecastTools();
+  const { antimeridianOutlineGeometry } = await import(new URL("../lib/geo-geometry.ts", import.meta.url));
+  const cone = parseNhcConeKml(`<kml><Placemark><Polygon><outerBoundaryIs><LinearRing><coordinates>179,10 189,10 189,20 179,20 179,10</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark></kml>`);
+  assert.equal(cone.type, "MultiPolygon");
+  const points = cone.coordinates.flat(2);
+  assert.ok(points.some(([longitude]) => longitude < -170));
+  assert.ok(points.some(([longitude]) => longitude >= 179));
+  assert.ok(points.every(([longitude, latitude]) => longitude >= -180 && longitude <= 180 && latitude >= -90 && latitude <= 90));
+
+  const outline = antimeridianOutlineGeometry(cone, -171);
+  assert.equal(outline?.type, "MultiLineString");
+  assert.ok(outline.coordinates.flatMap((line) => line).every(([longitude]) => longitude >= -181 && longitude <= -171));
+  assert.ok(outline.coordinates.every((line) => line.every((point, index) => index === 0 || !(Math.abs(Math.abs(point[0]) - 180) < 1e-7 && Math.abs(Math.abs(line[index - 1][0]) - 180) < 1e-7))));
+});
+
 test("task AOI slices are clipped to the imaging window and split at the date line", async () => {
   const { cycloneTaskAoiSlices } = await forecastTools();
   const forecast = {

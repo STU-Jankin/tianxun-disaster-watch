@@ -48,14 +48,18 @@ install -d -o root -g root -m 0755 /var/lib/tianxun
 install -d -o tianxun-engine -g tianxun-engine -m 0750 /var/lib/tianxun/engine
 install -d -o tianxun-notifier -g tianxun-notifier -m 0750 /var/lib/tianxun/notifier
 install -d -o root -g root -m 0755 "$install_root/releases" "$release_dir"
-cp -a "$project_dir/." "$release_dir/"
-# cp -a also copies the source directory mode. Releases are often unpacked in a
-# private mktemp directory (0700), so restore traverse permission for the
-# dedicated service users before switching the current symlink.
+# Copy an explicit release allow-list. This prevents local .env files, VCS
+# history, editor state, test fixtures and cached databases from ever entering
+# the release directory, even briefly.
+for directory in app db drizzle lib public vps; do
+  [[ -d "$project_dir/$directory" ]] || { echo "Missing release directory: $directory" >&2; exit 1; }
+  cp -a "$project_dir/$directory" "$release_dir/"
+done
+for file in package.json package-lock.json tsconfig.json vite.config.ts next.config.ts next-env.d.ts postcss.config.mjs drizzle.config.ts; do
+  [[ -f "$project_dir/$file" ]] || { echo "Missing release file: $file" >&2; exit 1; }
+  cp -a "$project_dir/$file" "$release_dir/"
+done
 chmod 0755 "$release_dir"
-rm -rf "$release_dir/node_modules" "$release_dir/.git" "$release_dir/.next" "$release_dir/.vinext" "$release_dir/.wrangler" "$release_dir/.data"
-find "$release_dir" -maxdepth 1 -type f -name '.env*' ! -name '.env.example' -delete
-rm -f "$release_dir/.dev-output.log" "$release_dir/.dev-error.log"
 
 cd "$release_dir"
 install -d -o tianxun-engine -g tianxun-engine -m 0750 /var/cache/tianxun/npm
@@ -65,6 +69,14 @@ runuser -u tianxun-engine -- env npm_config_cache=/var/cache/tianxun/npm "$npm_b
 chown -R root:root "$release_dir"
 previous_target="$(readlink -f "$install_root/current" 2>/dev/null || true)"
 ln -sfn "$release_dir" "$install_root/current"
+
+rollback_release() {
+  if [[ -n "$previous_target" && "$previous_target" == /opt/tianxun/releases/* ]]; then
+    ln -sfn "$previous_target" "$install_root/current"
+    systemctl restart tianxun-engine.service || true
+    echo "Restored previous release: $previous_target" >&2
+  fi
+}
 
 install -d -o root -g root -m 0755 /etc/tianxun
 if [[ ! -f /etc/tianxun/engine.env ]]; then
@@ -79,6 +91,16 @@ if [[ ! "$engine_token" =~ ^[a-fA-F0-9]{64}$ ]]; then
 fi
 sed -i -E "s|^TIANXUN_API_TOKEN=.*$|TIANXUN_API_TOKEN=$engine_token|" /etc/tianxun/engine.env
 sed -i -E "s|^TIANXUN_API_TOKEN=.*$|TIANXUN_API_TOKEN=$engine_token|" /etc/tianxun/notifier.env
+for role in OPERATOR EXECUTOR; do
+  variable="TIANXUN_${role}_TOKEN"
+  role_token="$(sed -n "s/^${variable}=//p" /etc/tianxun/engine.env | head -n1)"
+  if [[ ! "$role_token" =~ ^[a-fA-F0-9]{64}$ ]]; then role_token="$(openssl rand -hex 32)"; fi
+  if grep -q "^${variable}=" /etc/tianxun/engine.env; then
+    sed -i -E "s|^${variable}=.*$|${variable}=${role_token}|" /etc/tianxun/engine.env
+  else
+    printf '%s=%s\n' "$variable" "$role_token" >> /etc/tianxun/engine.env
+  fi
+done
 chown root:tianxun-engine /etc/tianxun/engine.env
 chmod 0640 /etc/tianxun/engine.env
 chown root:tianxun-notifier /etc/tianxun/notifier.env
@@ -87,14 +109,18 @@ chmod 0640 /etc/tianxun/notifier.env
 install -o root -g root -m 0644 "$release_dir/vps/systemd/tianxun-engine.service" /etc/systemd/system/tianxun-engine.service
 install -o root -g root -m 0644 "$release_dir/vps/systemd/tianxun-notifier.service" /etc/systemd/system/tianxun-notifier.service
 install -o root -g root -m 0644 "$release_dir/vps/systemd/tianxun-notifier.timer" /etc/systemd/system/tianxun-notifier.timer
+install -o root -g root -m 0644 "$release_dir/vps/systemd/tianxun-ingest.service" /etc/systemd/system/tianxun-ingest.service
+install -o root -g root -m 0644 "$release_dir/vps/systemd/tianxun-ingest.timer" /etc/systemd/system/tianxun-ingest.timer
 install -o root -g root -m 0644 "$release_dir/vps/systemd/tianxun-backup.service" /etc/systemd/system/tianxun-backup.service
 install -o root -g root -m 0644 "$release_dir/vps/systemd/tianxun-backup.timer" /etc/systemd/system/tianxun-backup.timer
+install -o root -g root -m 0644 "$release_dir/vps/systemd/tianxun-orbit-refresh.service" /etc/systemd/system/tianxun-orbit-refresh.service
+install -o root -g root -m 0644 "$release_dir/vps/systemd/tianxun-orbit-refresh.timer" /etc/systemd/system/tianxun-orbit-refresh.timer
 
 systemctl daemon-reload
 engine_ready=false
 if systemctl enable tianxun-engine.service && systemctl restart tianxun-engine.service; then
   for _attempt in {1..15}; do
-    if curl --fail --silent --show-error http://127.0.0.1:3000/api/health >/dev/null 2>&1; then
+    if curl --fail --silent --show-error http://127.0.0.1:3000/api/health/live >/dev/null 2>&1; then
       engine_ready=true
       break
     fi
@@ -102,11 +128,18 @@ if systemctl enable tianxun-engine.service && systemctl restart tianxun-engine.s
   done
 fi
 if [[ "$engine_ready" != true ]]; then
-  if [[ -n "$previous_target" && "$previous_target" == /opt/tianxun/releases/* ]]; then
-    ln -sfn "$previous_target" "$install_root/current"
-    systemctl restart tianxun-engine.service || true
-    echo "Engine health check failed; restored previous release: $previous_target" >&2
-  fi
+  rollback_release
+  echo "Engine liveness check failed." >&2
+  exit 1
+fi
+if ! systemctl start tianxun-ingest.service; then
+  rollback_release
+  echo "Initial source ingestion failed; release is not ready." >&2
+  exit 1
+fi
+if ! curl --fail --silent --show-error -H "Authorization: Bearer $engine_token" http://127.0.0.1:3000/api/health >/dev/null; then
+  rollback_release
+  echo "Readiness check failed after initial ingestion." >&2
   exit 1
 fi
 mapfile -t old_releases < <(find "$install_root/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -nr | tail -n +4 | cut -d' ' -f2-)
@@ -117,7 +150,9 @@ for old_release in "${old_releases[@]}"; do
   esac
 done
 systemctl enable tianxun-notifier.timer
+systemctl enable --now tianxun-ingest.timer
 systemctl enable --now tianxun-backup.timer
+systemctl enable --now tianxun-orbit-refresh.timer
 
 echo
 echo "Tianxun backend installed at $release_dir."

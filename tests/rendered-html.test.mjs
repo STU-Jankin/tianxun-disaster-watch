@@ -139,6 +139,48 @@ test("keeps satellite visibility integration explicit when simulation is not con
   assert.doesNotMatch(route, /mock|fake|demo window/i);
 });
 
+test("adds a daily cached CelesTrak orbit catalog without exposing refresh writes publicly", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const route = await readFile(new URL("../app/api/satellites/route.ts", import.meta.url), "utf8");
+  const catalog = await readFile(new URL("../lib/satellite-orbits.ts", import.meta.url), "utf8");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  const nginx = await readFile(new URL("../vps/nginx/tianxun-public-readonly.conf", import.meta.url), "utf8");
+  const timer = await readFile(new URL("../vps/systemd/tianxun-orbit-refresh.timer", import.meta.url), "utf8");
+  for (const id of [51832, 56846, 61231, 64048, 69100, 58918]) assert.ok(catalog.includes(String(id)));
+  assert.match(route, /fetchTrackedSatelliteTles/);
+  assert.match(route, /recordSatelliteOrbitFailure/);
+  assert.match(dashboard, /SAR仿真轨道/);
+  assert.match(dashboard, /显示卫星轨道/);
+  assert.match(dashboard, /TLE\/SGP4 外推/);
+  assert.match(nginx, /location = \/api\/satellites[\s\S]*limit_except GET \{ deny all; \}/);
+  assert.match(timer, /OnCalendar=\*-\*-\* 02:35:00 UTC/);
+  assert.match(timer, /Persistent=true/);
+});
+
+test("syncs a compact task draft and lets the server rebuild canonical 4D products", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  const sync = await readFile(new URL("../lib/task-sync.ts", import.meta.url), "utf8");
+  const route = await readFile(new URL("../app/api/tasks/route.ts", import.meta.url), "utf8");
+  assert.match(dashboard, /compactSatelliteTaskForSync/);
+  assert.doesNotMatch(dashboard, /JSON\.stringify\(\{ \.\.\.task, aoi:/);
+  const draftAllowlist = sync.match(/taskDraftFields\s*=\s*\[([\s\S]*?)\]\s*as const/)?.[1] ?? "";
+  for (const canonical of ["sourceGeometry", "cycloneForecast", "timeIndexedAoi"]) assert.doesNotMatch(draftAllowlist, new RegExp(`"${canonical}"`));
+  assert.match(route, /readJsonObject\(request, 256 \* 1024\)/);
+  assert.match(route, /timeIndexedAoi: cycloneTaskAoiSlices/);
+});
+
+test("returns persisted canonical identities and heals stale local draft references conservatively", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const eventsRoute = await readFile(new URL("../app/api/events/route.ts", import.meta.url), "utf8");
+  const taskRoute = await readFile(new URL("../app/api/tasks/route.ts", import.meta.url), "utf8");
+  const operational = await readFile(new URL("../db/operational.ts", import.meta.url), "utf8");
+  assert.match(eventsRoute, /\(persistedEvents \?\? normalized\)\.map/);
+  assert.match(taskRoute, /entityKey: typeof task\.entityKey/);
+  assert.match(operational, /matches\.length === 1/);
+  assert.match(operational, /candidate\.event\.evidence\.some/);
+});
+
 test("aggregates continuing named hazards into one process with update history", async () => {
   const { readFile } = await import("node:fs/promises");
   const route = await readFile(new URL("../app/api/events/route.ts", import.meta.url), "utf8");
@@ -185,7 +227,7 @@ test("keeps the public Nginx trial read-only and leaves internal services unexpo
   const { readFile } = await import("node:fs/promises");
   const nginx = await readFile(new URL("../vps/nginx/tianxun-public-readonly.conf", import.meta.url), "utf8");
   assert.match(nginx, /listen 80 default_server/);
-  assert.equal(nginx.match(/tianxun-proxy-secret\.conf/g)?.length, 4);
+  assert.equal(nginx.match(/tianxun-proxy-secret\.conf/g)?.length, 5);
   assert.match(nginx, /location = \/api\/weather[\s\S]*limit_req[\s\S]*tianxun-proxy-secret\.conf/);
   assert.match(nginx, /location = \/api\/tasks[\s\S]*public-read-only[\s\S]*return 403/);
   assert.match(nginx, /location ~ \^\/api\/\(changes\|visibility\)[\s\S]*return 403/);

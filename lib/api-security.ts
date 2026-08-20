@@ -5,22 +5,40 @@ function timingSafeEqualText(left: string, right: string) {
   return mismatch === 0;
 }
 
-export function authorizeApiRequest(request: Request) {
+export type ApiRole = "viewer" | "operator" | "executor" | "admin";
+
+export function authorizeApiRequest(request: Request, requiredRole: ApiRole = "viewer") {
   const expectedToken = process.env.TIANXUN_API_TOKEN?.trim();
+  const operatorToken = process.env.TIANXUN_OPERATOR_TOKEN?.trim();
+  const executorToken = process.env.TIANXUN_EXECUTOR_TOKEN?.trim();
   const proxySecret = process.env.TIANXUN_TRUSTED_PROXY_SECRET?.trim();
-  const authorization = request.headers.get("authorization") ?? "";
-  const bearer = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
-  if (isStrongSecret(expectedToken) && bearer && timingSafeEqualText(bearer, expectedToken!)) return null;
-  const suppliedProxySecret = request.headers.get("x-tianxun-proxy-secret") ?? "";
-  if (isStrongSecret(proxySecret) && suppliedProxySecret && timingSafeEqualText(suppliedProxySecret, proxySecret!)) return null;
+  const role = apiRole(request);
+  if (role) {
+    if (roleAllows(role, requiredRole)) return null;
+    return Response.json({ error: `当前身份缺少 ${requiredRole} 权限` }, { status: 403 });
+  }
 
   const url = new URL(request.url);
   const local = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "::1";
-  if (process.env.NODE_ENV !== "production" && !expectedToken && local) return null;
-  if (!isStrongSecret(expectedToken) && !isStrongSecret(proxySecret)) {
+  if (process.env.NODE_ENV !== "production" && !expectedToken && !operatorToken && !executorToken && local) return null;
+  if (![expectedToken, operatorToken, executorToken, proxySecret].some(isStrongSecret)) {
     return Response.json({ error: "服务端鉴权尚未安全配置" }, { status: 503 });
   }
   return Response.json({ error: "未授权访问；请使用站点身份或配置的 API Bearer Token" }, { status: 401 });
+}
+
+export function apiRole(request: Request): ApiRole | null {
+  const bearer = request.headers.get("authorization")?.startsWith("Bearer ") ? request.headers.get("authorization")!.slice(7).trim() : "";
+  if (isStrongSecret(process.env.TIANXUN_API_TOKEN?.trim()) && bearer && timingSafeEqualText(bearer, process.env.TIANXUN_API_TOKEN!.trim())) return "admin";
+  if (isStrongSecret(process.env.TIANXUN_OPERATOR_TOKEN?.trim()) && bearer && timingSafeEqualText(bearer, process.env.TIANXUN_OPERATOR_TOKEN!.trim())) return "operator";
+  if (isStrongSecret(process.env.TIANXUN_EXECUTOR_TOKEN?.trim()) && bearer && timingSafeEqualText(bearer, process.env.TIANXUN_EXECUTOR_TOKEN!.trim())) return "executor";
+  const proxySecret = process.env.TIANXUN_TRUSTED_PROXY_SECRET?.trim();
+  const suppliedProxySecret = request.headers.get("x-tianxun-proxy-secret") ?? "";
+  if (isStrongSecret(proxySecret) && suppliedProxySecret && timingSafeEqualText(suppliedProxySecret, proxySecret)) return normalizeRole(request.headers.get("x-tianxun-role")) ?? "viewer";
+  const url = new URL(request.url);
+  const local = ["localhost", "127.0.0.1", "::1"].includes(url.hostname);
+  if (process.env.NODE_ENV !== "production" && local && ![process.env.TIANXUN_API_TOKEN, process.env.TIANXUN_OPERATOR_TOKEN, process.env.TIANXUN_EXECUTOR_TOKEN].some(isStrongSecret)) return "admin";
+  return null;
 }
 
 export function rejectCrossOriginBrowserWrite(request: Request) {
@@ -41,7 +59,19 @@ export function apiActor(request: Request) {
   if (isStrongSecret(expectedProxySecret) && suppliedProxySecret && timingSafeEqualText(suppliedProxySecret, expectedProxySecret)) {
     return sanitizeActor(request.headers.get("x-tianxun-user")) || "trusted-proxy-user";
   }
-  return request.headers.get("authorization")?.startsWith("Bearer ") ? "api-token" : "local-developer";
+  const bearer = request.headers.get("authorization")?.startsWith("Bearer ") ? request.headers.get("authorization")!.slice(7).trim() : "";
+  if (isStrongSecret(process.env.TIANXUN_OPERATOR_TOKEN?.trim()) && timingSafeEqualText(bearer, process.env.TIANXUN_OPERATOR_TOKEN!.trim())) return "operator-token";
+  if (isStrongSecret(process.env.TIANXUN_EXECUTOR_TOKEN?.trim()) && timingSafeEqualText(bearer, process.env.TIANXUN_EXECUTOR_TOKEN!.trim())) return "executor-token";
+  return bearer ? "admin-token" : "local-developer";
+}
+
+function normalizeRole(value: string | null): ApiRole | null {
+  return ["viewer", "operator", "executor", "admin"].includes(value ?? "") ? value as ApiRole : null;
+}
+
+function roleAllows(actual: ApiRole, required: ApiRole) {
+  if (actual === "admin" || actual === required) return true;
+  return required === "viewer";
 }
 
 export async function readJsonObject(request: Request, maximumBytes = 64 * 1024) {
@@ -82,7 +112,12 @@ function sanitizeActor(value: string | null) {
 }
 
 export class ApiInputError extends Error {
-  constructor(message: string, readonly status: number) { super(message); }
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
 }
 
 const rateState = globalThis as typeof globalThis & { __tianxunRateLimits?: Map<string, { count: number; resetAt: number }> };

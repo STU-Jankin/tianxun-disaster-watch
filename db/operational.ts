@@ -1,6 +1,7 @@
 import type { DisasterEvent } from "../lib/disasters.ts";
+import type { SatelliteOrbitCacheRecord, SatelliteTleRecord } from "../lib/satellite-orbits.ts";
 import { canTransitionTask } from "../lib/task-contract.ts";
-import { eventHasInvalidIdentity, isValidSourceEventId } from "../lib/event-integrity.ts";
+import { compareEventVersionFreshness, eventHasInvalidIdentity, isValidSourceEventId } from "../lib/event-integrity.ts";
 import { evidenceReassignmentSql } from "../lib/operational-sql.ts";
 
 type TaskRecord = Record<string, unknown> & {
@@ -22,6 +23,8 @@ type TaskRecord = Record<string, unknown> & {
   eventRevision?: string;
   aoiHash?: string;
 };
+
+type LifecycleTaskRow = { task_id: string; owner: string; status: string; revision: number; payload_json: string };
 
 let schemaReady: Promise<void> | null = null;
 let databaseReady: Promise<DatabaseLike> | null = null;
@@ -131,20 +134,27 @@ export function ensureOperationalSchema() {
     `CREATE TABLE IF NOT EXISTS event_evidence (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, master_event_id TEXT NOT NULL, source TEXT NOT NULL, source_url TEXT NOT NULL, source_event_id TEXT NOT NULL, observed_at TEXT NOT NULL, role TEXT NOT NULL)`,
     `CREATE UNIQUE INDEX IF NOT EXISTS event_evidence_source_event_uidx ON event_evidence (master_event_id, source, source_event_id)`,
     `CREATE INDEX IF NOT EXISTS event_evidence_master_idx ON event_evidence (master_event_id)`,
-    `CREATE TABLE IF NOT EXISTS satellite_tasks (task_id TEXT PRIMARY KEY NOT NULL, event_id TEXT NOT NULL, master_event_id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, priority INTEGER NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL, aoi_type TEXT NOT NULL, aoi_json TEXT NOT NULL, sensors_json TEXT NOT NULL, imaging_start TEXT NOT NULL, imaging_end TEXT NOT NULL, aoi_approval TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, event_revision TEXT NOT NULL DEFAULT '', aoi_hash TEXT NOT NULL DEFAULT '')`,
+    `CREATE TABLE IF NOT EXISTS satellite_tasks (task_id TEXT PRIMARY KEY NOT NULL, event_id TEXT NOT NULL, master_event_id TEXT NOT NULL, owner TEXT NOT NULL DEFAULT 'legacy', title TEXT NOT NULL, status TEXT NOT NULL, priority INTEGER NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL, aoi_type TEXT NOT NULL, aoi_json TEXT NOT NULL, sensors_json TEXT NOT NULL, imaging_start TEXT NOT NULL, imaging_end TEXT NOT NULL, aoi_approval TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, event_revision TEXT NOT NULL DEFAULT '', aoi_hash TEXT NOT NULL DEFAULT '')`,
     `CREATE INDEX IF NOT EXISTS satellite_tasks_status_priority_idx ON satellite_tasks (status, priority)`,
     `CREATE INDEX IF NOT EXISTS satellite_tasks_event_idx ON satellite_tasks (master_event_id)`,
-    `CREATE TABLE IF NOT EXISTS task_cancellation_intents (task_id TEXT PRIMARY KEY NOT NULL, cancelled_at TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS task_cancellation_intents (task_id TEXT PRIMARY KEY NOT NULL, owner TEXT NOT NULL DEFAULT 'legacy', cancelled_at TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS task_cancellation_intents_time_idx ON task_cancellation_intents (cancelled_at)`,
+    `CREATE TABLE IF NOT EXISTS task_export_packages (package_id TEXT PRIMARY KEY NOT NULL, format TEXT NOT NULL, task_ids_json TEXT NOT NULL, payload_sha256 TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS task_export_packages_created_idx ON task_export_packages (created_at)`,
     `CREATE TABLE IF NOT EXISTS task_status_history (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, task_id TEXT NOT NULL, from_status TEXT, to_status TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)`,
     `CREATE INDEX IF NOT EXISTS task_status_history_task_idx ON task_status_history (task_id, changed_at)`,
     `CREATE TRIGGER IF NOT EXISTS satellite_tasks_history_insert AFTER INSERT ON satellite_tasks BEGIN INSERT INTO task_status_history (task_id, from_status, to_status, note) VALUES (NEW.task_id, NULL, NEW.status, 'task created'); END`,
     `CREATE TRIGGER IF NOT EXISTS satellite_tasks_history_update AFTER UPDATE OF status ON satellite_tasks WHEN OLD.status != NEW.status BEGIN INSERT INTO task_status_history (task_id, from_status, to_status, note) VALUES (NEW.task_id, OLD.status, NEW.status, 'status changed'); END`,
+    `CREATE TABLE IF NOT EXISTS task_revision_history (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, task_id TEXT NOT NULL, revision INTEGER NOT NULL, owner TEXT NOT NULL, actor TEXT NOT NULL, from_status TEXT, to_status TEXT NOT NULL, reason TEXT NOT NULL, payload_json TEXT NOT NULL, changed_at TEXT NOT NULL)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS task_revision_history_task_revision_uidx ON task_revision_history (task_id, revision)`,
+    `CREATE INDEX IF NOT EXISTS task_revision_history_owner_time_idx ON task_revision_history (owner, changed_at)`,
     `CREATE TABLE IF NOT EXISTS event_tombstones (source TEXT NOT NULL, source_event_id TEXT NOT NULL, reason TEXT NOT NULL, resolved_at TEXT NOT NULL, PRIMARY KEY (source, source_event_id))`,
     `CREATE TABLE IF NOT EXISTS event_source_claims (source TEXT NOT NULL, source_event_id TEXT NOT NULL, master_event_id TEXT NOT NULL, hazard TEXT NOT NULL, claimed_at TEXT NOT NULL, PRIMARY KEY (source, source_event_id))`,
     `CREATE TABLE IF NOT EXISTS event_quarantine (master_event_id TEXT PRIMARY KEY NOT NULL, reason TEXT NOT NULL, payload_json TEXT NOT NULL, quarantined_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS operational_changes (id TEXT PRIMARY KEY NOT NULL, change_type TEXT NOT NULL, master_event_id TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS operational_changes_created_idx ON operational_changes (created_at, id)`,
+    `CREATE TABLE IF NOT EXISTS satellite_orbits (norad_id INTEGER PRIMARY KEY NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}', last_attempt_at TEXT NOT NULL, last_success_at TEXT, last_error TEXT)`,
+    `CREATE INDEX IF NOT EXISTS satellite_orbits_success_idx ON satellite_orbits (last_success_at)`,
   ];
   schemaReady = database().then(async (db) => {
     await db.batch(statements.map((statement) => db.prepare(statement)));
@@ -154,7 +164,14 @@ export function ensureOperationalSchema() {
     if (!names.has("revision")) migrations.push(db.prepare(`ALTER TABLE satellite_tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 1`));
     if (!names.has("event_revision")) migrations.push(db.prepare(`ALTER TABLE satellite_tasks ADD COLUMN event_revision TEXT NOT NULL DEFAULT ''`));
     if (!names.has("aoi_hash")) migrations.push(db.prepare(`ALTER TABLE satellite_tasks ADD COLUMN aoi_hash TEXT NOT NULL DEFAULT ''`));
+    if (!names.has("owner")) migrations.push(db.prepare(`ALTER TABLE satellite_tasks ADD COLUMN owner TEXT NOT NULL DEFAULT 'legacy'`));
     if (migrations.length) await db.batch(migrations);
+    const intentColumns = await db.prepare(`PRAGMA table_info(task_cancellation_intents)`).all<{ name: string }>();
+    if (!intentColumns.results.some((column) => column.name === "owner")) await db.prepare(`ALTER TABLE task_cancellation_intents ADD COLUMN owner TEXT NOT NULL DEFAULT 'legacy'`).run();
+    await db.batch([
+      db.prepare(`CREATE INDEX IF NOT EXISTS satellite_tasks_owner_status_idx ON satellite_tasks (owner, status)`),
+      db.prepare(`CREATE INDEX IF NOT EXISTS task_cancellation_intents_owner_time_idx ON task_cancellation_intents (owner, cancelled_at)`),
+    ]);
     await db.prepare(`INSERT OR IGNORE INTO event_source_claims (source, source_event_id, master_event_id, hazard, claimed_at)
       SELECT e.source, e.source_event_id, e.master_event_id, c.hazard, CURRENT_TIMESTAMP
       FROM event_evidence e JOIN canonical_events c ON c.id = e.master_event_id
@@ -169,7 +186,7 @@ export function ensureOperationalSchema() {
   return schemaReady;
 }
 
-export async function persistCanonicalEvents(events: DisasterEvent[]) {
+export async function persistCanonicalEvents(events: DisasterEvent[]): Promise<DisasterEvent[] | null> {
   try {
     await ensureOperationalSchema();
     const db = await database();
@@ -195,27 +212,97 @@ export async function persistCanonicalEvents(events: DisasterEvent[]) {
         return !claim || (claim.hazard === originalEvent.hazard && (claim.master_event_id === masterEventId || existingMasters.has(claim.master_event_id)));
       });
       if (!acceptedEvidence.length) continue;
-      const event = { ...originalEvent, masterEventId, evidence: acceptedEvidence, evidenceCount: acceptedEvidence.length };
+      const event = {
+        ...originalEvent,
+        masterEventId,
+        evidence: acceptedEvidence,
+        evidenceCount: acceptedEvidence.length,
+        independentSourceCount: distinctEvidenceSources(acceptedEvidence),
+        bulletinCount: originalEvent.updateHistory?.length ?? originalEvent.updateCount ?? acceptedEvidence.length,
+      };
       acceptedEvidence.forEach((item) => claims.set(`${item.source}|${item.sourceEventId}`, { source: item.source, source_event_id: item.sourceEventId, master_event_id: masterEventId, hazard: event.hazard }));
       acceptedEvents.push(event);
     }
-    const statements = acceptedEvents.flatMap((event) => [
-      db.prepare(`INSERT INTO canonical_events (id, hazard, title, lifecycle_status, severity, geometry_type, latitude, longitude, location_quality, location_accuracy_km, confidence_score, occurred_at, updated_at, observation_expires_at, payload_json, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET hazard=excluded.hazard, title=excluded.title, lifecycle_status=excluded.lifecycle_status, severity=excluded.severity, geometry_type=excluded.geometry_type, latitude=excluded.latitude, longitude=excluded.longitude, location_quality=excluded.location_quality, location_accuracy_km=excluded.location_accuracy_km, confidence_score=excluded.confidence_score, occurred_at=excluded.occurred_at, updated_at=excluded.updated_at, observation_expires_at=excluded.observation_expires_at, payload_json=excluded.payload_json, synced_at=excluded.synced_at`)
+    const canonicalEvents = collapseCanonicalEventsByMasterId(acceptedEvents);
+    const statements = canonicalEvents.flatMap((event) => [
+      db.prepare(`INSERT INTO canonical_events (id, hazard, title, lifecycle_status, severity, geometry_type, latitude, longitude, location_quality, location_accuracy_km, confidence_score, occurred_at, updated_at, observation_expires_at, payload_json, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET hazard=excluded.hazard, title=excluded.title, lifecycle_status=excluded.lifecycle_status, severity=excluded.severity, geometry_type=excluded.geometry_type, latitude=excluded.latitude, longitude=excluded.longitude, location_quality=excluded.location_quality, location_accuracy_km=excluded.location_accuracy_km, confidence_score=excluded.confidence_score, occurred_at=excluded.occurred_at, updated_at=excluded.updated_at, observation_expires_at=excluded.observation_expires_at, payload_json=excluded.payload_json, synced_at=excluded.synced_at WHERE excluded.updated_at >= canonical_events.updated_at`)
         .bind(event.masterEventId, event.hazard, event.title, event.lifecycleStatus, event.severity, event.geometryType, event.latitude, event.longitude, event.locationQuality, event.locationAccuracyKm, event.confidenceScore, event.occurredAt, event.updatedAt, event.observationExpiresAt, JSON.stringify(event), syncMarker),
       ...event.evidence.map((item) => db.prepare(`INSERT INTO event_evidence (master_event_id, source, source_url, source_event_id, observed_at, role) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(master_event_id, source, source_event_id) DO UPDATE SET source_url=excluded.source_url, observed_at=excluded.observed_at, role=excluded.role`)
         .bind(event.masterEventId, item.source, item.sourceUrl, item.sourceEventId, item.observedAt, item.role)),
       ...event.evidence.map((item) => db.prepare(`INSERT INTO event_source_claims (source, source_event_id, master_event_id, hazard, claimed_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(source, source_event_id) DO NOTHING`)
         .bind(item.source, item.sourceEventId, event.masterEventId, event.hazard, syncMarker)),
     ]);
-    for (let index = 0; index < statements.length; index += 50) await db.batch(statements.slice(index, index + 50));
+    // Publish one ingestion snapshot atomically. A partially committed refresh
+    // is more dangerous than rejecting an oversized run because task/event
+    // provenance depends on canonical rows and evidence changing together.
+    if (statements.length) await db.batch(statements);
     await resolveClaimAliases(db);
     await db.prepare(`UPDATE canonical_events SET lifecycle_status = CASE WHEN observation_expires_at <= ? THEN 'archived' ELSE 'monitoring' END WHERE synced_at < ? AND lifecycle_status IN ('active', 'monitoring')`)
       .bind(syncMarker, syncMarker).run();
-    return true;
+    return await readPersistedCanonicalEvents(db, canonicalEvents);
   } catch (error) {
     console.error("canonical event persistence unavailable", error);
-    return false;
+    return null;
   }
+}
+
+export function collapseCanonicalEventsByMasterId(events: DisasterEvent[]) {
+  const groups = new Map<string, DisasterEvent[]>();
+  for (const event of events) groups.set(event.masterEventId, [...(groups.get(event.masterEventId) ?? []), event]);
+  return [...groups.values()].map((versions) => {
+    const latest = [...versions].sort((left, right) => compareEventVersionFreshness(right, left))[0];
+    const evidence = deduplicateNewest(
+      versions.flatMap((event) => event.evidence ?? []),
+      (item) => `${item.source}|${item.sourceEventId}`,
+      (item) => item.observedAt,
+    );
+    const updateHistory = deduplicateNewest(
+      versions.flatMap((event) => event.updateHistory ?? []),
+      (item) => `${item.source}|${item.sourceEventId}|${item.observedAt}|${item.sourceSeverity}`,
+      (item) => item.observedAt,
+    ).slice(0, 100);
+    const cycloneForecast = versions.flatMap((event) => event.cycloneForecast ? [event.cycloneForecast] : [])
+      .sort((left, right) => Date.parse(right.issuedAt) - Date.parse(left.issuedAt) || right.track.length - left.track.length)[0];
+    return {
+      ...latest,
+      evidence,
+      evidenceCount: evidence.length,
+      independentSourceCount: distinctEvidenceSources(evidence),
+      updateHistory,
+      updateCount: Math.max(updateHistory.length, ...versions.map((event) => event.updateCount ?? 0)),
+      bulletinCount: Math.max(updateHistory.length, ...versions.map((event) => event.bulletinCount ?? 0)),
+      cycloneForecast,
+    };
+  });
+}
+
+async function readPersistedCanonicalEvents(db: DatabaseLike, requested: DisasterEvent[]) {
+  if (!requested.length) return [];
+  const ids = requested.map((event) => event.masterEventId);
+  const fallback = new Map(requested.map((event) => [event.masterEventId, event]));
+  const persisted = new Map<string, DisasterEvent>();
+  // D1 deployments may retain SQLite's conservative host-parameter limit.
+  // Keep this well below that limit instead of letting a normal 250-event
+  // refresh turn a successful write into a false persistence failure.
+  const readBatchSize = 80;
+  for (let offset = 0; offset < ids.length; offset += readBatchSize) {
+    const batch = ids.slice(offset, offset + readBatchSize);
+    const result = await db.prepare(`SELECT id, payload_json FROM canonical_events WHERE id IN (${batch.map(() => "?").join(",")})`)
+      .bind(...batch).all<{ id: string; payload_json: string }>();
+    for (const row of result.results) {
+      try { persisted.set(row.id, JSON.parse(row.payload_json) as DisasterEvent); } catch { /* keep the validated in-memory event */ }
+    }
+  }
+  return ids.flatMap((id) => persisted.get(id) ?? fallback.get(id) ?? []);
+}
+
+function deduplicateNewest<T>(items: T[], key: (item: T) => string, timestamp: (item: T) => string) {
+  const result = new Map<string, T>();
+  for (const item of items) {
+    const existing = result.get(key(item));
+    if (!existing || Date.parse(timestamp(item)) >= Date.parse(timestamp(existing))) result.set(key(item), item);
+  }
+  return [...result.values()].sort((left, right) => Date.parse(timestamp(right)) - Date.parse(timestamp(left)));
 }
 
 async function resolveClaimAliases(db: DatabaseLike) {
@@ -231,8 +318,8 @@ async function resolveClaimAliases(db: DatabaseLike) {
     if (!alias.target_id || alias.target_id === alias.id || Number(alias.evidence_count) === 0 || Number(alias.claimed_count) !== Number(alias.evidence_count) || Number(alias.target_count) !== 1) continue;
     const target = await db.prepare(`SELECT id FROM canonical_events WHERE id = ? AND hazard = ?`).bind(alias.target_id, alias.hazard).first<{ id: string }>();
     if (!target) continue;
-    const taskRows = await db.prepare(`SELECT task_id, status FROM satellite_tasks WHERE master_event_id = ? AND status IN ('candidate','reviewed','scheduled','submitted')`)
-      .bind(alias.id).all<{ task_id: string; status: string }>();
+    const taskRows = await db.prepare(`SELECT task_id, owner, status, revision, payload_json FROM satellite_tasks WHERE master_event_id = ? AND status IN ('candidate','reviewed','scheduled','submitted')`)
+      .bind(alias.id).all<LifecycleTaskRow>();
     const now = new Date().toISOString();
     const reason = `历史别名已收敛到主事件 ${alias.target_id}`;
     let event: unknown = null;
@@ -242,11 +329,7 @@ async function resolveClaimAliases(db: DatabaseLike) {
       db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at) VALUES (?, 'event_merged', ?, ?, ?)`)
         .bind(`event_merged:${alias.id}:${now}`, alias.target_id, JSON.stringify({ fromMasterEventId: alias.id, toMasterEventId: alias.target_id, reason, event }), now),
     ];
-    for (const task of taskRows.results) {
-      statements.push(db.prepare(`UPDATE satellite_tasks SET status='cancelled', updated_at=? WHERE task_id=? AND status=?`).bind(now, task.task_id, task.status));
-      statements.push(db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at) VALUES (?, 'task_cancelled', ?, ?, ?)`)
-        .bind(`task_cancelled:${task.task_id}:${now}`, alias.id, JSON.stringify({ taskId: task.task_id, previousStatus: task.status, reason: `${reason}；旧任务必须重新核对 AOI` }), now));
-    }
+    for (const task of taskRows.results) statements.push(...lifecycleTaskTransitionStatements(db, task, alias.id, now, `${reason}；旧任务必须重新核对 AOI`));
     await db.batch(statements);
   }
 }
@@ -264,8 +347,8 @@ async function reconcileCanonicalMasters(db: DatabaseLike, masterIds: string[], 
   for (const source of candidates.filter((candidate) => candidate.id !== target)) {
     const [canonical, taskRows] = await Promise.all([
       db.prepare(`SELECT payload_json FROM canonical_events WHERE id = ?`).bind(source.id).first<{ payload_json: string }>(),
-      db.prepare(`SELECT task_id, status FROM satellite_tasks WHERE master_event_id = ? AND status IN ('candidate','reviewed','scheduled','submitted')`)
-        .bind(source.id).all<{ task_id: string; status: string }>(),
+      db.prepare(`SELECT task_id, owner, status, revision, payload_json FROM satellite_tasks WHERE master_event_id = ? AND status IN ('candidate','reviewed','scheduled','submitted')`)
+        .bind(source.id).all<LifecycleTaskRow>(),
     ]);
     const now = new Date().toISOString();
     const statements: DatabaseStatement[] = [
@@ -276,20 +359,18 @@ async function reconcileCanonicalMasters(db: DatabaseLike, masterIds: string[], 
       db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at) VALUES (?, 'event_merged', ?, ?, ?)`)
         .bind(`event_merged:${source.id}:${now}`, target, JSON.stringify({ fromMasterEventId: source.id, toMasterEventId: target, reason, event: canonical ? JSON.parse(canonical.payload_json) : null }), now),
     ];
-    for (const task of taskRows.results) {
-      statements.push(db.prepare(`UPDATE satellite_tasks SET status = 'cancelled', updated_at = ? WHERE task_id = ? AND status = ?`).bind(now, task.task_id, task.status));
-      statements.push(db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at) VALUES (?, 'task_cancelled', ?, ?, ?)`)
-        .bind(`task_cancelled:${task.task_id}:${now}`, source.id, JSON.stringify({ taskId: task.task_id, previousStatus: task.status, reason: `${reason}；旧任务必须重新核对 AOI` }), now));
-    }
+    for (const task of taskRows.results) statements.push(...lifecycleTaskTransitionStatements(db, task, source.id, now, `${reason}；旧任务必须重新核对 AOI`));
     await db.batch(statements);
   }
   return target;
 }
 
-export async function listSatelliteTasks() {
+export async function listSatelliteTasks(owner?: string) {
   await ensureOperationalSchema();
   const db = await database();
-  const result = await db.prepare(`SELECT status, revision, event_revision, aoi_hash, updated_at, payload_json FROM satellite_tasks WHERE status != 'cancelled' ORDER BY priority DESC, updated_at DESC LIMIT 500`).all<{ status: string; revision: number; event_revision: string; aoi_hash: string; updated_at: string; payload_json: string }>();
+  const result = owner
+    ? await db.prepare(`SELECT status, revision, event_revision, aoi_hash, updated_at, payload_json FROM satellite_tasks WHERE status != 'cancelled' AND owner=? ORDER BY priority DESC, updated_at DESC LIMIT 500`).bind(owner).all<{ status: string; revision: number; event_revision: string; aoi_hash: string; updated_at: string; payload_json: string }>()
+    : await db.prepare(`SELECT status, revision, event_revision, aoi_hash, updated_at, payload_json FROM satellite_tasks WHERE status != 'cancelled' ORDER BY priority DESC, updated_at DESC LIMIT 500`).all<{ status: string; revision: number; event_revision: string; aoi_hash: string; updated_at: string; payload_json: string }>();
   return result.results.flatMap((row): TaskRecord[] => {
     try {
       const payload = JSON.parse(row.payload_json) as TaskRecord;
@@ -298,11 +379,12 @@ export async function listSatelliteTasks() {
   });
 }
 
-export async function getSatelliteTask(taskId: string) {
+export async function getSatelliteTask(taskId: string, owner?: string) {
   await ensureOperationalSchema();
   const db = await database();
-  const row = await db.prepare(`SELECT status, revision, event_revision, aoi_hash, updated_at, payload_json FROM satellite_tasks WHERE task_id = ? AND status != 'cancelled'`)
-    .bind(taskId).first<{ status: string; revision: number; event_revision: string; aoi_hash: string; updated_at: string; payload_json: string }>();
+  const row = owner
+    ? await db.prepare(`SELECT status, revision, event_revision, aoi_hash, updated_at, payload_json FROM satellite_tasks WHERE task_id = ? AND owner=? AND status != 'cancelled'`).bind(taskId, owner).first<{ status: string; revision: number; event_revision: string; aoi_hash: string; updated_at: string; payload_json: string }>()
+    : await db.prepare(`SELECT status, revision, event_revision, aoi_hash, updated_at, payload_json FROM satellite_tasks WHERE task_id = ? AND status != 'cancelled'`).bind(taskId).first<{ status: string; revision: number; event_revision: string; aoi_hash: string; updated_at: string; payload_json: string }>();
   if (!row) return null;
   try {
     const payload = JSON.parse(row.payload_json) as TaskRecord;
@@ -310,15 +392,35 @@ export async function getSatelliteTask(taskId: string) {
   } catch { return null; }
 }
 
-export async function listSatelliteTaskCancellationIds() {
+export async function listSatelliteTaskCancellationIds(owner?: string) {
   await ensureOperationalSchema();
   const db = await database();
   const result = await db.prepare(`SELECT task_id FROM (
-      SELECT task_id, updated_at AS cancelled_at FROM satellite_tasks WHERE status = 'cancelled'
+      SELECT task_id, owner, updated_at AS cancelled_at FROM satellite_tasks WHERE status = 'cancelled'
       UNION ALL
-      SELECT task_id, cancelled_at FROM task_cancellation_intents
-    ) GROUP BY task_id ORDER BY MAX(cancelled_at) DESC LIMIT 5000`).all<{ task_id: string }>();
+      SELECT task_id, owner, cancelled_at FROM task_cancellation_intents
+    ) WHERE ?='' OR owner=? GROUP BY task_id ORDER BY MAX(cancelled_at) DESC LIMIT 5000`).bind(owner ?? "", owner ?? "").all<{ task_id: string }>();
   return result.results.map((row) => row.task_id);
+}
+
+export async function listTaskRevisionHistory(taskId: string, owner?: string) {
+  await ensureOperationalSchema();
+  const db = await database();
+  const result = await db.prepare(`SELECT task_id, revision, owner, actor, from_status, to_status, reason, payload_json, changed_at
+      FROM task_revision_history WHERE task_id=? AND (?='' OR owner=?) ORDER BY revision ASC LIMIT 500`)
+    .bind(taskId, owner ?? "", owner ?? "")
+    .all<{ task_id: string; revision: number; owner: string; actor: string; from_status: string | null; to_status: string; reason: string; payload_json: string; changed_at: string }>();
+  return result.results.map((row) => ({
+    taskId: row.task_id,
+    revision: row.revision,
+    owner: row.owner,
+    actor: row.actor,
+    fromStatus: row.from_status,
+    toStatus: row.to_status,
+    reason: row.reason,
+    payloadJson: row.payload_json,
+    changedAt: row.changed_at,
+  }));
 }
 
 export async function listRetainedCanonicalEvents() {
@@ -336,19 +438,45 @@ export async function listRetainedCanonicalEvents() {
       if (eventHasInvalidIdentity(event)) return [];
       const evidence = event.evidence.filter((item) => !blocked.has(`${item.source}|${item.sourceEventId}`));
       if (!evidence.length) return [];
-      return [{ ...event, evidence, evidenceCount: evidence.length, lifecycleStatus: row.lifecycle_status }];
+      return [{
+        ...event,
+        evidence,
+        evidenceCount: evidence.length,
+        independentSourceCount: distinctEvidenceSources(evidence),
+        bulletinCount: event.updateHistory?.length ?? event.updateCount ?? evidence.length,
+        lifecycleStatus: row.lifecycle_status,
+      }];
     } catch {
       return [];
     }
   });
 }
 
-export async function getCanonicalEventForTask(masterEventId: string) {
+export async function getCanonicalEventForTask(masterEventId: string, reference?: { eventId?: string; entityKey?: string; hazard?: string }) {
   await ensureOperationalSchema();
   const db = await database();
   const row = await db.prepare(`SELECT lifecycle_status, observation_expires_at, payload_json FROM canonical_events WHERE id = ?`)
     .bind(masterEventId).first<{ lifecycle_status: string; observation_expires_at: string; payload_json: string }>();
-  if (!row) return null;
+  const exact = row ? await taskCanonicalFromRow(db, masterEventId, row) : null;
+  if (exact && !["resolved", "archived"].includes(exact.lifecycleStatus)) return exact;
+
+  const entityKey = reference?.entityKey?.trim();
+  const hazard = reference?.hazard?.trim();
+  if (!entityKey || entityKey.length > 300 || !hazard || hazard.length > 40) return exact;
+  const candidates = await db.prepare(`SELECT id, lifecycle_status, observation_expires_at, payload_json FROM canonical_events WHERE hazard = ? AND lifecycle_status IN ('active','monitoring') AND observation_expires_at > ? ORDER BY updated_at DESC LIMIT 1000`)
+    .bind(hazard, new Date().toISOString()).all<{ id: string; lifecycle_status: string; observation_expires_at: string; payload_json: string }>();
+  const matches = [];
+  for (const candidate of candidates.results) {
+    const parsed = await taskCanonicalFromRow(db, candidate.id, candidate);
+    if (parsed?.event.entityKey === entityKey) matches.push(parsed);
+  }
+  if (matches.length === 1) return matches[0];
+  const eventId = reference?.eventId?.trim();
+  const direct = eventId ? matches.filter((candidate) => candidate.event.id === eventId || candidate.event.evidence.some((item) => item.sourceEventId === eventId)) : [];
+  return direct.length === 1 ? direct[0] : exact;
+}
+
+async function taskCanonicalFromRow(db: DatabaseLike, masterEventId: string, row: { lifecycle_status: string; observation_expires_at: string; payload_json: string }) {
   if (!await hasActiveEvidence(db, masterEventId)) return null;
   try {
     const event = JSON.parse(row.payload_json) as DisasterEvent;
@@ -359,12 +487,13 @@ export async function getCanonicalEventForTask(masterEventId: string) {
   }
 }
 
-export async function upsertSatelliteTask(task: TaskRecord) {
+export async function upsertSatelliteTask(task: TaskRecord, canonicalGuard?: { payloadJson: string }, owner = "legacy", allowAllOwners = false) {
   await ensureOperationalSchema();
   const db = await database();
   const cancellationIntent = await db.prepare(`SELECT task_id FROM task_cancellation_intents WHERE task_id = ?`).bind(task.taskId).first<{ task_id: string }>();
   if (cancellationIntent) throw new Error("任务已取消，不允许重新创建；请新建任务");
-  const existing = await db.prepare(`SELECT status, revision FROM satellite_tasks WHERE task_id = ?`).bind(task.taskId).first<{ status: string; revision: number }>();
+  const existing = await db.prepare(`SELECT status, revision, owner FROM satellite_tasks WHERE task_id = ?`).bind(task.taskId).first<{ status: string; revision: number; owner: string }>();
+  if (existing && !allowAllOwners && existing.owner !== owner) throw new Error("任务不属于当前操作员");
   if (!canTransitionTask(existing?.status ?? null, task.status)) throw new Error(`不允许的任务状态转换：${existing?.status ?? "new"} -> ${task.status}`);
   const suppliedRevision = Number(task.revision ?? 0);
   if (existing && suppliedRevision !== existing.revision) throw new Error(`任务版本冲突：当前为 ${existing.revision}，请求为 ${suppliedRevision}`);
@@ -373,48 +502,138 @@ export async function upsertSatelliteTask(task: TaskRecord) {
   const revision = existing ? existing.revision + 1 : 1;
   const payload = { ...task, revision, updatedAt };
   const aoi = JSON.stringify({ type: task.aoiType, sourceGeometry: task.sourceGeometry, customGeometry: task.customGeometry, radiusKm: task.aoiRadiusKm, widthKm: task.aoiWidthKm, heightKm: task.aoiHeightKm, lengthKm: task.aoiLengthKm, bearingDeg: task.aoiBearingDeg });
+  const canonicalCondition = canonicalGuard
+    ? ` AND EXISTS (SELECT 1 FROM canonical_events c WHERE c.id=? AND c.lifecycle_status IN ('active','monitoring') AND c.observation_expires_at>? AND c.payload_json=? AND EXISTS (SELECT 1 FROM event_evidence e LEFT JOIN event_tombstones t ON t.source=e.source AND t.source_event_id=e.source_event_id WHERE e.master_event_id=c.id AND t.source IS NULL))`
+    : "";
+  const guardValues = canonicalGuard ? [task.masterEventId, updatedAt, canonicalGuard.payloadJson] : [];
   const save = existing
-    ? db.prepare(`UPDATE satellite_tasks SET event_id=?, master_event_id=?, title=?, status=?, priority=?, latitude=?, longitude=?, aoi_type=?, aoi_json=?, sensors_json=?, imaging_start=?, imaging_end=?, aoi_approval=?, payload_json=?, updated_at=?, revision=?, event_revision=?, aoi_hash=? WHERE task_id=? AND status=? AND revision=?`)
-      .bind(task.eventId, task.masterEventId, task.title, task.status, task.priority, task.latitude, task.longitude, task.aoiType, aoi, JSON.stringify(task.sensors ?? []), task.imagingStart, task.imagingEnd, task.aoiApproval, JSON.stringify(payload), updatedAt, revision, task.eventRevision ?? "", task.aoiHash ?? "", task.taskId, existing.status, existing.revision)
-    : db.prepare(`INSERT INTO satellite_tasks (task_id, event_id, master_event_id, title, status, priority, latitude, longitude, aoi_type, aoi_json, sensors_json, imaging_start, imaging_end, aoi_approval, payload_json, created_at, updated_at, revision, event_revision, aoi_hash)
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-        WHERE NOT EXISTS (SELECT 1 FROM task_cancellation_intents WHERE task_id = ?)`)
-      .bind(task.taskId, task.eventId, task.masterEventId, task.title, task.status, task.priority, task.latitude, task.longitude, task.aoiType, aoi, JSON.stringify(task.sensors ?? []), task.imagingStart, task.imagingEnd, task.aoiApproval, JSON.stringify(payload), task.createdAt, updatedAt, revision, task.eventRevision ?? "", task.aoiHash ?? "", task.taskId);
-  const result = await save.run();
-  if (existing && affectedRows(result) === 0) throw new Error("任务已被其他请求更新，请刷新后重试");
-  if (!existing && affectedRows(result) === 0) throw new Error("任务已取消，不允许重新创建；请新建任务");
+    ? db.prepare(`UPDATE satellite_tasks SET event_id=?, master_event_id=?, title=?, status=?, priority=?, latitude=?, longitude=?, aoi_type=?, aoi_json=?, sensors_json=?, imaging_start=?, imaging_end=?, aoi_approval=?, payload_json=?, updated_at=?, revision=?, event_revision=?, aoi_hash=? WHERE task_id=? AND status=? AND revision=?${canonicalCondition}`)
+      .bind(task.eventId, task.masterEventId, task.title, task.status, task.priority, task.latitude, task.longitude, task.aoiType, aoi, JSON.stringify(task.sensors ?? []), task.imagingStart, task.imagingEnd, task.aoiApproval, JSON.stringify(payload), updatedAt, revision, task.eventRevision ?? "", task.aoiHash ?? "", task.taskId, existing.status, existing.revision, ...guardValues)
+    : db.prepare(`INSERT INTO satellite_tasks (task_id, event_id, master_event_id, owner, title, status, priority, latitude, longitude, aoi_type, aoi_json, sensors_json, imaging_start, imaging_end, aoi_approval, payload_json, created_at, updated_at, revision, event_revision, aoi_hash)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE NOT EXISTS (SELECT 1 FROM task_cancellation_intents WHERE task_id = ?)${canonicalCondition}`)
+      .bind(task.taskId, task.eventId, task.masterEventId, owner, task.title, task.status, task.priority, task.latitude, task.longitude, task.aoiType, aoi, JSON.stringify(task.sensors ?? []), task.imagingStart, task.imagingEnd, task.aoiApproval, JSON.stringify(payload), task.createdAt, updatedAt, revision, task.eventRevision ?? "", task.aoiHash ?? "", task.taskId, ...guardValues);
+  const auditReason = existing ? existing.status === task.status ? "operator task edit" : "operator status update" : "operator task create";
+  const audit = db.prepare(`INSERT OR IGNORE INTO task_revision_history (task_id, revision, owner, actor, from_status, to_status, reason, payload_json, changed_at)
+      SELECT task_id, revision, owner, ?, ?, status, ?, payload_json, updated_at FROM satellite_tasks WHERE task_id=? AND revision=?`)
+    .bind(owner, existing?.status ?? null, auditReason, task.taskId, revision);
+  const [result] = await db.batch([save, audit]);
+  if (existing && affectedRows(result) === 0) throw new Error("任务或主事件已被其他请求更新，请刷新后重试");
+  if (!existing && affectedRows(result) === 0) throw new Error("任务已取消，或主事件在保存期间发生变化；请刷新后新建任务");
   return payload;
 }
 
-export async function deleteSatelliteTask(taskId: string, expectedRevision?: number, actor = "api", reason = "操作员取消任务") {
+export type TaskExportSnapshotRow = {
+  taskId: string;
+  status: string;
+  revision: number;
+  eventRevision: string;
+  aoiHash: string;
+  task: Record<string, unknown>;
+  lifecycleStatus: string;
+  observationExpiresAt: string;
+  event: DisasterEvent;
+  activeEvidenceCount: number;
+};
+
+export async function getTaskExportSnapshot(taskIds: string[], owner?: string): Promise<TaskExportSnapshotRow[]> {
+  await ensureOperationalSchema();
+  if (!taskIds.length || taskIds.length > 100) return [];
+  const db = await database();
+  const placeholders = taskIds.map(() => "?").join(",");
+  const rows = await db.prepare(`SELECT t.task_id, t.status, t.revision, t.event_revision, t.aoi_hash,
+      t.payload_json AS task_payload_json, c.lifecycle_status, c.observation_expires_at,
+      c.payload_json AS event_payload_json,
+      (SELECT COUNT(*) FROM event_evidence e LEFT JOIN event_tombstones x ON x.source=e.source AND x.source_event_id=e.source_event_id WHERE e.master_event_id=c.id AND x.source IS NULL) AS active_evidence_count
+    FROM satellite_tasks t JOIN canonical_events c ON c.id=t.master_event_id
+    WHERE t.task_id IN (${placeholders}) AND t.status != 'cancelled' AND (?='' OR t.owner=?)`).bind(...taskIds, owner ?? "", owner ?? "")
+    .all<{ task_id: string; status: string; revision: number; event_revision: string; aoi_hash: string; task_payload_json: string; lifecycle_status: string; observation_expires_at: string; event_payload_json: string; active_evidence_count: number }>();
+  return rows.results.flatMap((row) => {
+    try {
+      return [{
+        taskId: row.task_id,
+        status: row.status,
+        revision: row.revision,
+        eventRevision: row.event_revision,
+        aoiHash: row.aoi_hash,
+        task: JSON.parse(row.task_payload_json) as Record<string, unknown>,
+        lifecycleStatus: row.lifecycle_status,
+        observationExpiresAt: row.observation_expires_at,
+        event: JSON.parse(row.event_payload_json) as DisasterEvent,
+        activeEvidenceCount: Number(row.active_evidence_count),
+      }];
+    } catch {
+      return [];
+    }
+  });
+}
+
+export async function recordTaskExportPackage(record: { packageId: string; format: string; taskIds: string[]; masterEventIds: string[]; payloadSha256: string; actor: string; createdAt: string }) {
   await ensureOperationalSchema();
   const db = await database();
-  const existing = await db.prepare(`SELECT status, revision, master_event_id, payload_json FROM satellite_tasks WHERE task_id = ?`).bind(taskId).first<{ status: string; revision: number; master_event_id: string; payload_json: string }>();
+  await db.batch([
+    db.prepare(`INSERT INTO task_export_packages (package_id, format, task_ids_json, payload_sha256, actor, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
+      .bind(record.packageId, record.format, JSON.stringify(record.taskIds), record.payloadSha256, record.actor, record.createdAt),
+    db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at) VALUES (?, 'task_package_exported', ?, ?, ?)`)
+      .bind(`task_package_exported:${record.packageId}`, record.masterEventIds[0] ?? "task-package", JSON.stringify(record), record.createdAt),
+  ]);
+}
+
+export async function deleteSatelliteTask(taskId: string, expectedRevision?: number, actor = "legacy", reason = "操作员取消任务", allowAllOwners = false) {
+  await ensureOperationalSchema();
+  const db = await database();
+  const existing = await db.prepare(`SELECT status, revision, master_event_id, owner, payload_json FROM satellite_tasks WHERE task_id = ?`).bind(taskId).first<{ status: string; revision: number; master_event_id: string; owner: string; payload_json: string }>();
   const cancelledAt = new Date().toISOString();
   if (!existing) {
-    await db.prepare(`INSERT INTO task_cancellation_intents (task_id, cancelled_at, actor, reason) VALUES (?, ?, ?, ?)
-      ON CONFLICT(task_id) DO UPDATE SET cancelled_at=excluded.cancelled_at, actor=excluded.actor, reason=excluded.reason`)
-      .bind(taskId, cancelledAt, actor, reason).run();
+    await db.prepare(`INSERT INTO task_cancellation_intents (task_id, owner, cancelled_at, actor, reason) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner, cancelled_at=excluded.cancelled_at, actor=excluded.actor, reason=excluded.reason`)
+      .bind(taskId, actor, cancelledAt, actor, reason).run();
     return { state: "cancellation_recorded" as const, revision: null };
   }
+  if (!allowAllOwners && existing.owner !== actor) throw new Error("任务不属于当前操作员");
   if (existing.status === "cancelled") return { state: "already_cancelled" as const, revision: existing.revision };
+  if (existing.status === "cancellation_requested") return { state: "cancellation_requested" as const, revision: existing.revision };
   if (expectedRevision !== undefined && expectedRevision !== existing.revision) throw new Error(`任务版本冲突：当前为 ${existing.revision}，请求为 ${expectedRevision}`);
+  if (["submitted", "cancel_rejected"].includes(existing.status)) {
+    const revision = existing.revision + 1;
+    let previousPayload: Record<string, unknown> = {};
+    try { previousPayload = JSON.parse(existing.payload_json) as Record<string, unknown>; } catch { /* preserve normalized columns */ }
+    const cancellationRequestId = `CANCEL-${taskId}-${revision}`;
+    const payload = { ...previousPayload, status: "cancellation_requested", revision, updatedAt: cancelledAt, cancellationRequestId, cancellationRequestedAt: cancelledAt, cancellationRequestedBy: actor, cancellationReason: reason };
+    const statements = [
+      db.prepare(`UPDATE satellite_tasks SET status='cancellation_requested', payload_json=?, updated_at=?, revision=? WHERE task_id=? AND status=? AND revision=?`)
+        .bind(JSON.stringify(payload), cancelledAt, revision, taskId, existing.status, existing.revision),
+      db.prepare(`INSERT OR IGNORE INTO task_revision_history (task_id, revision, owner, actor, from_status, to_status, reason, payload_json, changed_at)
+        SELECT task_id, revision, owner, ?, ?, status, ?, payload_json, updated_at FROM satellite_tasks WHERE task_id=? AND revision=?`)
+        .bind(actor, existing.status, reason, taskId, revision),
+      db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at)
+        SELECT ?, 'task_cancellation_requested', ?, ?, ? WHERE changes() > 0`)
+        .bind(`task_cancellation_requested:${taskId}:${revision}`, existing.master_event_id, JSON.stringify({ taskId, previousStatus: existing.status, status: "cancellation_requested", revision, cancellationRequestId, actor, reason }), cancelledAt),
+    ];
+    const [result] = await db.batch(statements);
+    if (affectedRows(result) === 0) throw new Error("任务已被其他请求更新，请刷新后重试");
+    return { state: "cancellation_requested" as const, revision, task: payload };
+  }
   if (!canTransitionTask(existing.status, "cancelled")) throw new Error(`不允许取消状态为 ${existing.status} 的任务`);
   const revision = existing.revision + 1;
   let previousPayload: Record<string, unknown> = {};
   try { previousPayload = JSON.parse(existing.payload_json) as Record<string, unknown>; } catch { /* 旧数据仍按规范化列完成取消。 */ }
   const payload = { ...previousPayload, status: "cancelled", revision, updatedAt: cancelledAt, cancelledAt, cancelledBy: actor, cancellationReason: reason };
   const statements = [
-    db.prepare(`INSERT INTO task_cancellation_intents (task_id, cancelled_at, actor, reason) VALUES (?, ?, ?, ?)
-      ON CONFLICT(task_id) DO UPDATE SET cancelled_at=excluded.cancelled_at, actor=excluded.actor, reason=excluded.reason`)
-      .bind(taskId, cancelledAt, actor, reason),
     db.prepare(`UPDATE satellite_tasks SET status = 'cancelled', payload_json = ?, updated_at = ?, revision = ? WHERE task_id = ? AND status = ? AND revision = ?`)
       .bind(JSON.stringify(payload), cancelledAt, revision, taskId, existing.status, existing.revision),
+    db.prepare(`INSERT OR IGNORE INTO task_revision_history (task_id, revision, owner, actor, from_status, to_status, reason, payload_json, changed_at)
+      SELECT task_id, revision, owner, ?, ?, status, ?, payload_json, updated_at FROM satellite_tasks WHERE task_id=? AND revision=?`)
+      .bind(actor, existing.status, reason, taskId, revision),
     db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at)
-      SELECT ?, 'task_cancelled', ?, ?, ? WHERE changes() > 0`)
-      .bind(`task_cancelled:${taskId}:${revision}`, existing.master_event_id, JSON.stringify({ taskId, previousStatus: existing.status, revision, actor, reason }), cancelledAt),
+      SELECT ?, 'task_cancelled', ?, ?, ? WHERE EXISTS (SELECT 1 FROM satellite_tasks WHERE task_id=? AND status='cancelled' AND revision=?)`)
+      .bind(`task_cancelled:${taskId}:${revision}`, existing.master_event_id, JSON.stringify({ taskId, previousStatus: existing.status, revision, actor, reason }), cancelledAt, taskId, revision),
+    db.prepare(`INSERT INTO task_cancellation_intents (task_id, owner, cancelled_at, actor, reason)
+      SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM satellite_tasks WHERE task_id=? AND status='cancelled' AND revision=?)
+      ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner, cancelled_at=excluded.cancelled_at, actor=excluded.actor, reason=excluded.reason`)
+      .bind(taskId, existing.owner, cancelledAt, actor, reason, taskId, revision),
   ];
-  const [, result] = await db.batch(statements);
+  const [result] = await db.batch(statements);
   if (affectedRows(result) === 0) throw new Error("任务已被其他请求更新，请刷新后重试");
   return { state: "cancelled" as const, revision };
 }
@@ -434,19 +653,15 @@ export async function resolveCanonicalEventsByReferences(references: Array<{ sou
       if (await hasActiveEvidence(db, row.master_event_id)) continue;
       if (/CAP Update/i.test(reason)) continue;
       const canonical = await db.prepare(`SELECT payload_json FROM canonical_events WHERE id=?`).bind(row.master_event_id).first<{ payload_json: string }>();
-      const taskRows = await db.prepare(`SELECT task_id, status FROM satellite_tasks WHERE master_event_id = ? AND status IN ('candidate', 'reviewed', 'scheduled', 'submitted')`)
-        .bind(row.master_event_id).all<{ task_id: string; status: string }>();
+      const taskRows = await db.prepare(`SELECT task_id, owner, status, revision, payload_json FROM satellite_tasks WHERE master_event_id = ? AND status IN ('candidate', 'reviewed', 'scheduled', 'submitted')`)
+        .bind(row.master_event_id).all<LifecycleTaskRow>();
       const now = new Date().toISOString();
       const statements: DatabaseStatement[] = [
         db.prepare(`UPDATE canonical_events SET lifecycle_status = 'resolved', observation_expires_at = ?, synced_at = ? WHERE id = ?`).bind(now, now, row.master_event_id),
         db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at) VALUES (?, 'event_resolved', ?, ?, ?)`)
           .bind(`event_resolved:${row.master_event_id}:${now}`, row.master_event_id, JSON.stringify({ reason, event: canonical ? JSON.parse(canonical.payload_json) : null }), now),
       ];
-      for (const task of taskRows.results) {
-        statements.push(db.prepare(`UPDATE satellite_tasks SET status = 'cancelled', updated_at = ? WHERE task_id = ? AND status = ?`).bind(now, task.task_id, task.status));
-        statements.push(db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at) VALUES (?, 'task_cancelled', ?, ?, ?)`)
-          .bind(`task_cancelled:${task.task_id}:${now}`, row.master_event_id, JSON.stringify({ taskId: task.task_id, previousStatus: task.status, reason }), now));
-      }
+      for (const task of taskRows.results) statements.push(...lifecycleTaskTransitionStatements(db, task, row.master_event_id, now, reason));
       await db.batch(statements);
       resolved += 1;
     }
@@ -457,8 +672,46 @@ export async function resolveCanonicalEventsByReferences(references: Array<{ sou
 export async function operationalHealth() {
   await ensureOperationalSchema();
   const db = await database();
-  const row = await db.prepare(`SELECT (SELECT COUNT(*) FROM canonical_events) AS events, (SELECT COUNT(*) FROM satellite_tasks WHERE status != 'cancelled') AS tasks`).first<{ events: number; tasks: number }>();
-  return { database: "ok" as const, events: Number(row?.events ?? 0), tasks: Number(row?.tasks ?? 0) };
+  const row = await db.prepare(`SELECT (SELECT COUNT(*) FROM canonical_events) AS events, (SELECT COUNT(*) FROM satellite_tasks WHERE status != 'cancelled') AS tasks, (SELECT COUNT(*) FROM satellite_orbits WHERE last_success_at IS NOT NULL) AS orbits`).first<{ events: number; tasks: number; orbits: number }>();
+  return { database: "ok" as const, events: Number(row?.events ?? 0), tasks: Number(row?.tasks ?? 0), orbits: Number(row?.orbits ?? 0) };
+}
+
+export async function listSatelliteOrbitCache(): Promise<SatelliteOrbitCacheRecord[]> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const result = await db.prepare(`SELECT norad_id, payload_json, last_attempt_at, last_success_at, last_error FROM satellite_orbits ORDER BY norad_id`).all<{ norad_id: number; payload_json: string; last_attempt_at: string; last_success_at: string | null; last_error: string | null }>();
+  return result.results.map((row) => {
+    let tle: SatelliteTleRecord | undefined;
+    try {
+      const parsed = JSON.parse(row.payload_json) as SatelliteTleRecord;
+      if (parsed?.noradId === Number(row.norad_id) && parsed.tleLine1 && parsed.tleLine2) tle = parsed;
+    } catch {
+      // A malformed cache row is exposed as unavailable and replaced on refresh.
+    }
+    return {
+      noradId: Number(row.norad_id),
+      tle,
+      lastAttemptAt: row.last_attempt_at,
+      lastSuccessAt: row.last_success_at ?? undefined,
+      lastError: row.last_error ?? undefined,
+    };
+  });
+}
+
+export async function recordSatelliteOrbitSuccess(tle: SatelliteTleRecord) {
+  await ensureOperationalSchema();
+  const db = await database();
+  await db.prepare(`INSERT INTO satellite_orbits (norad_id, payload_json, last_attempt_at, last_success_at, last_error) VALUES (?, ?, ?, ?, NULL)
+    ON CONFLICT(norad_id) DO UPDATE SET payload_json=excluded.payload_json, last_attempt_at=excluded.last_attempt_at, last_success_at=excluded.last_success_at, last_error=NULL`)
+    .bind(tle.noradId, JSON.stringify(tle), tle.fetchedAt, tle.fetchedAt).run();
+}
+
+export async function recordSatelliteOrbitFailure(noradId: number, attemptedAt: string, error: string) {
+  await ensureOperationalSchema();
+  const db = await database();
+  await db.prepare(`INSERT INTO satellite_orbits (norad_id, payload_json, last_attempt_at, last_success_at, last_error) VALUES (?, '{}', ?, NULL, ?)
+    ON CONFLICT(norad_id) DO UPDATE SET last_attempt_at=excluded.last_attempt_at, last_error=excluded.last_error`)
+    .bind(noradId, attemptedAt, error.replace(/[\r\n]+/g, " ").slice(0, 240)).run();
 }
 
 export async function listOperationalChanges(after: string, afterId = "", limit = 200) {
@@ -486,18 +739,59 @@ async function quarantineInvalidOperationalRecords(db: DatabaseLike) {
     let event: DisasterEvent;
     try { event = JSON.parse(row.payload_json) as DisasterEvent; } catch { continue; }
     if (!eventHasInvalidIdentity(event)) continue;
-    await db.batch([
+    const tasks = await db.prepare(`SELECT task_id, owner, status, revision, payload_json FROM satellite_tasks WHERE master_event_id=? AND status IN ('candidate','reviewed','scheduled','submitted')`)
+      .bind(row.id).all<LifecycleTaskRow>();
+    const statements: DatabaseStatement[] = [
       db.prepare(`INSERT INTO event_quarantine (master_event_id, reason, payload_json, quarantined_at) VALUES (?, ?, ?, ?) ON CONFLICT(master_event_id) DO UPDATE SET reason=excluded.reason, payload_json=excluded.payload_json, quarantined_at=excluded.quarantined_at`)
         .bind(row.id, "invalid source identity", row.payload_json, now),
       db.prepare(`UPDATE canonical_events SET lifecycle_status='resolved', observation_expires_at=?, synced_at=? WHERE id=?`).bind(now, now, row.id),
-      db.prepare(`UPDATE satellite_tasks SET status='cancelled', updated_at=? WHERE master_event_id=? AND status IN ('candidate','reviewed','scheduled','submitted')`).bind(now, row.id),
       db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at) VALUES (?, 'event_quarantined', ?, ?, ?)`)
         .bind(`event_quarantined:${row.id}:${now}`, row.id, JSON.stringify({ reason: "invalid source identity", event }), now),
-    ]);
+    ];
+    for (const task of tasks.results) statements.push(...lifecycleTaskTransitionStatements(db, task, row.id, now, "主事件身份异常并已隔离"));
+    await db.batch(statements);
   }
 }
 
 function affectedRows(result: unknown) {
   const value = result as { changes?: number; meta?: { changes?: number } } | null;
   return value?.changes ?? value?.meta?.changes ?? 1;
+}
+
+function distinctEvidenceSources(evidence: Array<{ source: string }>) {
+  return new Set(evidence.map((item) => item.source.split(" · ")[0].trim())).size;
+}
+
+function lifecycleTaskTransitionStatements(db: DatabaseLike, task: LifecycleTaskRow, masterEventId: string, changedAt: string, reason: string) {
+  const nextStatus = task.status === "submitted" ? "cancellation_requested" : "cancelled";
+  const revision = Number(task.revision) + 1;
+  let previousPayload: Record<string, unknown> = {};
+  try { previousPayload = JSON.parse(task.payload_json) as Record<string, unknown>; } catch { /* retain normalized columns when legacy JSON is damaged */ }
+  const cancellationRequestId = nextStatus === "cancellation_requested" ? `CANCEL-${task.task_id}-${revision}` : undefined;
+  const payload = {
+    ...previousPayload,
+    status: nextStatus,
+    revision,
+    updatedAt: changedAt,
+    externalStatusReason: reason,
+    ...(cancellationRequestId ? { cancellationRequestId, cancellationRequestedAt: changedAt } : { cancelledAt: changedAt, cancellationReason: reason }),
+  };
+  const changeType = nextStatus === "cancellation_requested" ? "task_cancellation_requested" : "task_cancelled";
+  const statements: DatabaseStatement[] = [
+    db.prepare(`UPDATE satellite_tasks SET status=?, payload_json=?, updated_at=?, revision=? WHERE task_id=? AND status=? AND revision=?`)
+      .bind(nextStatus, JSON.stringify(payload), changedAt, revision, task.task_id, task.status, task.revision),
+    db.prepare(`INSERT OR IGNORE INTO task_revision_history (task_id, revision, owner, actor, from_status, to_status, reason, payload_json, changed_at)
+      SELECT task_id, revision, owner, 'event-lifecycle', ?, status, ?, payload_json, updated_at FROM satellite_tasks WHERE task_id=? AND revision=?`)
+      .bind(task.status, reason, task.task_id, revision),
+    db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at)
+      SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM satellite_tasks WHERE task_id=? AND status=? AND revision=?)`)
+      .bind(`${changeType}:${task.task_id}:${revision}`, changeType, masterEventId, JSON.stringify({ taskId: task.task_id, previousStatus: task.status, status: nextStatus, revision, cancellationRequestId, reason }), changedAt, task.task_id, nextStatus, revision),
+  ];
+  if (nextStatus === "cancelled") statements.push(
+    db.prepare(`INSERT INTO task_cancellation_intents (task_id, owner, cancelled_at, actor, reason)
+      SELECT ?, ?, ?, 'event-lifecycle', ? WHERE EXISTS (SELECT 1 FROM satellite_tasks WHERE task_id=? AND status='cancelled' AND revision=?)
+      ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner, cancelled_at=excluded.cancelled_at, actor=excluded.actor, reason=excluded.reason`)
+      .bind(task.task_id, task.owner, changedAt, reason, task.task_id, revision),
+  );
+  return statements;
 }

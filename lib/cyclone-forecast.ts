@@ -214,6 +214,11 @@ export function cycloneTaskAoiSlices(forecast: CycloneForecast | undefined, imag
     const validTo = Math.min(end, nextFrameStart);
     if (!Number.isFinite(frameStart) || validTo <= validFrom) return [];
     const field = [...frame.windFields].sort((left, right) => left.thresholdKnots - right.thresholdKnots)[0];
+    const windGeometry = field ? cycloneWindGeometry(frame, field) : undefined;
+    const uncertaintyGeometry = cycloneUncertaintyGeometry(frame);
+    // Interpolated centers remain useful to animate the official track, but a
+    // time slice without a wind footprint or uncertainty area is not an AOI.
+    if (!windGeometry && !uncertaintyGeometry) return [];
     return [{
       validFrom: new Date(validFrom).toISOString(),
       validTo: new Date(validTo).toISOString(),
@@ -221,8 +226,8 @@ export function cycloneTaskAoiSlices(forecast: CycloneForecast | undefined, imag
       center: [frame.longitude, frame.latitude],
       centerBasis: frame.centerBasis,
       thresholdKnots: field?.thresholdKnots,
-      windGeometry: field ? cycloneWindGeometry(frame, field) : undefined,
-      uncertaintyGeometry: cycloneUncertaintyGeometry(frame),
+      windGeometry,
+      uncertaintyGeometry,
     }];
   }).slice(0, 361);
 }
@@ -352,8 +357,12 @@ function polygonRings(value: string): Coordinate[][] {
 function parseCoordinates(value: string): Coordinate[] {
   return value.trim().split(/\s+/).flatMap((token): Coordinate[] => {
     const [longitude, latitude] = token.split(",").map(Number);
-    return Number.isFinite(longitude) && Number.isFinite(latitude) && latitude >= -90 && latitude <= 90 && longitude >= -180 && longitude <= 180
-      ? [[longitude, latitude]] : [];
+    // NHC deliberately keeps cones continuous across the date line by using
+    // longitudes above 180 degrees (for example 189E instead of 171W). Keep
+    // that valid 0..360 representation, then normalize it before the common
+    // antimeridian splitter runs. Reject wider values as malformed input.
+    return Number.isFinite(longitude) && Number.isFinite(latitude) && latitude >= -90 && latitude <= 90 && longitude >= -360 && longitude <= 360
+      ? [[normalizeLongitude(longitude), latitude]] : [];
   });
 }
 

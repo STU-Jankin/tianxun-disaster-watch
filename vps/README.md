@@ -6,7 +6,7 @@
 运行链路：
 
 ```text
-全球灾害数据源 → 天巡聚合/生命周期判定 → SQLite 变更与去重队列
+全球灾害数据源 → 独立两分钟采集器 → 天巡聚合/生命周期判定 → SQLite 变更与去重队列
              → HMAC 本机 Webhook → Hermes deliver_only → 飞书
 ```
 
@@ -59,7 +59,8 @@ sudo bash vps/scripts/install.sh
 - 将带时间戳的发行版安装到 `/opt/tianxun/releases/`；
 - 构建生产包，原子切换 `/opt/tianxun/current`；
 - 创建 `/etc/tianxun/*.env`，权限为 `0640 root:tianxun`；
-- 启用后台引擎和五分钟通知定时器；
+- 启用后台引擎、独立两分钟采集定时器；通知定时器需在飞书验收后手工启用；
+- 启用每日一次的 CelesTrak TLE 刷新定时器，失败时保留上次有效轨道；
 - 不修改 UFW，不开放 3000/8644 端口。
 
 安装器会生成 64 位十六进制 API 令牌，并同步写入引擎和通知器的受限环境文件，不会把令牌打印到终端。已有强令牌会保留，示例占位值不会被当作有效凭据。
@@ -119,6 +120,9 @@ sudo systemctl start tianxun-notifier.service
 sudo bash /opt/tianxun/current/vps/scripts/healthcheck.sh
 sudo journalctl -u tianxun-engine -u tianxun-notifier --since '15 minutes ago' --no-pager
 sudo systemctl list-timers tianxun-notifier.timer
+sudo systemctl list-timers tianxun-ingest.timer
+sudo systemctl list-timers tianxun-orbit-refresh.timer
+sudo systemctl list-timers tianxun-backup.timer
 ```
 
 第一次应在飞书收到“天巡灾害后台已建立运行基线”。再次立即执行通知服务，不应重复收到同一消息。
@@ -126,7 +130,7 @@ sudo systemctl list-timers tianxun-notifier.timer
 SQLite 检查：
 
 ```bash
-sudo sqlite3 /var/lib/tianxun/notifier.sqlite \
+sudo sqlite3 /var/lib/tianxun/notifier/notifier.sqlite \
   "select status, count(*) from notification_queue group by status;"
 ```
 
@@ -136,7 +140,12 @@ sudo sqlite3 /var/lib/tianxun/notifier.sqlite \
 sudo bash /opt/tianxun/current/vps/scripts/backup.sh
 ```
 
-默认备份到 `/var/backups/tianxun`，保留 14 天。恢复前应停止引擎和通知定时器，确认目标数据库路径，再用 `sqlite3 .restore` 恢复；不要直接覆盖运行中的 WAL 数据库。
+默认备份到 `/var/backups/tianxun`，保留 14 天，并为每个备份生成 SHA-256。使用受控恢复脚本；它会验证路径、校验和与 SQLite 完整性，并停止相关写入服务：
+
+```bash
+sudo bash /opt/tianxun/current/vps/scripts/restore.sh operational /var/backups/tianxun/operational-YYYYMMDDTHHMMSSZ.sqlite
+sudo bash /opt/tianxun/current/vps/scripts/restore.sh notifier /var/backups/tianxun/notifier-YYYYMMDDTHHMMSSZ.sqlite
+```
 
 ## 资源预算（2 GB RAM VPS）
 
@@ -154,5 +163,7 @@ sudo bash /opt/tianxun/current/vps/scripts/backup.sh
 ## 公网只读试用入口
 
 `vps/nginx/tianxun-public-readonly.conf` 可把页面、事件、地点解析、逐小时天气和健康检查通过 Nginx 暴露到 80 端口，同时让 Node 引擎与 Hermes 继续只监听回环地址。天气接口只代理经过坐标校验、频率限制和30分钟缓存的只读查询；免密钥 MET Norway 是默认底座，QWeather 仅作可选增强且凭据不会返回浏览器。该配置不会公开已有卫星任务，并拒绝任务写入、删除、变更流和可见性仿真请求。生产环境若要开放任务规划，必须先配置域名、HTTPS 和用户级认证，不能仅靠共享代理密钥。
+
+`/api/satellites` 只读公开 6 颗已配置卫星的业务名称、NORAD 编号、TLE、轨道历元与缓存状态。服务器每天通过免认证 CelesTrak GP `CATNR` 接口刷新一次；公开入口不允许触发刷新。51832、56846、61231、64048、69100 的业务名称来自项目配置，58918 的“东方慧眼”身份保持待核验；CelesTrak 返回名称始终单独保存，不用名称字符串覆盖业务映射。
 
 站点配置依赖两个运行时 snippet：`/etc/nginx/snippets/tianxun-proxy-common.conf` 使用仓库模板；`/etc/nginx/snippets/tianxun-proxy-secret.conf` 必须在服务器上生成，权限设为 `0600`，内容为 `proxy_set_header X-Tianxun-Proxy-Secret <64位随机值>;`。同一个随机值写入 `/etc/tianxun/engine.env` 的 `TIANXUN_TRUSTED_PROXY_SECRET` 后重启引擎。不要把实际密钥提交到仓库。

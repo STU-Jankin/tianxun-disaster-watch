@@ -122,8 +122,11 @@ export type DisasterEvent = {
   sourcePresence: "current" | "retained";
   evidence: EventEvidence[];
   evidenceCount: number;
+  independentSourceCount?: number;
+  bulletinCount?: number;
   updateHistory: EventUpdate[];
   updateCount: number;
+  peakSeverity?: "red" | "orange" | "yellow" | "blue";
   confidenceScore: number;
   confidenceLevel: "high" | "medium" | "low";
   geometryType: "Point" | "LineString" | "Polygon" | "MultiPolygon";

@@ -3,6 +3,11 @@ export type SupportedGeometry = {
   coordinates: unknown;
 };
 
+export type AntimeridianOutlineGeometry = {
+  type: "MultiLineString";
+  coordinates: Coordinate[][];
+};
+
 export type GeometryValidation = {
   ok: boolean;
   reason?: string;
@@ -24,6 +29,7 @@ export function validateGeoGeometry(
     maximumRingVertices?: number;
     maximumAreaKm2?: number;
     rejectUnsplitAntimeridian?: boolean;
+    allowOverlappingMultiPolygon?: boolean;
   } = {},
 ): GeometryValidation {
   const maximumVertices = options.maximumVertices ?? 10_000;
@@ -100,7 +106,7 @@ export function validateGeoGeometry(
     if (!parsed.ok) return fail(parsed.reason);
     polygons.push(parsed);
   }
-  if (geometry.type === "MultiPolygon") {
+  if (geometry.type === "MultiPolygon" && !options.allowOverlappingMultiPolygon) {
     for (let left = 0; left < polygons.length; left += 1) {
       const leftOuter = unwrapRing(polygons[left].rings[0]);
       for (let right = left + 1; right < polygons.length; right += 1) {
@@ -153,6 +159,62 @@ export function splitAntimeridianRing(ring: Coordinate[]): Coordinate[][] {
   const inside = clipVertical(unwrapped, boundary, insideSide).map(([lon, lat]) => [normalizeLongitude(lon), lat] as Coordinate);
   const outside = clipVertical(unwrapped, boundary, outsideSide).map(([lon, lat]) => [normalizeLongitude(lon + (boundary === 180 ? -360 : 360)), lat] as Coordinate);
   return [inside, outside].filter((part) => part.length >= 4 && Math.abs(planarSignedArea(unwrapRing(part))) > EPSILON);
+}
+
+/**
+ * Builds the visible outline of a polygon split at the international date
+ * line, excluding the artificial +/-180 degree clipping edges. The returned
+ * longitudes are unwrapped near the current map view so Leaflet renders both
+ * halves together instead of drawing a vertical seam across the filled area.
+ * Returns null when the geometry has no clipping seam and can be styled as a
+ * normal polygon.
+ */
+export function antimeridianOutlineGeometry(
+  value: SupportedGeometry,
+  referenceLongitude: number,
+): AntimeridianOutlineGeometry | null {
+  if (value.type !== "Polygon" && value.type !== "MultiPolygon") return null;
+  const polygons = value.type === "Polygon" ? [value.coordinates] : value.coordinates;
+  if (!Array.isArray(polygons)) return null;
+  const outlines: Coordinate[][] = [];
+  let foundSeam = false;
+
+  for (const polygon of polygons) {
+    if (!Array.isArray(polygon)) continue;
+    for (const rawRing of polygon) {
+      if (!Array.isArray(rawRing) || rawRing.length < 2) continue;
+      const ring = rawRing as Coordinate[];
+      const edgeCount = ring.length - 1;
+      const seamEdges: number[] = [];
+      for (let index = 0; index < edgeCount; index += 1) {
+        if (isDateLineCoordinate(ring[index]) && isDateLineCoordinate(ring[index + 1])) seamEdges.push(index);
+      }
+      if (!seamEdges.length) {
+        outlines.push(unwrapLineRelative(ring, referenceLongitude));
+        continue;
+      }
+
+      foundSeam = true;
+      const seamSet = new Set(seamEdges);
+      const firstEdge = (seamEdges[0] + 1) % edgeCount;
+      let segment: Coordinate[] = [];
+      for (let offset = 0; offset < edgeCount; offset += 1) {
+        const edgeIndex = (firstEdge + offset) % edgeCount;
+        if (seamSet.has(edgeIndex)) {
+          if (segment.length >= 2) outlines.push(unwrapLineRelative(segment, referenceLongitude));
+          segment = [];
+          continue;
+        }
+        const start = ring[edgeIndex];
+        const end = ring[edgeIndex + 1];
+        if (!segment.length) segment.push(start);
+        segment.push(end);
+      }
+      if (segment.length >= 2) outlines.push(unwrapLineRelative(segment, referenceLongitude));
+    }
+  }
+
+  return foundSeam && outlines.length ? { type: "MultiLineString", coordinates: outlines } : null;
 }
 
 function clipVertical(ring: Coordinate[], boundary: number, side: "less" | "greater") {
@@ -260,6 +322,21 @@ function unwrapRingRelative(ring: Coordinate[], reference: number) {
     prior = unwrapped;
     return [unwrapped, latitude] as Coordinate;
   });
+}
+
+function unwrapLineRelative(line: Coordinate[], reference: number) {
+  let prior = reference;
+  return line.map(([longitude, latitude]) => {
+    let unwrapped = longitude;
+    while (unwrapped - prior > 180) unwrapped -= 360;
+    while (unwrapped - prior < -180) unwrapped += 360;
+    prior = unwrapped;
+    return [unwrapped, latitude] as Coordinate;
+  });
+}
+
+function isDateLineCoordinate([longitude]: Coordinate) {
+  return Math.abs(Math.abs(longitude) - 180) <= 1e-7;
 }
 
 function normalizeLongitude(value: number) {
