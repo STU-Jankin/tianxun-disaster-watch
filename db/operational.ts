@@ -1,4 +1,5 @@
 import type { DisasterEvent } from "../lib/disasters.ts";
+import type { RoadDisruption, RoadDisruptionRegistryEntry } from "../lib/response-disruptions.ts";
 import type { SatelliteOrbitCacheRecord, SatelliteTleRecord } from "../lib/satellite-orbits.ts";
 import { canTransitionTask } from "../lib/task-contract.ts";
 import { compareEventVersionFreshness, eventHasInvalidIdentity, isValidSourceEventId } from "../lib/event-integrity.ts";
@@ -155,6 +156,11 @@ export function ensureOperationalSchema() {
     `CREATE INDEX IF NOT EXISTS operational_changes_created_idx ON operational_changes (created_at, id)`,
     `CREATE TABLE IF NOT EXISTS satellite_orbits (norad_id INTEGER PRIMARY KEY NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}', last_attempt_at TEXT NOT NULL, last_success_at TEXT, last_error TEXT)`,
     `CREATE INDEX IF NOT EXISTS satellite_orbits_success_idx ON satellite_orbits (last_success_at)`,
+    `CREATE TABLE IF NOT EXISTS road_disruptions (disruption_id TEXT PRIMARY KEY NOT NULL, owner TEXT NOT NULL, lifecycle_status TEXT NOT NULL, verification TEXT NOT NULL, revision INTEGER NOT NULL, valid_from TEXT, valid_to TEXT, payload_json TEXT NOT NULL, reported_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS road_disruptions_active_time_idx ON road_disruptions (lifecycle_status, valid_to, updated_at)`,
+    `CREATE INDEX IF NOT EXISTS road_disruptions_owner_idx ON road_disruptions (owner, updated_at)`,
+    `CREATE TABLE IF NOT EXISTS road_disruption_history (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, disruption_id TEXT NOT NULL, revision INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, payload_json TEXT NOT NULL, changed_at TEXT NOT NULL)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS road_disruption_history_revision_uidx ON road_disruption_history (disruption_id, revision)`,
   ];
   schemaReady = database().then(async (db) => {
     await db.batch(statements.map((statement) => db.prepare(statement)));
@@ -669,11 +675,113 @@ export async function resolveCanonicalEventsByReferences(references: Array<{ sou
   return resolved;
 }
 
+export async function listRoadDisruptions(options: { includeInactive?: boolean; activeAt?: string } = {}): Promise<RoadDisruptionRegistryEntry[]> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const result = await db.prepare(`SELECT payload_json FROM road_disruptions
+    WHERE (?=1 OR lifecycle_status='active')
+      AND (?='' OR valid_from IS NULL OR valid_from < ?)
+      AND (?='' OR valid_to IS NULL OR valid_to > ?)
+    ORDER BY CASE verification WHEN 'verified' THEN 0 ELSE 1 END, updated_at DESC
+    LIMIT 500`)
+    .bind(options.includeInactive ? 1 : 0, options.activeAt ?? "", options.activeAt ?? "", options.activeAt ?? "", options.activeAt ?? "")
+    .all<{ payload_json: string }>();
+  return result.results.flatMap((row) => {
+    try {
+      const entry = JSON.parse(row.payload_json) as RoadDisruptionRegistryEntry;
+      return entry?.disruptionId ? [entry] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
+export async function upsertRoadDisruptionReports(disruptions: RoadDisruption[], actor: string, allowAllOwners = false): Promise<RoadDisruptionRegistryEntry[]> {
+  await ensureOperationalSchema();
+  if (!disruptions.length || disruptions.length > 50) throw new Error("道路中断上报数量必须为 1–50 条");
+  const db = await database();
+  const now = new Date().toISOString();
+  const saved: RoadDisruptionRegistryEntry[] = [];
+  for (const disruption of disruptions) {
+    const existing = await db.prepare(`SELECT owner, revision, reported_at FROM road_disruptions WHERE disruption_id=?`)
+      .bind(disruption.disruptionId).first<{ owner: string; revision: number; reported_at: string }>();
+    if (existing && !allowAllOwners && existing.owner !== actor) throw new Error("道路中断记录不属于当前操作员");
+    const revision = Number(existing?.revision ?? 0) + 1;
+    const entry: RoadDisruptionRegistryEntry = {
+      ...disruption,
+      verification: "reported",
+      lifecycleStatus: "active",
+      revision,
+      reportedAt: existing?.reported_at ?? now,
+      updatedAt: now,
+      reportedBy: existing?.owner ?? actor,
+      verifiedAt: undefined,
+      verifiedBy: undefined,
+      resolvedAt: undefined,
+      resolvedBy: undefined,
+    };
+    const payload = JSON.stringify(entry);
+    await db.batch([
+      db.prepare(`INSERT INTO road_disruptions (disruption_id, owner, lifecycle_status, verification, revision, valid_from, valid_to, payload_json, reported_at, updated_at)
+        VALUES (?, ?, 'active', 'reported', ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(disruption_id) DO UPDATE SET lifecycle_status='active', verification='reported', revision=excluded.revision, valid_from=excluded.valid_from, valid_to=excluded.valid_to, payload_json=excluded.payload_json, updated_at=excluded.updated_at
+        WHERE road_disruptions.revision=?`)
+        .bind(entry.disruptionId, entry.reportedBy, revision, entry.validFrom ?? null, entry.validTo ?? null, payload, entry.reportedAt, now, revision - 1),
+      db.prepare(`INSERT INTO road_disruption_history (disruption_id, revision, actor, action, payload_json, changed_at) VALUES (?, ?, ?, 'reported', ?, ?)`)
+        .bind(entry.disruptionId, revision, actor, payload, now),
+      db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at) VALUES (?, 'road_disruption_reported', 'road-network', ?, ?)`)
+        .bind(`road_disruption_reported:${entry.disruptionId}:${revision}`, JSON.stringify({ disruptionId: entry.disruptionId, revision, actor }), now),
+    ]);
+    saved.push(entry);
+  }
+  return saved;
+}
+
+export async function transitionRoadDisruption(disruptionId: string, expectedRevision: number, action: "verify" | "resolve" | "reject", actor: string, isAdmin: boolean): Promise<RoadDisruptionRegistryEntry> {
+  await ensureOperationalSchema();
+  if (!isAdmin) throw new Error("只有管理员可以核验或解除道路中断");
+  const db = await database();
+  const row = await db.prepare(`SELECT revision, payload_json FROM road_disruptions WHERE disruption_id=?`).bind(disruptionId)
+    .first<{ revision: number; payload_json: string }>();
+  if (!row) throw new Error("道路中断记录不存在");
+  if (Number(row.revision) !== expectedRevision) throw new Error(`道路中断版本冲突：当前为 ${row.revision}，请求为 ${expectedRevision}`);
+  const current = JSON.parse(row.payload_json) as RoadDisruptionRegistryEntry;
+  if (action === "verify" && current.lifecycleStatus !== "active") throw new Error("只有有效记录可以核验");
+  if ((action === "resolve" || action === "reject") && current.lifecycleStatus !== "active") return current;
+  if (action === "verify" && current.verification === "verified") return current;
+  const now = new Date().toISOString();
+  const revision = expectedRevision + 1;
+  const next: RoadDisruptionRegistryEntry = {
+    ...current,
+    revision,
+    updatedAt: now,
+    verification: action === "verify" ? "verified" : current.verification,
+    lifecycleStatus: action === "resolve" ? "resolved" : action === "reject" ? "rejected" : "active",
+    verifiedAt: action === "verify" ? now : current.verifiedAt,
+    verifiedBy: action === "verify" ? actor : current.verifiedBy,
+    resolvedAt: action === "resolve" || action === "reject" ? now : current.resolvedAt,
+    resolvedBy: action === "resolve" || action === "reject" ? actor : current.resolvedBy,
+  };
+  const payload = JSON.stringify(next);
+  const [result] = await db.batch([
+    db.prepare(`UPDATE road_disruptions SET lifecycle_status=?, verification=?, revision=?, valid_from=?, valid_to=?, payload_json=?, updated_at=? WHERE disruption_id=? AND revision=?`)
+      .bind(next.lifecycleStatus, next.verification, revision, next.validFrom ?? null, next.validTo ?? null, payload, now, disruptionId, expectedRevision),
+    db.prepare(`INSERT INTO road_disruption_history (disruption_id, revision, actor, action, payload_json, changed_at)
+      SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM road_disruptions WHERE disruption_id=? AND revision=? AND payload_json=?)`)
+      .bind(disruptionId, revision, actor, action, payload, now, disruptionId, revision, payload),
+    db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at)
+      SELECT ?, ?, 'road-network', ?, ? WHERE EXISTS (SELECT 1 FROM road_disruptions WHERE disruption_id=? AND revision=? AND payload_json=?)`)
+      .bind(`road_disruption_${action}:${disruptionId}:${revision}`, `road_disruption_${action}`, JSON.stringify({ disruptionId, revision, actor }), now, disruptionId, revision, payload),
+  ]);
+  if (affectedRows(result) === 0) throw new Error("道路中断已被其他请求更新，请刷新后重试");
+  return next;
+}
+
 export async function operationalHealth() {
   await ensureOperationalSchema();
   const db = await database();
-  const row = await db.prepare(`SELECT (SELECT COUNT(*) FROM canonical_events) AS events, (SELECT COUNT(*) FROM satellite_tasks WHERE status != 'cancelled') AS tasks, (SELECT COUNT(*) FROM satellite_orbits WHERE last_success_at IS NOT NULL) AS orbits`).first<{ events: number; tasks: number; orbits: number }>();
-  return { database: "ok" as const, events: Number(row?.events ?? 0), tasks: Number(row?.tasks ?? 0), orbits: Number(row?.orbits ?? 0) };
+  const row = await db.prepare(`SELECT (SELECT COUNT(*) FROM canonical_events) AS events, (SELECT COUNT(*) FROM satellite_tasks WHERE status != 'cancelled') AS tasks, (SELECT COUNT(*) FROM satellite_orbits WHERE last_success_at IS NOT NULL) AS orbits, (SELECT COUNT(*) FROM road_disruptions WHERE lifecycle_status='active') AS disruptions`).first<{ events: number; tasks: number; orbits: number; disruptions: number }>();
+  return { database: "ok" as const, events: Number(row?.events ?? 0), tasks: Number(row?.tasks ?? 0), orbits: Number(row?.orbits ?? 0), disruptions: Number(row?.disruptions ?? 0) };
 }
 
 export async function listSatelliteOrbitCache(): Promise<SatelliteOrbitCacheRecord[]> {

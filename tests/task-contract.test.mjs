@@ -106,3 +106,40 @@ test("rejects self-intersecting and world-scale AOIs", async () => {
   task.customGeometry = { type: "Polygon", coordinates: [[[-170, -70], [170, -70], [170, 70], [-170, 70], [-170, -70]]] };
   assert.equal(validateSatelliteTask(task).ok, false);
 });
+
+test("accepts bounded landslide SAR planning fields and rejects contradictory payloads", async () => {
+  const { unknownTaskFields, validateSatelliteTask } = await contract();
+  const task = validTask();
+  task.orbitDirectionPreference = "ascending";
+  task.referenceAcquisitionRequired = true;
+  task.sarAnalysisMode = "amplitude_change_and_insar_pair";
+  assert.deepEqual(unknownTaskFields(task), []);
+  assert.equal(validateSatelliteTask(task).ok, true);
+  task.orbitDirectionPreference = "polar";
+  assert.equal(validateSatelliteTask(task).ok, false);
+  task.orbitDirectionPreference = "descending";
+  task.sensors = ["高分辨率光学"];
+  assert.equal(validateSatelliteTask(task).ok, false);
+});
+
+test("accepts bounded orbit-only provenance but forbids direct execution", async () => {
+  const { unknownTaskFields, validateSatelliteTask } = await contract();
+  const task = validTask();
+  Object.assign(task, {
+    simulationLevel: "orbit_only",
+    satelliteNoradId: 51832,
+    closestApproachAt: new Date(Date.now() + 4_000_000).toISOString(),
+    closestSubpointLatitude: 31.2,
+    closestSubpointLongitude: 120.1,
+    minimumGroundTrackDistanceKm: 82.4,
+    orbitSearchRadiusKm: 350,
+    opportunityOrbitDirection: "ascending",
+  });
+  assert.deepEqual(unknownTaskFields(task), []);
+  assert.equal(validateSatelliteTask(task).ok, true);
+  task.status = "scheduled";
+  assert.equal(validateSatelliteTask(task).ok, false);
+  task.status = "candidate";
+  task.orbitSearchRadiusKm = 5_000;
+  assert.equal(validateSatelliteTask(task).ok, false);
+});

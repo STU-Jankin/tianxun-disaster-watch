@@ -60,6 +60,7 @@ export async function POST(request: Request) {
       if (canonical.event.dispatchEligibility !== "ready") return Response.json({ error: "来源坐标不具备直接下发资格，必须由操作员复核 AOI" }, { status: 409 });
       if (task.aoiType !== "source") return Response.json({ error: "来源核验任务必须使用当前主事件的来源几何" }, { status: 409 });
     }
+    const timeIndexedAoi = cycloneTaskAoiSlices(cycloneForecast, String(task.imagingStart), String(task.imagingEnd));
     const canonicalFields = {
       eventId: canonical.event.id,
       masterEventId: canonical.event.masterEventId,
@@ -85,7 +86,7 @@ export async function POST(request: Request) {
       forecastAdvisoryId: cycloneForecast ? `${cycloneForecast.source}:${cycloneForecast.advisory ?? cycloneForecast.issuedAt}` : undefined,
       forecastIssuedAt: cycloneForecast?.issuedAt,
       forecastValidUntil: cycloneForecast?.forecastValidUntil,
-      timeIndexedAoi: cycloneTaskAoiSlices(cycloneForecast, String(task.imagingStart), String(task.imagingEnd)),
+      timeIndexedAoi: timeIndexedAoi.length ? timeIndexedAoi : undefined,
       sourceGeometry,
     };
     const draft = { ...task, ...canonicalFields, eventRevision: currentEventRevision };

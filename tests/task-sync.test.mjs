@@ -21,8 +21,14 @@ test("task sync omits canonical cyclone products and source geometry", () => {
   assert.ok(JSON.stringify(compact).length < 2_000);
 });
 
-test("task sync retains operator-authored Polygon and MultiPolygon AOIs", () => {
+test("task sync retains operator-authored AOI and bounded orbit-screening provenance", () => {
   const customGeometry = { type: "Polygon", coordinates: [[[120, 30], [121, 30], [121, 31], [120, 30]]] };
-  const compact = compactSatelliteTaskForSync({ taskId: "task-2", masterEventId: "master-2", aoiType: "polygon", customGeometry });
+  const compact = compactSatelliteTaskForSync({ taskId: "task-2", masterEventId: "master-2", aoiType: "polygon", customGeometry, orbitDirectionPreference: "ascending", referenceAcquisitionRequired: true, sarAnalysisMode: "amplitude_change_and_insar_pair", simulationLevel: "orbit_only", satelliteNoradId: 51832, minimumGroundTrackDistanceKm: 72.5, orbitSearchRadiusKm: 350 });
   assert.deepEqual(compact.customGeometry, customGeometry);
+  assert.equal(compact.orbitDirectionPreference, "ascending");
+  assert.equal(compact.referenceAcquisitionRequired, true);
+  assert.equal(compact.sarAnalysisMode, "amplitude_change_and_insar_pair");
+  assert.equal(compact.simulationLevel, "orbit_only");
+  assert.equal(compact.satelliteNoradId, 51832);
+  assert.equal(compact.minimumGroundTrackDistanceKm, 72.5);
 });

@@ -20,6 +20,15 @@ test("builds immutable planning packages with 4D cyclone features and CSV inject
     imagingEnd: "2026-08-20T02:00:00.000Z",
     eventRevision: "a".repeat(64),
     aoiHash: "b".repeat(64),
+    orbitDirectionPreference: "ascending",
+    referenceAcquisitionRequired: true,
+    sarAnalysisMode: "amplitude_change_and_insar_pair",
+    simulationLevel: "orbit_only",
+    satelliteNoradId: 51832,
+    closestApproachAt: "2026-08-20T00:45:00.000Z",
+    minimumGroundTrackDistanceKm: 84.2,
+    orbitSearchRadiusKm: 350,
+    opportunityOrbitDirection: "ascending",
     timeIndexedAoi: [{
       validFrom: "2026-08-20T00:00:00.000Z",
       validTo: "2026-08-20T01:00:00.000Z",
@@ -42,4 +51,7 @@ test("builds immutable planning packages with 4D cyclone features and CSV inject
 
   const csv = buildTaskExportArtifact([task], "csv", "operator-a", generatedAt);
   assert.match(csv.body, /'=FORMULA\(\)/);
+  assert.match(csv.body, /orbit_direction_preference,reference_acquisition_required,sar_analysis_mode/);
+  assert.match(csv.body, /ascending,true,amplitude_change_and_insar_pair/);
+  assert.match(csv.body, /orbit_only,51832,2026-08-20T00:45:00.000Z,84.2,350,ascending/);
 });

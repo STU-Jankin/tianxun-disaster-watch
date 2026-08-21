@@ -33,6 +33,9 @@ const allowedTaskFields = new Set([
   "approvalReason", "createdAt", "updatedAt", "status", "revision", "eventRevision", "aoiHash",
   "timeIndexedAoi", "forecastAdvisoryId", "forecastIssuedAt", "forecastValidUntil",
   "satelliteId", "instrumentId", "imagingMode", "opportunityId", "orbitVersion", "visibilityComputedAt",
+  "simulationLevel", "satelliteNoradId", "closestApproachAt", "closestSubpointLatitude", "closestSubpointLongitude",
+  "minimumGroundTrackDistanceKm", "orbitSearchRadiusKm", "opportunityOrbitDirection",
+  "orbitDirectionPreference", "referenceAcquisitionRequired", "sarAnalysisMode",
   "dispatchId", "dispatchAcceptedAt", "acquisitionId", "acquiredAt", "productIds", "completedAt",
   "cancellationRequestId", "cancellationRequestedAt", "cancellationAcknowledgedAt", "externalStatusReason",
 ]);
@@ -69,6 +72,19 @@ export function validateSatelliteTask(task: Record<string, unknown>, options: { 
   else if (task.sensors.length === 0 && (options.requirePayload || task.status !== "candidate")) errors.push("至少选择一种载荷");
   if (!Array.isArray(task.observationTargets) || task.observationTargets.length === 0) errors.push("至少需要一个观测目标");
   else if (task.observationTargets.length > 30 || task.observationTargets.some((target) => typeof target !== "string" || target.length > 120)) errors.push("观测目标数量或长度超限");
+  if (task.orbitDirectionPreference !== undefined && !["ascending", "descending", "either"].includes(String(task.orbitDirectionPreference))) errors.push("轨向偏好无效");
+  if (task.simulationLevel !== undefined && !["orbit_only", "sensor_model"].includes(String(task.simulationLevel))) errors.push("仿真层级无效");
+  if (task.simulationLevel === "orbit_only" && !["candidate", "reviewed"].includes(String(task.status))) errors.push("TLE 轨道级粗筛结果不得直接排程或下发");
+  if (task.satelliteNoradId !== undefined) boundedNumber(task.satelliteNoradId, 1, 69_999, "NORAD 编号", errors, true);
+  if (task.closestApproachAt !== undefined && !Number.isFinite(Date.parse(String(task.closestApproachAt)))) errors.push("最近轨道近接时间无效");
+  if (task.closestSubpointLatitude !== undefined) boundedNumber(task.closestSubpointLatitude, -90, 90, "最近子星点纬度", errors);
+  if (task.closestSubpointLongitude !== undefined) boundedNumber(task.closestSubpointLongitude, -180, 180, "最近子星点经度", errors);
+  if (task.minimumGroundTrackDistanceKm !== undefined) boundedNumber(task.minimumGroundTrackDistanceKm, 0, 20_050, "最小地面轨迹距离", errors);
+  if (task.orbitSearchRadiusKm !== undefined) boundedNumber(task.orbitSearchRadiusKm, 50, 1_000, "轨道搜索半径", errors);
+  if (task.opportunityOrbitDirection !== undefined && !["ascending", "descending"].includes(String(task.opportunityOrbitDirection))) errors.push("候选机会轨向无效");
+  if (task.referenceAcquisitionRequired !== undefined && typeof task.referenceAcquisitionRequired !== "boolean") errors.push("灾前参考影像要求必须是布尔值");
+  if (task.sarAnalysisMode !== undefined && !["amplitude_change", "insar_pair", "amplitude_change_and_insar_pair"].includes(String(task.sarAnalysisMode))) errors.push("SAR 分析模式无效");
+  if (task.sarAnalysisMode !== undefined && (!Array.isArray(task.sensors) || !task.sensors.includes("SAR"))) errors.push("SAR 分析模式必须选择 SAR 载荷");
   boundedNumber(task.minimumCoveragePercent, 1, 100, "最低覆盖率", errors);
   boundedNumber(task.maximumCloudPercent, 0, 100, "最大云量", errors);
   boundedNumber(task.spatialResolutionMeters, 0.1, 10_000, "空间分辨率", errors);

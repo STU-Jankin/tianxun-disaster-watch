@@ -126,15 +126,16 @@ test("models canonical events, evidence provenance and AOI dispatch gates", asyn
   assert.match(route, /isSamePhysicalEvent/);
   for (const field of ["masterEventId", "evidenceCount", "confidenceScore", "locationQuality", "dispatchEligibility"]) assert.ok(route.includes(field));
   assert.match(dashboard, /需先人工核对 AOI/);
-  assert.match(dashboard, /计算卫星可见窗口/);
+  assert.match(dashboard, /计算卫星任务机会/);
   for (const table of ["canonical_events", "event_evidence", "satellite_tasks", "task_status_history"]) assert.ok(schema.includes(table));
 });
 
-test("keeps satellite visibility integration explicit when simulation is not configured", async () => {
+test("falls back to an explicit TLE-only screen when a sensor simulator is not configured", async () => {
   const { readFile } = await import("node:fs/promises");
   const route = await readFile(new URL("../app/api/visibility/route.ts", import.meta.url), "utf8");
   assert.match(route, /SATELLITE_VISIBILITY_API_URL/);
-  assert.match(route, /needs_config/);
+  assert.match(route, /screenTleOpportunities/);
+  assert.match(route, /mode: "orbit_only"/);
   assert.match(route, /windows/);
   assert.doesNotMatch(route, /mock|fake|demo window/i);
 });
@@ -167,7 +168,8 @@ test("syncs a compact task draft and lets the server rebuild canonical 4D produc
   const draftAllowlist = sync.match(/taskDraftFields\s*=\s*\[([\s\S]*?)\]\s*as const/)?.[1] ?? "";
   for (const canonical of ["sourceGeometry", "cycloneForecast", "timeIndexedAoi"]) assert.doesNotMatch(draftAllowlist, new RegExp(`"${canonical}"`));
   assert.match(route, /readJsonObject\(request, 256 \* 1024\)/);
-  assert.match(route, /timeIndexedAoi: cycloneTaskAoiSlices/);
+  assert.match(route, /const timeIndexedAoi = cycloneTaskAoiSlices/);
+  assert.match(route, /timeIndexedAoi: timeIndexedAoi\.length \? timeIndexedAoi : undefined/);
 });
 
 test("returns persisted canonical identities and heals stale local draft references conservatively", async () => {
@@ -205,7 +207,7 @@ test("implements stale-data, map resize, AOI preview and server task gates", asy
   assert.match(dashboard, /aoiLayerRef/);
   assert.match(dashboard, /geo-cluster/);
   assert.match(dashboard, /aria-modal="true"/);
-  assert.match(dashboard, /inert=\{taskPanelOpen/);
+  assert.match(dashboard, /inert=\{modalPanelOpen/);
   assert.match(dashboard, /高优先事件/);
   assert.match(dashboard, /重试解析/);
   assert.match(taskRoute, /validateSatelliteTask/);
@@ -223,6 +225,38 @@ test("implements stale-data, map resize, AOI preview and server task gates", asy
   assert.match(eventRoute, /authorizeApiRequest/);
 });
 
+test("adds a bounded phase-three response simulation, disruption review and infrastructure screening workflow", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  const routing = await readFile(new URL("../lib/response-routing.ts", import.meta.url), "utf8");
+  const disruptionApi = await readFile(new URL("../app/api/road-disruptions/route.ts", import.meta.url), "utf8");
+  const infrastructureApi = await readFile(new URL("../app/api/infrastructure/route.ts", import.meta.url), "utf8");
+  const infrastructure = await readFile(new URL("../lib/osm-infrastructure.ts", import.meta.url), "utf8");
+  const operational = await readFile(new URL("../db/operational.ts", import.meta.url), "utf8");
+  assert.match(dashboard, /建立处置推演场景/);
+  assert.match(dashboard, /真实道路、毁损台账与基础设施暴露第三阶段/);
+  assert.match(dashboard, /生成真实道路候选/);
+  assert.match(dashboard, /设施结构状态：未核验/);
+  assert.match(dashboard, /OSM 设施暴露/);
+  assert.match(dashboard, /道路毁损与封闭/);
+  assert.match(dashboard, /电动自行车/);
+  assert.match(dashboard, /导出 GeoJSON/);
+  assert.match(dashboard, /responseLayerRef/);
+  assert.match(dashboard, /setActiveResponseScenarioId\(null\);\s*setSelected\(event\)/);
+  assert.match(routing, /geometric_preview_v1/);
+  assert.match(routing, /amap_driving_v1/);
+  assert.match(routing, /超出4D影响场有效期/);
+  assert.match(routing, /禁止作为可用路线/);
+  assert.match(disruptionApi, /authorizeApiRequest\(request, "admin"\)/);
+  assert.match(disruptionApi, /default_24h/);
+  assert.match(infrastructureApi, /authorizeApiRequest\(request, "operator"\)/);
+  assert.match(infrastructureApi, /15_000/);
+  assert.match(infrastructure, /maximumBboxAreaKm2 = 2_500/);
+  assert.match(infrastructure, /不代表设施当前完好/);
+  assert.match(operational, /CREATE TABLE IF NOT EXISTS road_disruptions/);
+  assert.match(operational, /road_disruption_history/);
+});
+
 test("keeps the public Nginx trial read-only and leaves internal services unexposed", async () => {
   const { readFile } = await import("node:fs/promises");
   const nginx = await readFile(new URL("../vps/nginx/tianxun-public-readonly.conf", import.meta.url), "utf8");
@@ -230,7 +264,8 @@ test("keeps the public Nginx trial read-only and leaves internal services unexpo
   assert.equal(nginx.match(/tianxun-proxy-secret\.conf/g)?.length, 5);
   assert.match(nginx, /location = \/api\/weather[\s\S]*limit_req[\s\S]*tianxun-proxy-secret\.conf/);
   assert.match(nginx, /location = \/api\/tasks[\s\S]*public-read-only[\s\S]*return 403/);
-  assert.match(nginx, /location ~ \^\/api\/\(changes\|visibility\)[\s\S]*return 403/);
+  assert.match(nginx, /location = \/api\/road-disruptions[\s\S]*public-read-only[\s\S]*return 403/);
+  assert.match(nginx, /location ~ \^\/api\/\(changes\|visibility\|routing\|infrastructure\|landslide-terrain\)[\s\S]*return 403/);
   assert.doesNotMatch(nginx, /listen\s+(?:127\.0\.0\.1:)?(?:3000|8644)/);
 });
 
@@ -242,6 +277,21 @@ test("includes every Vinext build dependency in the hardened VPS release allow-l
   assert.match(viteConfig, /\.\/build\/sites-vite-plugin\.ts/);
   assert.match(viteConfig, /main: "\.\/worker\/index\.ts"/);
   assert.match(installer, /for directory in \.openai app build db drizzle lib public vps worker/);
+});
+
+test("adds evidence-safe landslide terrain screening and complementary SAR task templates", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  const terrainApi = await readFile(new URL("../app/api/landslide-terrain/route.ts", import.meta.url), "utf8");
+  const planning = await readFile(new URL("../lib/landslide-planning.ts", import.meta.url), "utf8");
+  assert.match(dashboard, /滑坡证据状态/);
+  assert.match(dashboard, /生成地形约束 AOI/);
+  assert.match(dashboard, /建立升轨 \+ 降轨 SAR 任务/);
+  assert.match(dashboard, /不是滑坡实况边界/);
+  assert.match(terrainApi, /authorizeApiRequest\(request, "operator"\)/);
+  assert.match(terrainApi, /plan\.points\.map/);
+  assert.match(planning, /gridSize = 7/);
+  assert.match(planning, /不代表滑坡概率/);
 });
 
 test("adds on-demand hourly weather to event details and satellite tasks", async () => {

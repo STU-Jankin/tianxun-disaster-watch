@@ -17,6 +17,19 @@ import { cycloneTaskAoiSlices, cycloneUncertaintyGeometry, cycloneWindGeometry, 
 import { weatherImagingWindows, type WeatherForecastReady, type WeatherForecastResponse } from "../lib/qweather";
 import { compactSatelliteTaskForSync } from "../lib/task-sync";
 import { antimeridianOutlineGeometry } from "../lib/geo-geometry";
+import {
+  defaultResponseEndpoints,
+  planRoadResponseScenario,
+  planResponseScenario,
+  responseRouteStatusLabel,
+  responseScenarioGeoJson,
+  type ResponseCoordinate,
+  type ResponseScenario,
+} from "../lib/response-routing";
+import { amapTravelModeLabels, type AmapRoadRoutingResponse, type AmapTravelMode } from "../lib/amap-routing";
+import { isRoadDisruptionList, normalizeRoadDisruptionGeoJson, roadDisruptionFeatureCollection, roadDisruptionKindLabel, type RoadDisruption, type RoadDisruptionRegistryEntry } from "../lib/response-disruptions";
+import { infrastructureKindLabel, isInfrastructureAssessment, type InfrastructureAssessment } from "../lib/osm-infrastructure";
+import { deriveLandslideWorkflow, landslideSarTemplates, type LandslideSarTemplate, type LandslideTerrainResult, type LandslideTerrainScreening } from "../lib/landslide-planning";
 
 type ApiResponse = {
   events: DisasterEvent[];
@@ -122,6 +135,17 @@ type SatelliteTask = {
   visibilityComputedAt?: string;
   incidenceAngleDeg?: number;
   offNadirAngleDeg?: number;
+  simulationLevel?: "orbit_only" | "sensor_model";
+  satelliteNoradId?: number;
+  closestApproachAt?: string;
+  closestSubpointLatitude?: number;
+  closestSubpointLongitude?: number;
+  minimumGroundTrackDistanceKm?: number;
+  orbitSearchRadiusKm?: number;
+  opportunityOrbitDirection?: "ascending" | "descending";
+  orbitDirectionPreference?: "ascending" | "descending" | "either";
+  referenceAcquisitionRequired?: boolean;
+  sarAnalysisMode?: "amplitude_change" | "insar_pair" | "amplitude_change_and_insar_pair";
 };
 
 type TaskSyncState = { state: "saving" | "synced" | "local" | "error"; message?: string };
@@ -139,11 +163,23 @@ type VisibilityWindow = {
   coveragePercent?: number;
   incidenceAngleDeg?: number;
   offNadirAngleDeg?: number;
+  orbitDirection?: "ascending" | "descending";
+  simulationLevel?: "orbit_only" | "sensor_model";
+  satelliteLabel?: string;
+  satelliteNoradId?: number;
+  closestApproachAt?: string;
+  closestSubpoint?: { latitude: number; longitude: number };
+  minimumGroundTrackDistanceKm?: number;
+  altitudeKm?: number;
+  searchRadiusKm?: number;
+  aoiRadiusKm?: number;
+  candidateThresholdKm?: number;
   constraintNotes?: string[];
 };
 
 type VisibilityState = {
   state: "idle" | "loading" | "ready" | "needs_config" | "error";
+  mode?: "orbit_only" | "sensor_model";
   message?: string;
   windows: VisibilityWindow[];
 };
@@ -180,6 +216,7 @@ type WeatherLoadState = {
 };
 
 const taskStorageKey = "tianxun-satellite-task-candidates-v1";
+const responseStorageKey = "tianxun-response-scenarios-v1";
 const payloadOptions = ["高分辨率光学", "宽幅光学", "多光谱", "高光谱", "SAR", "热红外", "微波辐射计", "激光雷达"];
 const aoiOptions: Array<{ id: AoiType; label: string }> = [
   { id: "source", label: "来源几何" },
@@ -224,7 +261,13 @@ export function Dashboard() {
   const [tasks, setTasks] = useState<SatelliteTask[]>([]);
   const [tasksHydrated, setTasksHydrated] = useState(false);
   const [taskPanelOpen, setTaskPanelOpen] = useState(false);
+  const [responsePanelOpen, setResponsePanelOpen] = useState(false);
+  const [responseEventId, setResponseEventId] = useState<string | null>(null);
+  const [responseScenarios, setResponseScenarios] = useState<ResponseScenario[]>([]);
+  const [responseHydrated, setResponseHydrated] = useState(false);
+  const [activeResponseScenarioId, setActiveResponseScenarioId] = useState<string | null>(null);
   const [confirmedAois, setConfirmedAois] = useState<Set<string>>(new Set());
+  const [landslideTerrain, setLandslideTerrain] = useState<Record<string, LandslideTerrainScreening>>({});
   const [taskSync, setTaskSync] = useState<Record<string, TaskSyncState>>({});
   const [taskStorageMode, setTaskStorageMode] = useState<TaskStorageMode>("loading");
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
@@ -233,13 +276,17 @@ export function Dashboard() {
   const [undoDraft, setUndoDraft] = useState<{ task: SatelliteTask; expiresAt: number } | null>(null);
   const undoDraftTimer = useRef<number | null>(null);
   const taskTriggerRef = useRef<HTMLButtonElement>(null);
+  const responseTriggerRef = useRef<HTMLButtonElement>(null);
   const previousTaskPanelOpen = useRef(false);
+  const previousResponsePanelOpen = useRef(false);
   const taskSaveTimers = useRef(new Map<string, number>());
   const taskSaveControllers = useRef(new Map<string, AbortController>());
   const taskMutationGeneration = useRef(new Map<string, number>());
   const tasksRef = useRef<SatelliteTask[]>([]);
   const closeTaskPanel = useCallback(() => { setTaskPanelOpen(false); }, []);
+  const closeResponsePanel = useCallback(() => { setResponsePanelOpen(false); }, []);
   const selectEvent = useCallback((event: DisasterEvent) => {
+    setActiveResponseScenarioId(null);
     setSelected(event);
     // At notebook/tablet widths the detail panel and 4D controls need the map
     // canvas. Keep a one-click event-list reopen affordance instead of
@@ -302,6 +349,11 @@ export function Dashboard() {
   }, [taskPanelOpen]);
 
   useEffect(() => {
+    if (previousResponsePanelOpen.current && !responsePanelOpen) responseTriggerRef.current?.focus();
+    previousResponsePanelOpen.current = responsePanelOpen;
+  }, [responsePanelOpen]);
+
+  useEffect(() => {
     const restore = window.setTimeout(async () => {
       let localTasks: SatelliteTask[] = [];
       try {
@@ -338,9 +390,31 @@ export function Dashboard() {
   }, []);
 
   useEffect(() => {
+    const restore = window.setTimeout(() => {
+      try {
+        const saved = window.localStorage.getItem(responseStorageKey);
+        if (saved) {
+          const parsed = JSON.parse(saved) as ResponseScenario[];
+          setResponseScenarios(parsed.filter(isResponseScenario).slice(0, 50));
+        }
+      } catch {
+        // 损坏的本机推演场景不能影响灾害监测和卫星任务主链。
+      } finally {
+        setResponseHydrated(true);
+      }
+    }, 0);
+    return () => window.clearTimeout(restore);
+  }, []);
+
+  useEffect(() => {
     if (!tasksHydrated) return;
     window.localStorage.setItem(taskStorageKey, JSON.stringify(tasks));
   }, [tasks, tasksHydrated]);
+
+  useEffect(() => {
+    if (!responseHydrated) return;
+    window.localStorage.setItem(responseStorageKey, JSON.stringify(responseScenarios.slice(0, 50)));
+  }, [responseHydrated, responseScenarios]);
 
   useEffect(() => {
     if (!tasksHydrated || !data?.events.length) return;
@@ -407,14 +481,44 @@ export function Dashboard() {
     setActiveTaskId(task.taskId);
   }, [saveTask]);
 
+  const addLandslideSarTasks = useCallback((event: DisasterEvent, terrain: LandslideTerrainScreening) => {
+    const generated = createLandslideSarTasks(event, terrain);
+    const existingDirections = new Set(tasksRef.current.filter((task) => task.masterEventId === event.masterEventId).map((task) => task.orbitDirectionPreference));
+    const additions = generated.filter((task) => !existingDirections.has(task.orbitDirectionPreference));
+    if (!additions.length) {
+      setTaskPanelOpen(true);
+      setSelected(null);
+      return;
+    }
+    const next = [...additions, ...tasksRef.current];
+    tasksRef.current = next;
+    setTasks(next);
+    additions.forEach((task) => void saveTask(task).then((ok) => {
+      if (!ok) setTaskSync((current) => ({ ...current, [task.taskId]: current[task.taskId] ?? { state: "local", message: "仅保存在本机，可稍后重试同步" } }));
+    }));
+    setTaskPanelOpen(true);
+    setListOpen(false);
+    setSelected(null);
+    setActiveTaskId(additions[0].taskId);
+  }, [saveTask]);
+
   const updateTask = useCallback((taskId: string, patch: Partial<SatelliteTask>) => {
     const aoiKeys = ["aoiType", "aoiRadiusKm", "aoiWidthKm", "aoiHeightKm", "aoiLengthKm", "aoiBearingDeg", "customGeometry"];
     const touchesAoi = Object.keys(patch).some((key) => aoiKeys.includes(key));
+    const opportunityInputKeys = [...aoiKeys, "imagingStart", "imagingEnd", "sensors", "minimumCoveragePercent", "spatialResolutionMeters", "incidenceAngleMinDeg", "incidenceAngleMaxDeg", "orbitDirectionPreference"];
+    const invalidatesOpportunity = Object.keys(patch).some((key) => opportunityInputKeys.includes(key));
+    const opportunityReset: Partial<SatelliteTask> = invalidatesOpportunity ? {
+      satelliteId: undefined, instrumentId: undefined, imagingMode: undefined, opportunityId: undefined,
+      orbitVersion: undefined, visibilityComputedAt: undefined, incidenceAngleDeg: undefined, offNadirAngleDeg: undefined,
+      simulationLevel: undefined, satelliteNoradId: undefined, closestApproachAt: undefined,
+      closestSubpointLatitude: undefined, closestSubpointLongitude: undefined, minimumGroundTrackDistanceKm: undefined,
+      orbitSearchRadiusKm: undefined, opportunityOrbitDirection: undefined,
+    } : {};
     taskMutationGeneration.current.set(taskId, (taskMutationGeneration.current.get(taskId) ?? 0) + 1);
     taskSaveControllers.current.get(taskId)?.abort();
     setTasks((current) => current.map((task) => {
       if (task.taskId !== taskId) return task;
-      return { ...task, ...patch, ...(touchesAoi ? { aoiApproval: "operator_confirmed" as const, approvalReason: "操作员调整 AOI 参数" } : {}), updatedAt: new Date().toISOString() };
+      return { ...task, ...opportunityReset, ...patch, ...(touchesAoi ? { aoiApproval: "operator_confirmed" as const, approvalReason: "操作员调整 AOI 参数" } : {}), updatedAt: new Date().toISOString() };
     }));
     const priorTimer = taskSaveTimers.current.get(taskId);
     if (priorTimer) window.clearTimeout(priorTimer);
@@ -560,8 +664,41 @@ export function Dashboard() {
   const runtimeMode = !data ? "正在连接" : data.fallback && data.retainedCount > 0 ? "缓存模式" : data.fallback ? "演示模式" : producingSourceCount === 0 ? "无事件产出" : data.persistenceAvailable === false ? "数据库降级" : "实时监测中";
   const modeStale = runtimeMode !== "实时监测中" || Boolean(lastRefreshErrorAt);
   const activeTask = tasks.find((task) => task.taskId === activeTaskId) ?? null;
+  const activeResponseScenario = responseScenarios.find((scenario) => scenario.scenarioId === activeResponseScenarioId) ?? null;
+  const responsePlanningEvent = responseEventId ? deduplicatedEvents.find((event) => event.masterEventId === responseEventId || event.id === responseEventId) ?? null : null;
+  const openResponsePlanner = useCallback((event?: DisasterEvent) => {
+    document.querySelectorAll<HTMLDetailsElement>("details[open]").forEach((details) => { details.open = false; });
+    setTaskPanelOpen(false);
+    setActiveTaskId(null);
+    setResponseEventId(event?.masterEventId ?? null);
+    setResponsePanelOpen(true);
+    setListOpen(false);
+    if (event) setSelected(null);
+  }, []);
+  const saveResponseScenario = useCallback((scenario: ResponseScenario) => {
+    setResponseScenarios((current) => [scenario, ...current.filter((item) => item.scenarioId !== scenario.scenarioId)].slice(0, 50));
+    setActiveResponseScenarioId(scenario.scenarioId);
+  }, []);
+  const reviewResponseScenario = useCallback((scenarioId: string) => {
+    const scenario = responseScenarios.find((item) => item.scenarioId === scenarioId);
+    if (!scenario) return;
+    const event = deduplicatedEvents.find((item) => item.masterEventId === scenario.masterEventId);
+    setActiveTaskId(null);
+    setActiveResponseScenarioId(scenarioId);
+    setResponsePanelOpen(false);
+    setSelected(event ?? null);
+    if (window.matchMedia("(max-width: 1050px)").matches) setListOpen(false);
+  }, [deduplicatedEvents, responseScenarios]);
+  const removeResponseScenario = useCallback((scenarioId: string) => {
+    setResponseScenarios((current) => current.filter((scenario) => scenario.scenarioId !== scenarioId));
+    if (activeResponseScenarioId === scenarioId) setActiveResponseScenarioId(null);
+  }, [activeResponseScenarioId]);
+  const selectResponseRoute = useCallback((scenarioId: string, routeId: string) => {
+    setResponseScenarios((current) => current.map((scenario) => scenario.scenarioId === scenarioId ? { ...scenario, selectedRouteId: routeId, updatedAt: new Date().toISOString() } : scenario));
+  }, []);
   const reviewTaskAoi = useCallback((taskId: string) => {
     setActiveTaskId(taskId);
+    setActiveResponseScenarioId(null);
     setSelected(null);
     setTaskPanelOpen(false);
     if (window.matchMedia("(max-width: 720px)").matches) setListOpen(false);
@@ -574,10 +711,11 @@ export function Dashboard() {
       ...(normalized && requestedType !== "multi" ? { aoiType: normalized.type === "Polygon" ? "polygon" as const : "multi" as const } : {}),
     });
   }, [updateTask]);
+  const modalPanelOpen = taskPanelOpen || responsePanelOpen;
 
   return (
     <main className="app-shell">
-      <header className="topbar" inert={taskPanelOpen ? true : undefined} aria-hidden={taskPanelOpen || undefined}>
+      <header className="topbar" inert={modalPanelOpen ? true : undefined} aria-hidden={modalPanelOpen || undefined}>
         <div className="brand">
           <span className="brand-logo-frame" aria-hidden="true" />
           <div className="brand-copy"><strong>星联体·天巡灾情实时预报系统</strong><small>SATELLITE UNION · TIANXUN DISASTER NOWCAST</small></div>
@@ -592,14 +730,17 @@ export function Dashboard() {
             <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索事件或地区" aria-label="搜索事件或地区" />
           </label>
           <button className="icon-button" onClick={refresh} disabled={loading} title="立即刷新" aria-label="立即刷新">↻</button>
-          <button ref={taskTriggerRef} className="task-queue-button" onClick={() => { document.querySelectorAll<HTMLDetailsElement>("details[open]").forEach((details) => { details.open = false; }); setSelected(null); setListOpen(false); setTaskPanelOpen(true); }} aria-label={`打开卫星任务候选单，共${tasks.length}项`}>
+          <button ref={responseTriggerRef} className="response-queue-button" onClick={() => openResponsePlanner()} aria-label={`打开处置推演场景，共${responseScenarios.length}项`}>
+            处置推演 <b>{responseScenarios.length}</b>
+          </button>
+          <button ref={taskTriggerRef} className="task-queue-button" onClick={() => { document.querySelectorAll<HTMLDetailsElement>("details[open]").forEach((details) => { details.open = false; }); setResponsePanelOpen(false); setActiveResponseScenarioId(null); setSelected(null); setListOpen(false); setTaskPanelOpen(true); }} aria-label={`打开卫星任务候选单，共${tasks.length}项`}>
             任务候选 <b>{tasks.length}</b>
           </button>
           <div className="time-box"><strong>{chinaTime(clock)}</strong><small>UTC+08:00</small></div>
         </div>
       </header>
 
-      <section className="control-strip" inert={taskPanelOpen ? true : undefined} aria-hidden={taskPanelOpen || undefined}>
+      <section className="control-strip" inert={modalPanelOpen ? true : undefined} aria-hidden={modalPanelOpen || undefined}>
         <div className="scope-tabs" aria-label="重点观测范围">
           <span className="strip-label">重点范围</span>
           {scopeOrder.map((id, index) => (
@@ -608,11 +749,11 @@ export function Dashboard() {
             </button>
           ))}
         </div>
-        <SourceStatusPanel sources={data?.sourceStatus ?? []} forceClosed={taskPanelOpen} />
+        <SourceStatusPanel sources={data?.sourceStatus ?? []} forceClosed={modalPanelOpen} />
       </section>
 
-      <section className={`workspace ${taskPanelOpen ? "tasks-open" : ""}`}>
-        <aside className={`event-panel ${listOpen ? "open" : "closed"}`} inert={taskPanelOpen ? true : undefined} aria-hidden={taskPanelOpen || undefined}>
+      <section className={`workspace ${modalPanelOpen ? "tasks-open" : ""} ${responsePanelOpen ? "response-open" : ""}`}>
+        <aside className={`event-panel ${listOpen ? "open" : "closed"}`} inert={modalPanelOpen ? true : undefined} aria-hidden={modalPanelOpen || undefined}>
           <div className="panel-heading">
             <div><p>{scopes[scope].label} · {runtimeMode}</p><h1>{filtered.length}<span> 个可观测事件</span></h1></div>
             <button onClick={() => setListOpen(false)} aria-label="收起列表">‹</button>
@@ -643,19 +784,22 @@ export function Dashboard() {
           </footer>
         </aside>
 
-        {!listOpen && <button className="reopen-panel" onClick={() => setListOpen(true)} inert={taskPanelOpen ? true : undefined} aria-hidden={taskPanelOpen || undefined}>事件列表 <b>{filtered.length}</b> ›</button>}
+        {!listOpen && <button className="reopen-panel" onClick={() => setListOpen(true)} inert={modalPanelOpen ? true : undefined} aria-hidden={modalPanelOpen || undefined}>事件列表 <b>{filtered.length}</b> ›</button>}
 
-          <MapView scope={scope} events={filtered} selected={selected} activeTask={activeTask} fleet={fleet} detailOpen={Boolean(selected) && !taskPanelOpen} layoutKey={`${taskPanelOpen}-${listOpen}`} obscured={taskPanelOpen} onSelect={selectEvent} onCustomAoiChange={updateCustomAoi} onReturnToTask={() => setTaskPanelOpen(true)} />
+          <MapView scope={scope} events={filtered} selected={selected} terrainScreening={selected ? landslideTerrain[selected.masterEventId] : undefined} activeTask={activeTask} activeResponseScenario={activeResponseScenario} fleet={fleet} detailOpen={Boolean(selected) && !modalPanelOpen && !activeResponseScenario} layoutKey={`${modalPanelOpen}-${listOpen}-${activeResponseScenario?.scenarioId ?? "none"}`} obscured={modalPanelOpen} onSelect={selectEvent} onCustomAoiChange={updateCustomAoi} onReturnToTask={() => setTaskPanelOpen(true)} onReturnToResponse={() => setResponsePanelOpen(true)} />
 
-        <div className="map-legend" inert={taskPanelOpen ? true : undefined} aria-hidden={taskPanelOpen || undefined}>
+        <div className="map-legend" inert={modalPanelOpen ? true : undefined} aria-hidden={modalPanelOpen || undefined}>
           <span><i className="red" />红色</span><span><i className="orange" />橙色</span><span><i className="yellow" />黄色</span><span><i className="blue" />蓝色</span>
           <em />
           <span className="priority-ring">◎</span><span>重点范围加权</span>
           {selected?.cycloneForecast ? <><em /><span><i className="forecast-track-key" />官方路径</span><span><i className="forecast-impact-key" />风圈范围</span><span><i className="forecast-uncertainty-key" />路径不确定区</span></> : null}
+          {selected && landslideTerrain[selected.masterEventId] ? <><em /><span><i className="landslide-terrain-key" />DEM 地形筛查 AOI</span></> : null}
+          {activeResponseScenario ? <><em /><span><i className="response-route-clear-key" />未检出相交</span><span><i className="response-route-limited-key" />影响区内撤离</span><span><i className="response-route-blocked-key" />禁用/未核验</span>{activeResponseScenario.infrastructureFeatures?.length ? <span><i className="infrastructure-exposure-key" />OSM 设施暴露</span> : null}</> : null}
         </div>
 
-        {selected && <DetailPanel event={selected} nowMs={clock} obscured={taskPanelOpen} dispatchBlocked={modeStale} locationZh={locationZh[selected.id]} locationLoading={locationLoading === selected.id} locationState={locationState[selected.id]?.state} onRetryLocation={() => { setLocationState((current) => { const next = { ...current }; delete next[selected.id]; return next; }); setLocationRetry((value) => value + 1); }} taskAdded={tasks.some((task) => taskMatchesEvent(task, selected))} aoiConfirmed={confirmedAois.has(selected.masterEventId)} onConfirmAoi={(confirmed) => setConfirmedAois((current) => { const next = new Set(current); if (confirmed) next.add(selected.masterEventId); else next.delete(selected.masterEventId); return next; })} onAddTask={addTask} onClose={() => setSelected(null)} />}
+        {selected && !activeResponseScenario && <DetailPanel event={selected} nowMs={clock} obscured={modalPanelOpen} dispatchBlocked={modeStale} locationZh={locationZh[selected.id]} locationLoading={locationLoading === selected.id} locationState={locationState[selected.id]?.state} onRetryLocation={() => { setLocationState((current) => { const next = { ...current }; delete next[selected.id]; return next; }); setLocationRetry((value) => value + 1); }} taskAdded={tasks.some((task) => taskMatchesEvent(task, selected))} landslideTemplateCount={new Set(tasks.filter((task) => task.masterEventId === selected.masterEventId && ["ascending", "descending"].includes(String(task.orbitDirectionPreference))).map((task) => task.orbitDirectionPreference)).size} terrainScreening={landslideTerrain[selected.masterEventId]} onTerrainChange={(terrain) => setLandslideTerrain((current) => { const next = { ...current }; if (terrain) next[selected.masterEventId] = terrain; else delete next[selected.masterEventId]; return next; })} aoiConfirmed={confirmedAois.has(selected.masterEventId)} onConfirmAoi={(confirmed) => setConfirmedAois((current) => { const next = new Set(current); if (confirmed) next.add(selected.masterEventId); else next.delete(selected.masterEventId); return next; })} onAddTask={addTask} onAddLandslideTasks={addLandslideSarTasks} onResponsePlan={openResponsePlanner} onClose={() => setSelected(null)} />}
         {taskPanelOpen && <TaskPanel tasks={tasks} syncState={taskSync} storageMode={taskStorageMode} fleet={fleet} activeTaskId={activeTaskId} onActivate={reviewTaskAoi} onUpdate={updateTask} onRemove={(taskId) => void removeTask(taskId)} onClose={closeTaskPanel} onRetry={(task) => void saveTask(task)} />}
+        {responsePanelOpen && <ResponsePlanPanel event={responsePlanningEvent} events={deduplicatedEvents} scenarios={responseScenarios} activeScenarioId={activeResponseScenarioId} onSave={saveResponseScenario} onActivate={reviewResponseScenario} onSelectRoute={selectResponseRoute} onRemove={removeResponseScenario} onChooseEvent={(event) => setResponseEventId(event.masterEventId)} onClose={closeResponsePanel} />}
         {undoDraft ? <div className="task-undo-toast" role="status"><span>已删除本机草稿：{undoDraft.task.title}</span><button onClick={restoreDraft}>撤销</button></div> : null}
       </section>
     </main>
@@ -740,13 +884,15 @@ function EventCard({ event, active, onClick }: { event: DisasterEvent; active: b
   </button>;
 }
 
-function MapView({ scope, events, selected, activeTask, fleet, detailOpen, layoutKey, obscured, onSelect, onCustomAoiChange, onReturnToTask }: { scope: ScopeId; events: DisasterEvent[]; selected: DisasterEvent | null; activeTask: SatelliteTask | null; fleet: SatelliteFleetState; detailOpen: boolean; layoutKey: string; obscured: boolean; onSelect: (event: DisasterEvent) => void; onCustomAoiChange: (taskId: string, geometry?: CustomAoiGeometry) => void; onReturnToTask: () => void }) {
+function MapView({ scope, events, selected, terrainScreening, activeTask, activeResponseScenario, fleet, detailOpen, layoutKey, obscured, onSelect, onCustomAoiChange, onReturnToTask, onReturnToResponse }: { scope: ScopeId; events: DisasterEvent[]; selected: DisasterEvent | null; terrainScreening?: LandslideTerrainScreening; activeTask: SatelliteTask | null; activeResponseScenario: ResponseScenario | null; fleet: SatelliteFleetState; detailOpen: boolean; layoutKey: string; obscured: boolean; onSelect: (event: DisasterEvent) => void; onCustomAoiChange: (taskId: string, geometry?: CustomAoiGeometry) => void; onReturnToTask: () => void; onReturnToResponse: () => void }) {
   const bbox = scopes[scope].bbox;
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<import("leaflet").Map | null>(null);
   const markerLayerRef = useRef<import("leaflet").LayerGroup | null>(null);
   const selectedLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const aoiLayerRef = useRef<import("leaflet").GeoJSON | null>(null);
+  const opportunityLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
+  const responseLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const drawPreviewLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const orbitLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const scopeRef = useRef(scope);
@@ -803,6 +949,8 @@ function MapView({ scope, events, selected, activeTask, fleet, detailOpen, layou
       L.control.zoom({ position: "topright" }).addTo(map);
       markerLayerRef.current = L.layerGroup().addTo(map);
       selectedLayerRef.current = L.featureGroup().addTo(map);
+      opportunityLayerRef.current = L.featureGroup().addTo(map);
+      responseLayerRef.current = L.featureGroup().addTo(map);
       drawPreviewLayerRef.current = L.featureGroup().addTo(map);
       orbitLayerRef.current = L.featureGroup().addTo(map);
       mapRef.current = map;
@@ -826,6 +974,8 @@ function MapView({ scope, events, selected, activeTask, fleet, detailOpen, layou
       mapRef.current = null;
       markerLayerRef.current = null;
       selectedLayerRef.current = null;
+      opportunityLayerRef.current = null;
+      responseLayerRef.current = null;
       drawPreviewLayerRef.current = null;
       orbitLayerRef.current = null;
     };
@@ -840,11 +990,18 @@ function MapView({ scope, events, selected, activeTask, fleet, detailOpen, layou
       window.cancelAnimationFrame(frame);
       frame = window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
         map.invalidateSize({ pan: false });
-        if (activeTask) {
+        if (activeResponseScenario && responseLayerRef.current?.getBounds().isValid()) {
+          fitWithOverlay(map, responseLayerRef.current.getBounds(), 11);
+        } else if (activeTask) {
           const layer = aoiLayerRef.current;
-          if (layer?.getBounds().isValid()) fitWithOverlay(map, layer.getBounds(), 11);
-        } else if (selected?.cycloneForecast && selectedLayerRef.current?.getBounds().isValid()) {
-          fitWithOverlay(map, selectedLayerRef.current.getBounds(), 7);
+          const bounds = layer?.getBounds();
+          const opportunityBounds = opportunityLayerRef.current?.getBounds();
+          if (bounds?.isValid()) {
+            if (opportunityBounds?.isValid()) bounds.extend(opportunityBounds);
+            fitWithOverlay(map, bounds, activeTask.simulationLevel === "orbit_only" ? 7 : 11);
+          }
+        } else if (selected && (selected.cycloneForecast || terrainScreening) && selectedLayerRef.current?.getBounds().isValid()) {
+          fitWithOverlay(map, selectedLayerRef.current.getBounds(), selected.cycloneForecast ? 7 : 11);
         } else if (selected) centerWithOverlay(map, selected.latitude, selected.longitude, Math.max(map.getZoom(), scope === "global" ? 4 : map.getZoom()));
         else map.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], { padding: [24, 24], animate: false });
         selectedLayerRef.current?.eachLayer((selectedLayer) => {
@@ -856,7 +1013,7 @@ function MapView({ scope, events, selected, activeTask, fleet, detailOpen, layou
     observer.observe(container);
     restoreView();
     return () => { observer.disconnect(); window.cancelAnimationFrame(frame); };
-  }, [activeTask, bbox, centerWithOverlay, fitWithOverlay, layoutKey, mapReady, scope, selected]);
+  }, [activeResponseScenario, activeTask, bbox, centerWithOverlay, fitWithOverlay, layoutKey, mapReady, scope, selected, terrainScreening]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -1052,6 +1209,14 @@ function MapView({ scope, events, selected, activeTask, fleet, detailOpen, layou
           interactive: false,
         }).addTo(layer);
       }
+      if (terrainScreening) {
+        const terrainLayer = L.geoJSON(terrainScreening.geometry as GeoJSON.GeoJsonObject, {
+          style: { color: "#9a5a10", weight: 1.5, fillColor: "#f2b84b", fillOpacity: 0.22, dashArray: "3 3", className: "landslide-terrain-screening" },
+          interactive: true,
+        });
+        terrainLayer.bindTooltip(`DEM 地形筛查 AOI · ${terrainScreening.selectedCellCount} 个格网 · 最大近似坡度 ${terrainScreening.maximumSlopeDeg}°`, { sticky: true });
+        terrainLayer.addTo(layer);
+      }
       if (forecast?.impactGeometry && !forecast.impactField) {
         addCycloneArea(forecast.impactGeometry, selected.longitude, {
           color: "#c15624", weight: 1.5, fillColor: "#e58a42", fillOpacity: 0.16, className: "cyclone-impact-area",
@@ -1106,18 +1271,18 @@ function MapView({ scope, events, selected, activeTask, fleet, detailOpen, layou
         });
       }
       L.circleMarker([selected.latitude, selected.longitude], { radius: 20, color: "#087bd3", weight: 3, fill: false, interactive: false, className: "selected-event-ring" }).addTo(layer);
-      if (!activeTask && layer.getBounds().isValid() && (forecast || (selected.geometry && selected.geometry.type !== "Point"))) fitWithOverlay(map, layer.getBounds(), forecast ? 7 : 9);
+      if (!activeTask && layer.getBounds().isValid() && (forecast || terrainScreening || (selected.geometry && selected.geometry.type !== "Point"))) fitWithOverlay(map, layer.getBounds(), forecast ? 7 : terrainScreening ? 11 : 9);
     });
     return () => { cancelled = true; };
-  }, [activeTask, fitWithOverlay, forecastFrameIndex, mapReady, selected]);
+  }, [activeTask, fitWithOverlay, forecastFrameIndex, mapReady, selected, terrainScreening]);
 
   useEffect(() => {
-    if (!mapReady || !selected || selected.cycloneForecast || (selected.geometry && selected.geometry.type !== "Point") || !mapRef.current) return;
+    if (!mapReady || !selected || selected.cycloneForecast || terrainScreening || (selected.geometry && selected.geometry.type !== "Point") || !mapRef.current) return;
     const map = mapRef.current;
     const targetZoom = Math.max(map.getZoom(), scope === "global" ? 4 : map.getZoom());
     if (detailOpen) centerWithOverlay(map, selected.latitude, selected.longitude, targetZoom);
     else map.flyTo([selected.latitude, selected.longitude], targetZoom, { animate: true, duration: 0.45 });
-  }, [centerWithOverlay, detailOpen, mapReady, scope, selected]);
+  }, [centerWithOverlay, detailOpen, mapReady, scope, selected, terrainScreening]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -1133,10 +1298,93 @@ function MapView({ scope, events, selected, activeTask, fleet, detailOpen, layou
       const layer = L.geoJSON(geometry as GeoJSON.GeoJsonObject, { style: { color: "#006d63", weight: 2, fillColor: "#46a795", fillOpacity: 0.18, dashArray: "6 4" } }).addTo(map);
       aoiLayerRef.current = layer;
       const bounds = layer.getBounds();
-      if (bounds.isValid()) map.fitBounds(bounds, { padding: [32, 32], maxZoom: 11 });
+      if (bounds.isValid() && activeTask.simulationLevel !== "orbit_only") map.fitBounds(bounds, { padding: [32, 32], maxZoom: 11 });
     });
     return () => { cancelled = true; };
   }, [activeTask, mapReady]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    const layer = opportunityLayerRef.current;
+    if (!mapReady || !map || !layer) return;
+    layer.clearLayers();
+    if (activeTask?.simulationLevel !== "orbit_only" || !activeTask.closestApproachAt || !activeTask.satelliteNoradId) return;
+    const satellite = fleet.satellites.find((candidate) => candidate.noradId === activeTask.satelliteNoradId && candidate.orbitStatus === "current" && candidate.tleLine1 && candidate.tleLine2);
+    if (!satellite) return;
+    let cancelled = false;
+    void Promise.all([import("leaflet"), import("../lib/orbit-simulation")]).then(([L, orbit]) => {
+      if (cancelled) return;
+      const at = new Date(activeTask.closestApproachAt!);
+      const position = orbit.propagateTle(satellite.tleLine1!, satellite.tleLine2!, at);
+      if (!position) return;
+      // Keep the review overlay close to the actual coarse-screening interval;
+      // a full orbital arc would dwarf the AOI and falsely resemble a swath.
+      const track = orbit.buildGroundTrack(satellite.tleLine1!, satellite.tleLine2!, at, 2, 2, 15);
+      [...track.past, ...track.future].forEach((segment) => L.polyline(segment.map(([latitude, longitude]) => [latitude, unwrapLongitudeNear(longitude, activeTask.longitude)]), { color: "#6546b3", weight: 3, opacity: 0.92, dashArray: "8 4", interactive: false, className: "selected-opportunity-track" }).addTo(layer));
+      const radiusKm = activeTask.orbitSearchRadiusKm ?? 350;
+      const searchCircle = L.circle([position.latitude, position.longitude], { radius: radiusKm * 1_000, color: "#6546b3", weight: 2, fillColor: "#8d78cf", fillOpacity: 0.08, dashArray: "6 5", className: "selected-opportunity-search-circle" });
+      searchCircle.bindTooltip(`TLE 轨道粗筛搜索圈 · 半径 ${radiusKm} km（不是 SAR 幅宽）`, { sticky: true });
+      searchCircle.addTo(layer);
+      const closestMarker = L.circleMarker([position.latitude, position.longitude], { radius: 7, color: "#6546b3", weight: 3, fillColor: "#fff", fillOpacity: 1, className: "selected-opportunity-subpoint" });
+      closestMarker.bindTooltip(`${satellite.interfaceName || satellite.commonName} · 最近子星点 · ${formatTimeWithYear(position.at)} UTC+08 · ${position.direction === "ascending" ? "升轨" : "降轨"} · 距 AOI 中心约 ${activeTask.minimumGroundTrackDistanceKm ?? "--"} km`, { direction: "top" });
+      closestMarker.addTo(layer);
+      const bounds = layer.getBounds();
+      const aoiBounds = aoiLayerRef.current?.getBounds();
+      if (aoiBounds?.isValid()) bounds.extend(aoiBounds);
+      if (bounds.isValid()) fitWithOverlay(map, bounds, 7);
+    }).catch(() => setMapError("已选 TLE 轨道机会无法绘制；AOI 和任务字段仍可使用。"));
+    return () => { cancelled = true; layer.clearLayers(); };
+  }, [activeTask, fitWithOverlay, fleet.satellites, mapReady]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    const layer = responseLayerRef.current;
+    if (!mapReady || !map || !layer) return;
+    let cancelled = false;
+    void import("leaflet").then((L) => {
+      if (cancelled) return;
+      layer.clearLayers();
+      if (!activeResponseScenario) return;
+      const referenceLongitude = activeResponseScenario.origin[0];
+      activeResponseScenario.routes.forEach((route) => {
+        const color = route.status === "clear" ? "#14825f" : route.status === "limited" ? "#d18119" : route.status === "blocked" ? "#c43d35" : "#7869a8";
+        const selectedRoute = route.routeId === activeResponseScenario.selectedRouteId;
+        const routeLayer = L.geoJSON(unwrapForecastGeometry(route.geometry, referenceLongitude) as GeoJSON.GeoJsonObject, {
+          style: { color, weight: selectedRoute ? 6 : 3, opacity: selectedRoute ? 0.95 : 0.55, dashArray: route.status === "unverified" ? "7 5" : route.status === "blocked" ? "4 5" : undefined, className: `response-route ${route.status}${selectedRoute ? " selected" : ""}` },
+          interactive: true,
+        });
+        routeLayer.bindTooltip(`${route.label} · ${responseRouteStatusLabel(route.status)} · ${route.distanceKm.toFixed(1)} km`, { sticky: true });
+        routeLayer.addTo(layer);
+      });
+      (activeResponseScenario.roadDisruptions ?? []).forEach((disruption) => {
+        const verified = disruption.verification === "verified";
+        const color = disruption.impact === "blocked" ? "#a72222" : "#c78327";
+        const disruptionLayer = L.geoJSON(unwrapForecastGeometry(disruption.geometry as DisasterEvent["geometry"], referenceLongitude) as GeoJSON.GeoJsonObject, {
+          style: { color, weight: verified ? 4 : 3, opacity: verified ? 0.95 : 0.7, fillColor: color, fillOpacity: 0.2, dashArray: verified ? undefined : "6 5", className: `road-disruption ${disruption.impact} ${disruption.verification}` },
+          pointToLayer: (_feature, latlng) => L.circleMarker(latlng, { radius: Math.max(6, Math.min(16, disruption.radiusMeters / 25)), color, weight: verified ? 4 : 3, fillColor: color, fillOpacity: 0.35, dashArray: verified ? undefined : "5 4", className: `road-disruption ${disruption.impact} ${disruption.verification}` }),
+          interactive: true,
+        });
+        disruptionLayer.bindTooltip(`${roadDisruptionKindLabel(disruption.kind)} · ${disruption.label} · ${verified ? "已核验" : "上报待核验"}`, { sticky: true });
+        disruptionLayer.addTo(layer);
+      });
+      (activeResponseScenario.infrastructureFeatures ?? []).forEach((feature) => {
+        const color = feature.kind === "bridge" ? "#6847a6" : feature.kind === "tunnel" ? "#334b73" : "#087fa1";
+        const infrastructureLayer = L.geoJSON(unwrapForecastGeometry(feature.geometry as DisasterEvent["geometry"], referenceLongitude) as GeoJSON.GeoJsonObject, {
+          style: { color, weight: 5, opacity: 0.9, dashArray: feature.kind === "tunnel" ? "7 4" : undefined, className: `infrastructure-exposure ${feature.kind}` },
+          pointToLayer: (_feature, latlng) => L.circleMarker(latlng, { radius: 7, color: "#fff", weight: 2, fillColor: color, fillOpacity: 0.95, className: `infrastructure-exposure ${feature.kind}` }),
+          interactive: true,
+        });
+        infrastructureLayer.bindTooltip(`${infrastructureKindLabel(feature.kind)} · ${feature.label.replace(/^.*? · /, "")} · OSM 标注，结构状态未知`, { sticky: true });
+        infrastructureLayer.addTo(layer);
+      });
+      const marker = (coordinate: ResponseCoordinate, label: string, color: string) => L.circleMarker([coordinate[1], coordinate[0]], { radius: 7, color: "#fff", weight: 2, fillColor: color, fillOpacity: 1, className: "response-endpoint" }).bindTooltip(label, { direction: "top" }).addTo(layer);
+      marker(activeResponseScenario.origin, "撤离起点", "#075fa8");
+      marker(activeResponseScenario.destination, "参考目的地", "#14825f");
+      const bounds = layer.getBounds();
+      if (bounds.isValid()) fitWithOverlay(map, bounds, 11);
+    });
+    return () => { cancelled = true; };
+  }, [activeResponseScenario, fitWithOverlay, mapReady]);
 
   const finishCustomPolygon = useCallback(() => {
     if (!activeTask || activeDraftVertices.length < 3) {
@@ -1157,6 +1405,7 @@ function MapView({ scope, events, selected, activeTask, fleet, detailOpen, layou
 
   const forecastFrames = selected?.cycloneForecast?.impactField?.frames ?? [];
   const activeForecastFrame = forecastFrames[Math.min(forecastFrameIndex, Math.max(0, forecastFrames.length - 1))];
+  const activeResponseRoute = activeResponseScenario?.routes.find((route) => route.routeId === activeResponseScenario.selectedRouteId) ?? activeResponseScenario?.routes[0];
 
   return <div className="map-stage" inert={obscured ? true : undefined} aria-hidden={obscured || undefined}>
     <div ref={containerRef} className="leaflet-map" aria-label={`${scopes[scope].label}灾害事件地图`} />
@@ -1170,7 +1419,7 @@ function MapView({ scope, events, selected, activeTask, fleet, detailOpen, layou
       <small>{activeForecastFrame.windFields.length ? activeForecastFrame.windFields.map((field) => `≥${field.thresholdKnots} kt 象限风圈`).join(" · ") : "本时次无可用官方风圈"} · {activeForecastFrame.uncertaintyRadiusKm || activeForecastFrame.uncertaintyGeometry ? "含分时不确定区" : selected?.cycloneForecast?.uncertaintyGeometry ? "显示本报次总体不确定区" : "无不确定区数据"}</small>
     </div> : null}
     {activeTask ? <div className="map-review-toolbar" role="group" aria-label="任务AOI地图复核">
-      <div><strong>{activeTask.title}</strong><span>{["polygon", "multi"].includes(activeTask.aoiType) ? `${customAoiPartCount(activeTask.customGeometry)} 块自定义 AOI` : "正在显示任务 AOI"}</span></div>
+      <div><strong>{activeTask.title}</strong><span>{["polygon", "multi"].includes(activeTask.aoiType) ? `${customAoiPartCount(activeTask.customGeometry)} 块自定义 AOI` : "正在显示任务 AOI"}{activeTask.simulationLevel === "orbit_only" ? ` · TLE 轨道粗筛 · 最近约 ${activeTask.minimumGroundTrackDistanceKm ?? "--"} km` : ""}</span></div>
       {["polygon", "multi"].includes(activeTask.aoiType) ? <>
         <button onClick={() => { setDrawingTaskId(activeTask.taskId); setDrawing(true); setDraftVertices([]); setDrawingError(""); }}>{activeTask.aoiType === "multi" && activeTask.customGeometry ? "添加子区" : "开始绘制"}</button>
         <button onClick={() => setDraftVertices((current) => current.slice(0, -1))} disabled={!activeDrawing || !activeDraftVertices.length}>撤销顶点</button>
@@ -1181,11 +1430,16 @@ function MapView({ scope, events, selected, activeTask, fleet, detailOpen, layou
       {activeDrawing ? <small>在地图依次点击边界顶点，完成后点击“完成当前面”。{activeDraftVertices.length} 个顶点。</small> : null}
       {drawingError ? <small className="drawing-error" role="alert">{drawingError}</small> : null}
     </div> : null}
+    {!activeTask && activeResponseScenario && activeResponseRoute ? <div className="map-review-toolbar response-review-toolbar" role="group" aria-label="处置推演路线复核">
+      <div><strong>{activeResponseScenario.title}</strong><span>{amapTravelModeLabels[activeResponseScenario.travelMode ?? "driving"]} · {activeResponseRoute.label} · {responseRouteStatusLabel(activeResponseRoute.status)} · {activeResponseRoute.distanceKm.toFixed(1)} km / 约 {activeResponseRoute.estimatedMinutes} 分钟{activeResponseRoute.disruptionConflicts?.length ? ` · 中断冲突 ${activeResponseRoute.disruptionConflicts.length}` : ""}{activeResponseRoute.infrastructureCrossings?.length ? ` · 设施穿越 ${activeResponseRoute.infrastructureCrossings.length}` : ""}</span></div>
+      <button onClick={onReturnToResponse}>返回推演场景</button>
+      <small>{activeResponseScenario.disclaimer}</small>
+    </div> : null}
     {mapError ? <div className="map-error" role="alert">{mapError}<button onClick={() => window.location.reload()}>重试</button></div> : null}
   </div>;
 }
 
-function DetailPanel({ event, nowMs, obscured, dispatchBlocked, locationZh, locationLoading, locationState, onRetryLocation, taskAdded, aoiConfirmed, onConfirmAoi, onAddTask, onClose }: { event: DisasterEvent; nowMs: number; obscured: boolean; dispatchBlocked: boolean; locationZh?: string; locationLoading: boolean; locationState?: "resolved" | "fallback" | "error"; onRetryLocation: () => void; taskAdded: boolean; aoiConfirmed: boolean; onConfirmAoi: (confirmed: boolean) => void; onAddTask: (event: DisasterEvent, operatorConfirmed: boolean) => void; onClose: () => void }) {
+function DetailPanel({ event, nowMs, obscured, dispatchBlocked, locationZh, locationLoading, locationState, onRetryLocation, taskAdded, landslideTemplateCount, terrainScreening, onTerrainChange, aoiConfirmed, onConfirmAoi, onAddTask, onAddLandslideTasks, onResponsePlan, onClose }: { event: DisasterEvent; nowMs: number; obscured: boolean; dispatchBlocked: boolean; locationZh?: string; locationLoading: boolean; locationState?: "resolved" | "fallback" | "error"; onRetryLocation: () => void; taskAdded: boolean; landslideTemplateCount: number; terrainScreening?: LandslideTerrainScreening; onTerrainChange: (terrain?: LandslideTerrainScreening) => void; aoiConfirmed: boolean; onConfirmAoi: (confirmed: boolean) => void; onAddTask: (event: DisasterEvent, operatorConfirmed: boolean) => void; onAddLandslideTasks: (event: DisasterEvent, terrain: LandslideTerrainScreening) => void; onResponsePlan: (event: DisasterEvent) => void; onClose: () => void }) {
   const isDemo = event.source === "演示数据";
   const closeRef = useRef<HTMLButtonElement>(null);
   useEffect(() => { if (window.matchMedia("(max-width: 720px)").matches) closeRef.current?.focus(); }, [event.id]);
@@ -1193,6 +1447,7 @@ function DetailPanel({ event, nowMs, obscured, dispatchBlocked, locationZh, loca
   const cycloneForecastUsable = !event.cycloneForecast || Date.parse(event.cycloneForecast.forecastValidUntil) > nowMs + 3_600_000;
   const needsAoiReview = event.aoiApprovalRequired || !cycloneForecastUsable;
   const canDispatch = !dispatchBlocked && !isDemo && taskWindowValid && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived" && (!needsAoiReview || aoiConfirmed);
+  const canBuildTerrainTask = !dispatchBlocked && !isDemo && taskWindowValid && event.dispatchEligibility !== "blocked" && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived";
   return <aside className="detail-panel" aria-labelledby={`detail-title-${event.id}`} inert={obscured ? true : undefined} aria-hidden={obscured || undefined}>
     <button ref={closeRef} className="detail-close" onClick={onClose} aria-label="关闭详情">×</button>
     <div className={`detail-kicker ${event.severity}`}><span>{hazardMeta[event.hazard].symbol}</span>{hazardMeta[event.hazard].label} · {severityLabels[event.severity]} · {phenomenonLabels[event.phenomenonStage]}</div>
@@ -1214,6 +1469,7 @@ function DetailPanel({ event, nowMs, obscured, dispatchBlocked, locationZh, loca
     </div>
     <div className="observation-deadline"><span>{observationDeadlineLabel(event)}</span><strong>{remainingObservationTime(observationDeadline(event))}</strong><small>{event.observationRationale} 复核点 {formatTimeWithYear(event.observationReviewAt)}；有效期/归档点 {formatTimeWithYear(event.observationExpiresAt)} UTC+08。</small></div>
     <WeatherForecastCard latitude={event.latitude} longitude={event.longitude} maximumCloudPercent={30} />
+    {event.hazard === "landslide" ? <LandslidePlanningCard key={event.masterEventId} event={event} terrain={terrainScreening} templateCount={landslideTemplateCount} taskAllowed={canBuildTerrainTask} onTerrainChange={onTerrainChange} onAddTasks={(screening) => onAddLandslideTasks(event, screening)} /> : null}
     {event.cycloneForecast ? <section className="cyclone-forecast-card">
       <h3>官方台风预报 · {event.cycloneForecast.source}</h3>
       <div className="forecast-validity"><span>发布 {formatTimeWithYear(event.cycloneForecast.issuedAt)} UTC+08</span><span>有效至 {formatTimeWithYear(event.cycloneForecast.forecastValidUntil)} UTC+08</span></div>
@@ -1233,7 +1489,7 @@ function DetailPanel({ event, nowMs, obscured, dispatchBlocked, locationZh, loca
     <section><h3>观测目标</h3><div className="target-list">{event.observationTargets.map((target) => <span key={target}>{target}</span>)}</div></section>
     <section><h3>可选载荷</h3><div className="target-list">{payloadOptions.map((payload) => <span key={payload}>{payload}</span>)}</div></section>
     <section><h3>事件摘要</h3><p>{event.description || "暂无详细描述。"}</p></section>
-    <section className="evidence-chain"><h3>证据链</h3>{event.evidence.map((item) => <a key={`${item.source}-${item.sourceEventId}`} href={safeHttpUrl(item.sourceUrl)} target="_blank" rel="noreferrer"><span>{item.source}</span><small>{evidenceRoleLabel(item.role)} · {formatTime(item.observedAt)}</small></a>)}</section>
+    <section className="evidence-chain"><h3>证据链</h3>{event.evidence.map((item, index) => <a key={`${item.source}-${item.sourceEventId}-${item.role}-${index}`} href={safeHttpUrl(item.sourceUrl)} target="_blank" rel="noreferrer"><span>{item.source}</span><small>{evidenceRoleLabel(item.role)} · {formatTime(item.observedAt)}</small></a>)}</section>
     {event.updateCount > 1 ? <section className="update-history"><h3>过程更新 · 共 {event.updateCount} 期</h3>{event.updateHistory.slice(0, 8).map((item, index) => <a key={`${item.source}-${item.sourceEventId}`} href={safeHttpUrl(item.sourceUrl)} target="_blank" rel="noreferrer"><i>{index === 0 ? "最新" : String(event.updateCount - index).padStart(2, "0")}</i><span><strong>{item.title}</strong><small>{item.source} · {formatTimeWithYear(item.observedAt)}</small></span></a>)}</section> : null}
     <dl>
       <div><dt>{event.phenomenonStage === "observed" ? "发生时间" : "发布时间"}</dt><dd>{formatTimeWithYear(event.phenomenonStage === "observed" ? event.occurredAt : event.issuedAt)} UTC+08</dd></div>
@@ -1245,9 +1501,61 @@ function DetailPanel({ event, nowMs, obscured, dispatchBlocked, locationZh, loca
       <div><dt>数据来源</dt><dd>{event.source}</dd></div>
     </dl>
     <a className="source-link" href={safeHttpUrl(event.sourceUrl)} target="_blank" rel="noreferrer">查看权威来源 ↗</a>
+    <button className="response-plan-button" onClick={() => onResponsePlan(event)}>建立处置推演场景</button>
     {needsAoiReview ? <div className="aoi-approval"><input id={`aoi-confirm-${event.id}`} type="checkbox" checked={aoiConfirmed} onChange={(change) => onConfirmAoi(change.target.checked)} /><label htmlFor={`aoi-confirm-${event.id}`}><strong>人工核对 AOI</strong><small>{!cycloneForecastUsable ? "官方台风报次已不足一小时，不再作为预测 AOI；如需灾后复核，请在地图重新圈定实况 AOI。" : "地图已用绿色虚线显示完整来源几何；确认前请核对目标类型、范围和代表点误差。"}</small></label></div> : null}
     <button className="task-button" onClick={() => onAddTask(event, aoiConfirmed)} disabled={taskAdded || !canDispatch}>{taskAdded ? "已加入卫星任务候选" : dispatchBlocked ? "非实时/数据库降级状态禁止下发" : isDemo ? "演示事件禁止下发" : !taskWindowValid ? "观测期不足一小时，禁止建立任务" : !canDispatch ? "需先人工核对 AOI" : "加入卫星任务候选"}</button>
   </aside>;
+}
+
+function LandslidePlanningCard({ event, terrain, templateCount, taskAllowed, onTerrainChange, onAddTasks }: { event: DisasterEvent; terrain?: LandslideTerrainScreening; templateCount: number; taskAllowed: boolean; onTerrainChange: (terrain?: LandslideTerrainScreening) => void; onAddTasks: (terrain: LandslideTerrainScreening) => void }) {
+  const workflow = deriveLandslideWorkflow(event);
+  const [radiusKm, setRadiusKm] = useState(() => Math.min(20, Math.max(3, Number.isFinite(event.locationAccuracyKm) ? Math.ceil(event.locationAccuracyKm) : 10)));
+  const [load, setLoad] = useState<{ state: "idle" | "loading" | "error" | "flat"; message?: string }>({ state: "idle" });
+  const [terrainReviewed, setTerrainReviewed] = useState(false);
+
+  const requestTerrain = async () => {
+    setLoad({ state: "loading" });
+    setTerrainReviewed(false);
+    try {
+      const response = await fetch("/api/landslide-terrain", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ latitude: event.latitude, longitude: event.longitude, radiusKm }),
+      });
+      const result = await response.json() as LandslideTerrainResult;
+      if (!response.ok || result.state === "unavailable" || result.state === "unsupported") throw new Error("message" in result ? result.message : `地形请求失败（HTTP ${response.status}）`);
+      if (result.state === "flat") {
+        onTerrainChange(undefined);
+        setLoad({ state: "flat", message: result.message });
+        return;
+      }
+      onTerrainChange(result);
+      setLoad({ state: "idle" });
+    } catch (error) {
+      onTerrainChange(undefined);
+      setLoad({ state: "error", message: error instanceof Error ? error.message : "地形筛查失败" });
+    }
+  };
+
+  if (!workflow) return null;
+  return <section className="landslide-planning-card">
+    <div className="landslide-stage"><span>滑坡证据状态</span><strong>{workflow.label}</strong></div>
+    <p>{workflow.evidenceMeaning}</p>
+    <small>{workflow.dispatchRule}</small>
+    <div className="terrain-request">
+      <label>DEM 筛查半径（公里）<input type="number" min="1" max="20" value={radiusKm} onChange={(change) => setRadiusKm(clampNumber(change.target.value, 1, 20))} /></label>
+      <button onClick={() => void requestTerrain()} disabled={load.state === "loading"}>{load.state === "loading" ? "正在采样…" : terrain ? "重新生成地形 AOI" : "生成地形约束 AOI"}</button>
+    </div>
+    {load.message ? <p className={load.state === "error" ? "terrain-error" : "terrain-flat"} role={load.state === "error" ? "alert" : "status"}>{load.message}</p> : null}
+    {terrain ? <div className="terrain-result">
+      <div><strong>{terrain.selectedCellCount}</strong><span>候选格网</span></div><div><strong>{terrain.maximumSlopeDeg}°</strong><span>最大近似坡度</span></div><div><strong>≥{terrain.screeningThresholdDeg}°</strong><span>本轮筛查阈值</span></div>
+      <p>{terrain.note}</p>
+      <a href={safeHttpUrl(terrain.sourceUrl)} target="_blank" rel="noreferrer">{terrain.attribution} ↗</a>
+      <label className="terrain-confirm" htmlFor="landslide-terrain-confirm" aria-label="人工核对地形 AOI"><input id="landslide-terrain-confirm" type="checkbox" checked={terrainReviewed} onChange={(change) => setTerrainReviewed(change.target.checked)} /><span><b>人工核对地形 AOI</b><small>我已在地图核对代表点、范围和格网；知道该结果不是滑坡实况边界。</small></span></label>
+      <button className="landslide-template-button" disabled={!taskAllowed || !terrainReviewed || templateCount >= 2} onClick={() => onAddTasks(terrain)}>{templateCount >= 2 ? "升降轨 SAR 模板已建立" : !taskAllowed ? "当前数据状态禁止建立任务" : !terrainReviewed ? "核对后建立双向 SAR 任务" : "建立升轨 + 降轨 SAR 任务"}</button>
+      <small className="sar-template-note">两个候选均要求灾前参考影像、3 次重访和幅度变化 + InSAR 对比；最终轨向、入射角、阴影/叠掩仍由仿真窗口验证。</small>
+    </div> : null}
+  </section>;
 }
 
 function WeatherForecastCard({ latitude, longitude, maximumCloudPercent, compact = false, enabled = true, onRequest }: { latitude: number; longitude: number; maximumCloudPercent: number; compact?: boolean; enabled?: boolean; onRequest?: () => void }) {
@@ -1291,6 +1599,328 @@ function WeatherForecastCard({ latitude, longitude, maximumCloudPercent, compact
   </section>;
 }
 
+function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave, onActivate, onSelectRoute, onRemove, onChooseEvent, onClose }: {
+  event: DisasterEvent | null;
+  events: DisasterEvent[];
+  scenarios: ResponseScenario[];
+  activeScenarioId: string | null;
+  onSave: (scenario: ResponseScenario) => void;
+  onActivate: (scenarioId: string) => void;
+  onSelectRoute: (scenarioId: string, routeId: string) => void;
+  onRemove: (scenarioId: string) => void;
+  onChooseEvent: (event: DisasterEvent) => void;
+  onClose: () => void;
+}) {
+  const panelRef = useRef<HTMLElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const [originLongitude, setOriginLongitude] = useState("");
+  const [originLatitude, setOriginLatitude] = useState("");
+  const [destinationLongitude, setDestinationLongitude] = useState("");
+  const [destinationLatitude, setDestinationLatitude] = useState("");
+  const [departureAt, setDepartureAt] = useState(() => toLocalInput(new Date(Math.ceil(Date.now() / 60_000) * 60_000).toISOString()));
+  const [travelSpeed, setTravelSpeed] = useState("35");
+  const [travelMode, setTravelMode] = useState<AmapTravelMode>("driving");
+  const [roadDisruptions, setRoadDisruptions] = useState<RoadDisruption[]>([]);
+  const [registryDisruptions, setRegistryDisruptions] = useState<RoadDisruptionRegistryEntry[]>([]);
+  const [registryState, setRegistryState] = useState<"loading" | "operational-database" | "public-read-only" | "unavailable">("loading");
+  const [registryBusyId, setRegistryBusyId] = useState<string | null>(null);
+  const [disruptionError, setDisruptionError] = useState("");
+  const [planError, setPlanError] = useState("");
+  const [roadRoutingState, setRoadRoutingState] = useState<"idle" | "loading" | "ready" | "fallback">("idle");
+  const [infrastructureQueryState, setInfrastructureQueryState] = useState<"idle" | InfrastructureAssessment["state"]>("idle");
+  const effectiveRoadDisruptions = useMemo(() => {
+    const combined = new Map<string, RoadDisruption>();
+    for (const disruption of [...registryDisruptions, ...roadDisruptions]) combined.set(disruption.disruptionId, disruption);
+    return [...combined.values()];
+  }, [registryDisruptions, roadDisruptions]);
+
+  const refreshRoadRegistry = useCallback(async () => {
+    setRegistryState("loading");
+    try {
+      const response = await fetch("/api/road-disruptions", { cache: "no-store" });
+      const result = await response.json().catch(() => ({})) as { disruptions?: unknown; storage?: string; error?: string };
+      if (!response.ok) throw new Error(result.error || `道路中断台账读取失败（HTTP ${response.status}）`);
+      const disruptions = Array.isArray(result.disruptions) && isRoadDisruptionList(result.disruptions, 500) ? result.disruptions as RoadDisruptionRegistryEntry[] : [];
+      setRegistryDisruptions(disruptions.filter((item) => item.lifecycleStatus === "active"));
+      setRegistryState(result.storage === "public-read-only" ? "public-read-only" : "operational-database");
+    } catch (error) {
+      setRegistryDisruptions([]);
+      setRegistryState("unavailable");
+      setDisruptionError(error instanceof Error ? error.message : "道路中断台账读取失败");
+    }
+  }, []);
+
+  useEffect(() => {
+    closeRef.current?.focus();
+    const onKeyDown = (keyboardEvent: KeyboardEvent) => {
+      if (keyboardEvent.key === "Escape") onClose();
+      if (keyboardEvent.key !== "Tab" || !panelRef.current) return;
+      const focusable = [...panelRef.current.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), [href]')];
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (keyboardEvent.shiftKey && document.activeElement === first) { keyboardEvent.preventDefault(); last.focus(); }
+      else if (!keyboardEvent.shiftKey && document.activeElement === last) { keyboardEvent.preventDefault(); first.focus(); }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  useEffect(() => {
+    const start = window.setTimeout(() => { void refreshRoadRegistry(); }, 0);
+    return () => window.clearTimeout(start);
+  }, [refreshRoadRegistry]);
+
+  useEffect(() => {
+    if (!event) return;
+    const reset = window.setTimeout(() => {
+      const nextDeparture = new Date(Math.ceil(Date.now() / 60_000) * 60_000).toISOString();
+      const endpoints = defaultResponseEndpoints(event, nextDeparture);
+      setOriginLongitude(endpoints.origin[0].toFixed(6));
+      setOriginLatitude(endpoints.origin[1].toFixed(6));
+      setDestinationLongitude(endpoints.destination[0].toFixed(6));
+      setDestinationLatitude(endpoints.destination[1].toFixed(6));
+      setDepartureAt(toLocalInput(nextDeparture));
+      setPlanError("");
+      setRoadRoutingState("idle");
+      setInfrastructureQueryState("idle");
+      setRoadDisruptions([]);
+      setDisruptionError("");
+    }, 0);
+    return () => window.clearTimeout(reset);
+  }, [event]);
+
+  const routeInputs = () => ({
+    origin: [Number(originLongitude), Number(originLatitude)] as ResponseCoordinate,
+    destination: [Number(destinationLongitude), Number(destinationLatitude)] as ResponseCoordinate,
+    departureAt: fromLocalInput(departureAt),
+  });
+
+  const generateGeometric = () => {
+    if (!event) return;
+    setPlanError("");
+    try {
+      const inputs = routeInputs();
+      const scenario = planResponseScenario(event, {
+        eventRevision: eventRevisionFingerprint(event),
+        ...inputs,
+        travelSpeedKph: Number(travelSpeed),
+        travelMode,
+      });
+      onSave(scenario);
+      setRoadRoutingState("fallback");
+    } catch (error) {
+      setPlanError(error instanceof Error ? error.message : "推演参数无效");
+    }
+  };
+
+  const generateRoad = async () => {
+    if (!event || roadRoutingState === "loading") return;
+    setPlanError("");
+    setRoadRoutingState("loading");
+    setInfrastructureQueryState("idle");
+    try {
+      const inputs = routeInputs();
+      const validation = planResponseScenario(event, {
+        eventRevision: eventRevisionFingerprint(event),
+        ...inputs,
+        travelSpeedKph: Number(travelSpeed),
+        travelMode,
+      });
+      void validation;
+      const response = await fetch("/api/routing", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ origin: inputs.origin, destination: inputs.destination, mode: travelMode }),
+      });
+      const result = await response.json().catch(() => ({ state: "error", provider: "高德地图", message: `真实道路请求失败（HTTP ${response.status}）` })) as AmapRoadRoutingResponse;
+      if (!response.ok || result.state !== "ready") throw new Error(result.state === "ready" ? `真实道路请求失败（HTTP ${response.status}）` : result.message);
+      let infrastructure: InfrastructureAssessment;
+      try {
+        const infrastructureResponse = await fetch("/api/infrastructure", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ routes: result.routes.map((route) => ({ routeId: route.routeId, mode: route.mode, coordinates: route.coordinates })) }),
+        });
+        const infrastructurePayload = await infrastructureResponse.json().catch(() => null);
+        infrastructure = isInfrastructureAssessment(infrastructurePayload)
+          ? infrastructurePayload
+          : { state: "unavailable", provider: "OpenStreetMap · Overpass", message: `基础设施响应无效（HTTP ${infrastructureResponse.status}）` };
+      } catch (infrastructureError) {
+        infrastructure = { state: "unavailable", provider: "OpenStreetMap · Overpass", message: infrastructureError instanceof Error ? infrastructureError.message : "基础设施查询失败" };
+      }
+      const scenario = planRoadResponseScenario(event, {
+        eventRevision: eventRevisionFingerprint(event),
+        ...inputs,
+        roadRouting: result,
+        roadDisruptions: effectiveRoadDisruptions,
+        infrastructure,
+      });
+      onSave(scenario);
+      setInfrastructureQueryState(infrastructure.state);
+      setRoadRoutingState("ready");
+    } catch (error) {
+      setRoadRoutingState("idle");
+      setInfrastructureQueryState("idle");
+      setPlanError(`${error instanceof Error ? error.message : "真实道路请求失败"}；可使用下方几何降级模式继续推演。`);
+    }
+  };
+
+  const importRoadDisruptions = async (file: File | undefined) => {
+    if (!file) return;
+    setDisruptionError("");
+    try {
+      if (file.size > 512 * 1024) throw new Error("道路中断文件不能超过 512 KB");
+      const disruptions = normalizeRoadDisruptionGeoJson(JSON.parse(await file.text()));
+      setRoadDisruptions(disruptions);
+      setRoadRoutingState("idle");
+    } catch (error) {
+      setRoadDisruptions([]);
+      setDisruptionError(error instanceof Error ? error.message : "道路中断 GeoJSON 无效");
+    }
+  };
+
+  const saveRoadReports = async () => {
+    if (!roadDisruptions.length || registryBusyId) return;
+    setRegistryBusyId("new");
+    setDisruptionError("");
+    try {
+      const response = await fetch("/api/road-disruptions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(roadDisruptionFeatureCollection(roadDisruptions)),
+      });
+      const result = await response.json().catch(() => ({})) as { error?: string };
+      if (!response.ok) throw new Error(result.error || `道路中断上报失败（HTTP ${response.status}）`);
+      setRoadDisruptions([]);
+      await refreshRoadRegistry();
+      setRoadRoutingState("idle");
+    } catch (error) {
+      setDisruptionError(error instanceof Error ? error.message : "道路中断上报失败");
+    } finally {
+      setRegistryBusyId(null);
+    }
+  };
+
+  const reviewRoadReport = async (entry: RoadDisruptionRegistryEntry, action: "verify" | "resolve" | "reject") => {
+    if (registryBusyId) return;
+    setRegistryBusyId(entry.disruptionId);
+    setDisruptionError("");
+    try {
+      const response = await fetch("/api/road-disruptions", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ disruptionId: entry.disruptionId, revision: entry.revision, action }),
+      });
+      const result = await response.json().catch(() => ({})) as { error?: string };
+      if (!response.ok) throw new Error(result.error || `道路中断核验失败（HTTP ${response.status}）`);
+      await refreshRoadRegistry();
+      setRoadRoutingState("idle");
+    } catch (error) {
+      setDisruptionError(error instanceof Error ? error.message : "道路中断核验失败");
+    } finally {
+      setRegistryBusyId(null);
+    }
+  };
+
+  const exportScenario = (scenario: ResponseScenario) => {
+    const blob = new Blob([JSON.stringify(responseScenarioGeoJson(scenario), null, 2)], { type: "application/geo+json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `tianxun-response-${scenario.scenarioId.replace(/[^a-zA-Z0-9_-]/g, "-")}.geojson`;
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  };
+
+  return <aside ref={panelRef} className="task-panel response-panel" role="dialog" aria-modal="true" aria-labelledby="response-panel-title">
+    <div className="task-panel-heading response-panel-heading">
+      <div><span>PHASE 3 · DECISION SUPPORT</span><h2 id="response-panel-title">处置推演 <b>{scenarios.length}</b></h2><p>真实路网 + 中断台账 + 设施暴露 · WGS 84</p></div>
+      <button ref={closeRef} onClick={onClose} aria-label="关闭处置推演">×</button>
+    </div>
+    <div className="response-panel-body">
+      <section className="response-method-note">
+        <strong>真实道路、毁损台账与基础设施暴露第三阶段</strong>
+        <p>中国境内支持高德驾车、步行、骑行和电动自行车规划，并用灾害影响场、核验台账及免认证 OSM/Overpass 桥梁、隧道、涉水点三次筛查。OSM 是静态社区地图，不证明设施当前完好；燃油摩托车没有可靠专用接口，暂不冒充驾车路线。</p>
+      </section>
+      <section className="response-create">
+        <h3>建立推演场景</h3>
+        <label>灾害主事件
+          <select value={event?.masterEventId ?? ""} onChange={(change) => { const selectedEvent = events.find((candidate) => candidate.masterEventId === change.target.value); if (selectedEvent) onChooseEvent(selectedEvent); }}>
+            <option value="">请选择事件</option>
+            {events.slice(0, 250).map((candidate) => <option key={candidate.masterEventId} value={candidate.masterEventId}>{hazardMeta[candidate.hazard].label} · {candidate.title}</option>)}
+          </select>
+        </label>
+        {event ? <>
+          <div className={`response-source-quality ${event.dispatchEligibility}`}><strong>{event.dispatchEligibility === "ready" ? "事件来源已核验" : "事件需要人工复核"}</strong><span>{event.cycloneForecast?.impactField ? `${event.cycloneForecast.impactField.frames.length} 个台风逐时影响场时间片` : `${event.geometry.type} 来源几何`} · 更新 {formatTimeWithYear(event.updatedAt)} UTC+08</span></div>
+          <div className="response-fields">
+            <label>出行方式<select value={travelMode} onChange={(change) => { const mode = change.target.value as AmapTravelMode; setTravelMode(mode); setTravelSpeed(mode === "walking" ? "5" : mode === "bicycling" ? "15" : mode === "electrobike" ? "25" : "35"); setRoadRoutingState("idle"); }}>{Object.entries(amapTravelModeLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+            <label>起点经度<input inputMode="decimal" value={originLongitude} onChange={(change) => setOriginLongitude(change.target.value)} /></label>
+            <label>起点纬度<input inputMode="decimal" value={originLatitude} onChange={(change) => setOriginLatitude(change.target.value)} /></label>
+            <label>目的地经度<input inputMode="decimal" value={destinationLongitude} onChange={(change) => setDestinationLongitude(change.target.value)} /></label>
+            <label>目的地纬度<input inputMode="decimal" value={destinationLatitude} onChange={(change) => setDestinationLatitude(change.target.value)} /></label>
+            <label>出发时间（UTC+08）<input type="datetime-local" value={departureAt} onChange={(change) => setDepartureAt(change.target.value)} /></label>
+            <label>几何降级速度（km/h）<input type="number" min="5" max="160" value={travelSpeed} onChange={(change) => setTravelSpeed(change.target.value)} /></label>
+          </div>
+          <div className="response-disruption-import">
+            <div><strong>道路毁损与封闭</strong><span>{registryState === "loading" ? "正在读取中断台账…" : registryState === "public-read-only" ? "公网只读入口不展示内部现场上报" : registryState === "unavailable" ? "台账不可用；本次只能使用临时导入" : `有效台账 ${registryDisruptions.length} 条 · 本次临时导入 ${roadDisruptions.length} 条`}</span></div>
+            <label>上传 GeoJSON<input type="file" accept=".geojson,.json,application/geo+json,application/json" onChange={(change) => { const file = change.target.files?.[0]; void importRoadDisruptions(file); change.target.value = ""; }} /></label>
+            <button type="button" onClick={() => { setRoadDisruptions([]); setDisruptionError(""); setRoadRoutingState("idle"); }} disabled={!roadDisruptions.length}>清空</button>
+            <button type="button" onClick={() => void saveRoadReports()} disabled={!roadDisruptions.length || registryState !== "operational-database" || Boolean(registryBusyId)}>{registryBusyId === "new" ? "上报中…" : "保存为台账上报"}</button>
+            <small>支持道路冲毁、桥梁故障、积水、滑坡、封路和限制通行。所有新入库记录都会被强制降为“待核验”；缺少 validTo 时按 24 小时自动失效，只有管理员核验后才构成硬阻断。</small>
+          </div>
+          {registryDisruptions.length ? <div className="response-disruption-registry" aria-label="有效道路中断台账">
+            {registryDisruptions.slice(0, 12).map((entry) => <article key={entry.disruptionId} className={entry.verification}>
+              <div><strong>{roadDisruptionKindLabel(entry.kind)} · {entry.label}</strong><span>{entry.verification === "verified" ? "已核验" : "现场上报待核验"} · {entry.impact === "blocked" ? "完全阻断" : "限制通行"} · v{entry.revision}</span><small>{entry.source || "未提供外部来源"} · 有效至 {entry.validTo ? `${formatTimeWithYear(entry.validTo)} UTC+08` : "未设置"}</small></div>
+              <div>{entry.verification === "reported" ? <><button disabled={registryBusyId === entry.disruptionId} onClick={() => void reviewRoadReport(entry, "verify")}>核验</button><button disabled={registryBusyId === entry.disruptionId} onClick={() => void reviewRoadReport(entry, "reject")}>驳回</button></> : null}<button disabled={registryBusyId === entry.disruptionId} onClick={() => void reviewRoadReport(entry, "resolve")}>解除</button></div>
+            </article>)}
+            {registryDisruptions.length > 12 ? <p>另有 {registryDisruptions.length - 12} 条有效记录参与计算；为控制面板长度未全部展开。</p> : null}
+          </div> : null}
+          {disruptionError ? <div className="response-plan-error" role="alert">{disruptionError}</div> : null}
+          {planError ? <div className="response-plan-error" role="alert">{planError}</div> : null}
+          <div className="response-generate-actions">
+            <button className="response-generate" onClick={() => void generateRoad()} disabled={roadRoutingState === "loading"}>{roadRoutingState === "loading" ? "正在连接路网与基础设施…" : "生成真实道路候选"}</button>
+            <button className="response-generate-fallback" onClick={generateGeometric}>使用几何降级模式</button>
+          </div>
+          {roadRoutingState === "ready" ? <div className={`response-routing-ready ${infrastructureQueryState === "ready" ? "" : "partial"}`} role="status">高德{amapTravelModeLabels[travelMode]}路线已接通；已完成灾害与 {effectiveRoadDisruptions.length} 条有效/临时道路中断复核。{infrastructureQueryState === "ready" ? "OSM 基础设施暴露查询已完成，设施结构状态仍须核验。" : infrastructureQueryState === "too_large" ? "路线范围过大，未向公共 Overpass 发起重查询，基础设施覆盖未知。" : infrastructureQueryState === "unsupported" ? "当前路线不支持公共 Overpass 查询，基础设施覆盖未知。" : "Overpass 暂不可用，路线仍已保存但基础设施覆盖未知。"}</div> : roadRoutingState === "fallback" ? <div className="response-routing-fallback" role="status">当前保存的是{amapTravelModeLabels[travelMode]}几何降级场景，不代表真实道路可通行。</div> : null}
+        </> : <p className="response-select-hint">从当前监测事件中选择一个主事件，或在灾害详情中点击“建立处置推演场景”。</p>}
+      </section>
+      <section className="response-scenarios">
+        <h3>已保存场景</h3>
+        {!scenarios.length ? <div className="task-empty"><strong>暂无处置推演</strong><p>选择灾害事件并设置起点、目的地与出发时间。</p></div> : null}
+        {scenarios.map((scenario) => {
+          const currentEvent = events.find((candidate) => candidate.masterEventId === scenario.masterEventId);
+          const stale = !currentEvent || eventRevisionFingerprint(currentEvent) !== scenario.eventRevision;
+          const selectedRoute = scenario.routes.find((route) => route.routeId === scenario.selectedRouteId) ?? scenario.routes[0];
+          return <article key={scenario.scenarioId} className={`response-scenario ${activeScenarioId === scenario.scenarioId ? "active" : ""}`}>
+            <div className="response-scenario-title"><div><span>{hazardMeta[scenario.hazard]?.label ?? scenario.hazard} · {amapTravelModeLabels[scenario.travelMode ?? "driving"]}</span><strong>{scenario.title}</strong><small>出发 {formatTimeWithYear(scenario.departureAt)} UTC+08 · {scenario.router === "geometric_preview_v1" ? "几何预览 v1" : "高德多方式真实道路 v1"}</small></div><button onClick={() => onRemove(scenario.scenarioId)} aria-label={`删除处置推演 ${scenario.title}`}>删除</button></div>
+            {stale ? <div className="response-stale" role="status">事件版本已变化；旧路线仅供回放，必须按当前影响场重新生成。</div> : null}
+            <div className="response-route-options" role="group" aria-label="候选路线">
+              {scenario.routes.map((route) => <button key={route.routeId} className={`${route.status} ${route.routeId === scenario.selectedRouteId ? "active" : ""}`} onClick={() => onSelectRoute(scenario.scenarioId, route.routeId)} aria-pressed={route.routeId === scenario.selectedRouteId}>
+                <strong>{route.label}</strong><span>{responseRouteStatusLabel(route.status)}</span><small>{route.distanceKm.toFixed(1)} km · 约 {route.estimatedMinutes} 分钟{route.exposureKm > 0 ? ` · 影响区内 ${route.exposureKm.toFixed(1)} km` : ""}{route.roadProvider ? ` · ${route.roadProvider}` : ""}{route.restriction ? " · 存在限行" : ""}{route.disruptionConflicts?.length ? ` · 中断冲突 ${route.disruptionConflicts.length}` : ""}{route.infrastructureCrossings?.length ? ` · 设施穿越 ${route.infrastructureCrossings.length}` : ""}</small>
+              </button>)}
+            </div>
+            {selectedRoute.roadProvider ? <div className="response-road-evidence">
+              {(scenario.travelMode ?? "driving") === "driving" ? <><span>拥堵/严重拥堵 {(selectedRoute.traffic?.congestedKm ?? 0) + (selectedRoute.traffic?.severeCongestionKm ?? 0)} km</span><span>红绿灯 {selectedRoute.trafficLights ?? 0}</span><span>收费 ¥{selectedRoute.tollsYuan ?? 0}</span></> : <span>{amapTravelModeLabels[scenario.travelMode ?? "driving"]}上游预计耗时</span>}
+              <span>道路吸附 起点 {selectedRoute.originSnapKm ?? 0} / 终点 {selectedRoute.destinationSnapKm ?? 0} km</span>
+              <small>{selectedRoute.roadNames?.length ? `主要道路：${selectedRoute.roadNames.slice(0, 5).join("、")}` : "高德未返回可识别道路名称"}</small>
+              <b className="unknown">设施结构状态：未核验</b>
+              <b className={scenario.infrastructureData?.state === "ready" ? "checked" : "unknown"}>OSM 设施暴露：{scenario.infrastructureData?.state === "ready" ? `已核对 ${scenario.infrastructureCheckCount ?? 0} 个要素 · 本路线穿越 ${selectedRoute.infrastructureCrossings?.length ?? 0} 处` : "覆盖未知"}</b>
+              <b className={(scenario.roadDisruptionCheckCount ?? scenario.roadDisruptions?.length ?? 0) > 0 ? "checked" : "unknown"}>道路毁损数据：{(scenario.roadDisruptionCheckCount ?? scenario.roadDisruptions?.length ?? 0) > 0 ? `已核对 ${scenario.roadDisruptionCheckCount ?? scenario.roadDisruptions?.length ?? 0} 条 · 保存 ${scenario.roadDisruptions?.length ?? 0} 条相交证据` : "未提供"}</b>
+              {selectedRoute.infrastructureCrossings?.length ? <small className="infrastructure-crossings">设施存在不等于安全：{selectedRoute.infrastructureCrossings.slice(0, 8).map((crossing, index) => <span key={crossing.infrastructureId}>{index ? "；" : ""}<a href={safeHttpUrl(crossing.sourceUrl)} target="_blank" rel="noreferrer">{infrastructureKindLabel(crossing.kind)}·{crossing.label.replace(/^.*? · /, "")}</a></span>)}{selectedRoute.infrastructureCrossings.length > 8 ? `；另 ${selectedRoute.infrastructureCrossings.length - 8} 处` : ""}</small> : null}
+              {scenario.infrastructureData?.state === "ready" ? <small className="infrastructure-source"><a href={safeHttpUrl(scenario.infrastructureData.sourceUrl)} target="_blank" rel="noreferrer">{scenario.infrastructureData.attribution} · 查看许可与来源 ↗</a><br />查询时间 {formatTimeWithYear(scenario.infrastructureData.fetchedAt!)} UTC+08 · 包围盒约 {scenario.infrastructureData.queryAreaKm2?.toFixed(1)} km²</small> : scenario.infrastructureData ? <small className="infrastructure-warning">{scenario.infrastructureData.note}</small> : null}
+              {selectedRoute.disruptionConflicts?.length ? <small className="disruption-conflicts">冲突：{selectedRoute.disruptionConflicts.map((conflict) => `${roadDisruptionKindLabel(conflict.kind)}·${conflict.label}${conflict.verification === "verified" ? "（已核验）" : "（上报待核验）"}`).join("；")}</small> : null}
+            </div> : null}
+            <p className={`response-route-note ${selectedRoute.status}`}>{selectedRoute.note}</p>
+            <div className="response-actions"><button onClick={() => onActivate(scenario.scenarioId)}>在地图查看</button><button onClick={() => exportScenario(scenario)}>导出 GeoJSON</button>{currentEvent ? <button onClick={() => onChooseEvent(currentEvent)}>载入当前事件重算</button> : null}</div>
+          </article>;
+        })}
+      </section>
+    </div>
+    <footer>处置推演为决策支持功能，不输出“安全路线”结论；穿越影响区、事件未核验或超出预报时效的候选均会被显式限制。</footer>
+  </aside>;
+}
+
 function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActivate, onUpdate, onRemove, onClose, onRetry }: { tasks: SatelliteTask[]; syncState: Record<string, TaskSyncState>; storageMode: TaskStorageMode; fleet: SatelliteFleetState; activeTaskId: string | null; onActivate: (taskId: string) => void; onUpdate: (taskId: string, patch: Partial<SatelliteTask>) => void; onRemove: (taskId: string) => void; onClose: () => void; onRetry: (task: SatelliteTask) => void }) {
   const [visibility, setVisibility] = useState<Record<string, VisibilityState>>({});
   const [copiedTaskId, setCopiedTaskId] = useState<string | null>(null);
@@ -1299,6 +1929,32 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
   const [weatherTaskId, setWeatherTaskId] = useState<string | null>(activeTaskId);
   const panelRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const visibilityInputKeys = useMemo(() => Object.fromEntries(tasks.map((task) => [task.taskId, aoiFingerprint({
+    eventRevision: task.eventRevision,
+    aoiType: task.aoiType,
+    aoiRadiusKm: task.aoiRadiusKm,
+    aoiWidthKm: task.aoiWidthKm,
+    aoiHeightKm: task.aoiHeightKm,
+    aoiLengthKm: task.aoiLengthKm,
+    aoiBearingDeg: task.aoiBearingDeg,
+    geometry: task.aoiType === "source" ? task.sourceGeometry : task.customGeometry,
+    imagingStart: task.imagingStart,
+    imagingEnd: task.imagingEnd,
+    sensors: task.sensors,
+    minimumCoveragePercent: task.minimumCoveragePercent,
+    spatialResolutionMeters: task.spatialResolutionMeters,
+    incidenceAngleMinDeg: task.incidenceAngleMinDeg,
+    incidenceAngleMaxDeg: task.incidenceAngleMaxDeg,
+    orbitDirectionPreference: task.orbitDirectionPreference,
+  })])), [tasks]);
+  const previousVisibilityInputKeys = useRef(visibilityInputKeys);
+  useEffect(() => {
+    const previous = previousVisibilityInputKeys.current;
+    const changed = new Set(Object.keys(visibilityInputKeys).filter((taskId) => previous[taskId] && previous[taskId] !== visibilityInputKeys[taskId]));
+    const removed = Object.keys(previous).some((taskId) => !(taskId in visibilityInputKeys));
+    if (changed.size || removed) setVisibility((current) => Object.fromEntries(Object.entries(current).filter(([taskId]) => taskId in visibilityInputKeys && !changed.has(taskId))));
+    previousVisibilityInputKeys.current = visibilityInputKeys;
+  }, [visibilityInputKeys]);
   useEffect(() => {
     closeRef.current?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1341,9 +1997,9 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
     setVisibility((current) => ({ ...current, [task.taskId]: { state: "loading", windows: [] } }));
     try {
       const response = await fetch("/api/visibility", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ taskId: task.taskId, revision: task.revision }) });
-      const result = await response.json() as { state?: VisibilityState["state"]; message?: string; windows?: VisibilityWindow[]; orbitVersion?: string; computedAt?: string };
+      const result = await response.json() as { state?: VisibilityState["state"]; mode?: VisibilityState["mode"]; message?: string; windows?: VisibilityWindow[]; orbitVersion?: string; computedAt?: string };
       const windows = (result.windows ?? []).map((window) => ({ ...window, orbitVersion: window.orbitVersion ?? result.orbitVersion, computedAt: window.computedAt ?? result.computedAt }));
-      setVisibility((current) => ({ ...current, [task.taskId]: { state: result.state ?? (response.ok ? "ready" : "error"), message: result.message, windows } }));
+      setVisibility((current) => ({ ...current, [task.taskId]: { state: result.state ?? (response.ok ? "ready" : "error"), mode: result.mode, message: result.message, windows } }));
     } catch {
       setVisibility((current) => ({ ...current, [task.taskId]: { state: "error", message: "无法连接可见性计算接口", windows: [] } }));
     }
@@ -1387,6 +2043,7 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
         <div className={`task-quality ${task.aoiApproval}`}><span>{locationQualityLabels[task.locationQuality]} · ±{task.locationAccuracyKm} km</span><b>{task.aoiApproval === "source_verified" ? "来源可下发" : "已人工核对"}</b><small>{task.evidenceCount} 条证据 · {task.masterEventId}</small></div>
         <WeatherForecastCard latitude={task.latitude} longitude={task.longitude} maximumCloudPercent={task.maximumCloudPercent} compact enabled={weatherTaskId === task.taskId} onRequest={() => setWeatherTaskId(task.taskId)} />
         {task.cycloneForecast ? <div className="task-forecast-summary"><strong>官方预报已随任务保存</strong><span>{task.cycloneForecast.track.length} 个官方中心节点{task.cycloneForecast.impactField ? ` · ${task.cycloneForecast.impactField.frames.length} 个逐时时间片` : ""} · 至 {formatTimeWithYear(task.cycloneForecast.forecastValidUntil)} UTC+08</span><small>{task.cycloneForecast.impactGeometry ? `${task.cycloneForecast.impactThreshold || "官方风圈"}已作为默认来源 AOI` : "本报次没有官方风圈；默认 AOI 仍以当前中心设置"}</small></div> : null}
+        {task.hazard === "landslide" && task.orbitDirectionPreference ? <div className="task-landslide-summary"><strong>{task.orbitDirectionPreference === "ascending" ? "升轨" : task.orbitDirectionPreference === "descending" ? "降轨" : "任一轨向"} SAR 滑坡模板</strong><span>{task.referenceAcquisitionRequired ? "要求灾前参考影像" : "未要求灾前参考影像"} · {task.revisitCount} 次重访</span><small>地形格网是操作员确认的筛查 AOI，不是滑坡实况边界；成像机会仍需验证轨向、入射角及地形阴影/叠掩。</small></div> : null}
         <div className={`task-sync ${syncState[task.taskId]?.state ?? "local"}`} role="status">{syncState[task.taskId]?.state === "saving" ? "正在同步…" : syncState[task.taskId]?.state === "synced" ? (syncState[task.taskId]?.message ?? "已同步到业务数据库") : syncState[task.taskId]?.state === "error" ? <>同步失败：{syncState[task.taskId]?.message ?? "请重试"} <button onClick={() => onRetry(task)}>重试同步</button></> : "仅保存在本机"}</div>
     <div className="aoi-type-selector" aria-label="AOI目标类型">
           {aoiOptions.filter((option) => option.id !== "source" || task.sourceGeometry).map((option) => <button key={option.id} aria-pressed={task.aoiType === option.id} className={task.aoiType === option.id ? "active" : ""} onClick={() => onUpdate(task.taskId, {
@@ -1424,15 +2081,23 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
           <label>最大入射角（度）<input type="number" min="0" max="80" value={task.incidenceAngleMaxDeg} onChange={(event) => onUpdate(task.taskId, { incidenceAngleMaxDeg: clampNumber(event.target.value, 0, 80) })} /></label>
           <label>重访次数<input type="number" min="1" max="50" value={task.revisitCount} onChange={(event) => onUpdate(task.taskId, { revisitCount: clampNumber(event.target.value, 1, 50) })} /></label>
           <label>最迟交付（Asia/Shanghai UTC+08）<input type="datetime-local" min={toLocalInput(task.imagingEnd)} value={toLocalInput(task.deliveryDeadline)} onChange={(event) => onUpdate(task.taskId, { deliveryDeadline: fromLocalInput(event.target.value) })} /></label>
+          {task.hazard === "landslide" ? <><label>SAR 轨向偏好<select value={task.orbitDirectionPreference ?? "either"} onChange={(event) => onUpdate(task.taskId, { orbitDirectionPreference: event.target.value as SatelliteTask["orbitDirectionPreference"] })}><option value="ascending">升轨</option><option value="descending">降轨</option><option value="either">任一轨向</option></select></label><label>SAR 分析模式<select value={task.sarAnalysisMode ?? "amplitude_change_and_insar_pair"} onChange={(event) => onUpdate(task.taskId, { sarAnalysisMode: event.target.value as SatelliteTask["sarAnalysisMode"] })}><option value="amplitude_change_and_insar_pair">幅度变化 + InSAR 对比</option><option value="amplitude_change">幅度变化</option><option value="insar_pair">InSAR 配对</option></select></label><label className="task-checkbox-field"><input type="checkbox" checked={Boolean(task.referenceAcquisitionRequired)} onChange={(event) => onUpdate(task.taskId, { referenceAcquisitionRequired: event.target.checked })} />要求灾前参考影像</label></> : null}
         </div>
         <fieldset className="payload-options"><legend>载荷选项（可多选）</legend>{payloadOptions.map((payload) => <label key={payload}><input type="checkbox" checked={task.sensors.includes(payload)} onChange={() => onUpdate(task.taskId, { sensors: toggleValue(task.sensors, payload) })} />{payload}</label>)}</fieldset>
         <div className="task-targets">观测目标：{task.observationTargets.join(" · ")}</div>
         {(() => { const validation = validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requirePayload: true, requireProvenance: true }); return validation.ok ? null : <div className="task-validation" role="alert">{validation.errors.join("；")}</div>; })()}
         <div className={`visibility-box ${visibility[task.taskId]?.state ?? "idle"}`}>
-          <button onClick={() => void calculateVisibility(task)} disabled={visibility[task.taskId]?.state === "loading"}>{visibility[task.taskId]?.state === "loading" ? "正在请求仿真…" : "计算卫星可见窗口"}</button>
+          <button onClick={() => void calculateVisibility(task)} disabled={visibility[task.taskId]?.state === "loading"}>{visibility[task.taskId]?.state === "loading" ? "正在计算轨道机会…" : "计算卫星任务机会"}</button>
           {visibility[task.taskId]?.message ? <p>{visibility[task.taskId].message}</p> : null}
-          {task.opportunityId ? <p className="selected-opportunity">已选机会：{task.satelliteId} · {task.opportunityId} · 轨道 {task.orbitVersion || "未标识"}</p> : null}
-          {visibility[task.taskId]?.windows.map((window, windowIndex) => <div key={window.opportunityId || `${window.start}-${windowIndex}`}><strong>{window.satelliteId || `窗口 ${windowIndex + 1}`}</strong><span>{formatTimeWithYear(window.start)} — {formatTimeWithYear(window.end)}</span><small>{window.coveragePercent == null ? "覆盖率待仿真服务返回" : `覆盖 ${window.coveragePercent}%`}{window.incidenceAngleDeg == null ? " · 入射角待验证" : ` · 地面入射角 ${window.incidenceAngleDeg}°`}{window.offNadirAngleDeg == null ? "" : ` · 离轴 ${window.offNadirAngleDeg}°`}</small>{window.constraintNotes?.map((note) => <small className="constraint-note" key={note}>{note}</small>)}<button className="choose-opportunity" onClick={() => onUpdate(task.taskId, { satelliteId: window.satelliteId, instrumentId: window.instrumentId, imagingMode: window.imagingMode, opportunityId: window.opportunityId, orbitVersion: window.orbitVersion, visibilityComputedAt: window.computedAt, incidenceAngleDeg: window.incidenceAngleDeg, offNadirAngleDeg: window.offNadirAngleDeg })}>{task.opportunityId === window.opportunityId ? "已选择" : "选择此仿真机会"}</button></div>)}
+          {task.opportunityId ? <p className="selected-opportunity">已选机会：{task.satelliteId} · {task.opportunityId} · {task.simulationLevel === "orbit_only" ? `轨道级粗筛${task.minimumGroundTrackDistanceKm == null ? "" : ` · 最近 ${task.minimumGroundTrackDistanceKm} km`}` : "传感器级仿真"}</p> : null}
+          {visibility[task.taskId]?.windows.map((window, windowIndex) => <div key={window.opportunityId || `${window.start}-${windowIndex}`}>
+            <strong>{window.satelliteLabel || window.satelliteId || `窗口 ${windowIndex + 1}`}{window.simulationLevel === "orbit_only" ? " · 轨道近接候选" : ""}</strong>
+            <span>{formatTimeWithYear(window.start)} — {formatTimeWithYear(window.end)} UTC+08</span>
+            {window.closestApproachAt ? <small>最近近接 {formatTimeWithYear(window.closestApproachAt)} UTC+08 · 地面轨迹距 AOI 中心 {window.minimumGroundTrackDistanceKm ?? "--"} km · 高度 {window.altitudeKm ?? "--"} km</small> : null}
+            <small>{window.coveragePercent == null ? (window.simulationLevel === "orbit_only" ? "真实覆盖率未计算" : "覆盖率待仿真服务返回") : `覆盖 ${window.coveragePercent}%`}{window.incidenceAngleDeg == null ? (window.simulationLevel === "orbit_only" ? " · 地面入射角未计算" : " · 入射角待验证") : ` · 地面入射角 ${window.incidenceAngleDeg}°`}{window.offNadirAngleDeg == null ? "" : ` · 离轴 ${window.offNadirAngleDeg}°`}{window.orbitDirection ? ` · ${window.orbitDirection === "ascending" ? "升轨" : "降轨"}` : ""}</small>
+            {window.constraintNotes?.map((note) => <small className="constraint-note" key={note}>{note}</small>)}
+            <button className="choose-opportunity" onClick={() => onUpdate(task.taskId, { satelliteId: window.satelliteId, instrumentId: window.instrumentId, imagingMode: window.imagingMode, opportunityId: window.opportunityId, orbitVersion: window.orbitVersion, visibilityComputedAt: window.computedAt, incidenceAngleDeg: window.incidenceAngleDeg, offNadirAngleDeg: window.offNadirAngleDeg, simulationLevel: window.simulationLevel ?? "sensor_model", satelliteNoradId: window.satelliteNoradId, closestApproachAt: window.closestApproachAt, closestSubpointLatitude: window.closestSubpoint?.latitude, closestSubpointLongitude: window.closestSubpoint?.longitude, minimumGroundTrackDistanceKm: window.minimumGroundTrackDistanceKm, orbitSearchRadiusKm: window.searchRadiusKm, opportunityOrbitDirection: window.orbitDirection })}>{task.opportunityId === window.opportunityId ? "已选择" : window.simulationLevel === "orbit_only" ? "选择为轨道粗筛候选" : "选择此仿真机会"}</button>
+          </div>)}
         </div>
       </article>)}
     </div>
@@ -1579,10 +2244,46 @@ function createSatelliteTask(event: DisasterEvent, operatorConfirmed: boolean): 
     eventRevision: eventRevisionFingerprint(event),
     aoiHash: "",
   };
-  task.timeIndexedAoi = cycloneTaskAoiSlices(event.cycloneForecast, task.imagingStart, task.imagingEnd);
+  const timeIndexedAoi = cycloneTaskAoiSlices(event.cycloneForecast, task.imagingStart, task.imagingEnd);
+  task.timeIndexedAoi = timeIndexedAoi.length ? timeIndexedAoi : undefined;
   task.forecastAdvisoryId = event.cycloneForecast ? `${event.cycloneForecast.source}:${event.cycloneForecast.advisory ?? event.cycloneForecast.issuedAt}` : undefined;
   task.forecastIssuedAt = event.cycloneForecast?.issuedAt;
   task.forecastValidUntil = event.cycloneForecast?.forecastValidUntil;
+  return { ...task, aoiHash: aoiFingerprint(taskGeometry(task)) };
+}
+
+function createLandslideSarTasks(event: DisasterEvent, terrain: LandslideTerrainScreening): SatelliteTask[] {
+  if (event.hazard !== "landslide") throw new Error("只有滑坡事件可以建立滑坡 SAR 模板");
+  return landslideSarTemplates.map((template, index) => createLandslideSarTask(event, terrain, template, index));
+}
+
+function createLandslideSarTask(event: DisasterEvent, terrain: LandslideTerrainScreening, template: LandslideSarTemplate, index: number): SatelliteTask {
+  const base = createSatelliteTask(event, true);
+  const createdAt = new Date(Date.now() + index).toISOString();
+  const task: SatelliteTask = {
+    ...base,
+    taskId: `TASK-${event.id}-LANDSLIDE-${template.orbitDirectionPreference.toUpperCase()}-${Date.now()}-${index}`,
+    title: `${event.title} · ${template.label}`,
+    aoiType: "multi",
+    customGeometry: terrain.geometry,
+    sensors: [...template.sensors],
+    observationTargets: [...template.observationTargets],
+    minimumCoveragePercent: 90,
+    maximumCloudPercent: 100,
+    spatialResolutionMeters: template.spatialResolutionMeters,
+    incidenceAngleMinDeg: template.incidenceAngleMinDeg,
+    incidenceAngleMaxDeg: template.incidenceAngleMaxDeg,
+    revisitCount: template.revisitCount,
+    aoiApproval: "operator_confirmed",
+    approvedAt: createdAt,
+    approvedBy: "当前操作员",
+    approvalReason: `操作员核对 ${terrain.provider} 地形筛查格网；该 AOI 仅为任务候选，不作为滑坡实况边界。${template.note}`,
+    orbitDirectionPreference: template.orbitDirectionPreference,
+    referenceAcquisitionRequired: template.referenceAcquisitionRequired,
+    sarAnalysisMode: template.sarAnalysisMode,
+    createdAt,
+    updatedAt: createdAt,
+  };
   return { ...task, aoiHash: aoiFingerprint(taskGeometry(task)) };
 }
 
@@ -1665,6 +2366,17 @@ function migrateSatelliteTask(task: Partial<SatelliteTask>): SatelliteTask {
     visibilityComputedAt: task.visibilityComputedAt,
     incidenceAngleDeg: task.incidenceAngleDeg,
     offNadirAngleDeg: task.offNadirAngleDeg,
+    simulationLevel: task.simulationLevel,
+    satelliteNoradId: task.satelliteNoradId,
+    closestApproachAt: task.closestApproachAt,
+    closestSubpointLatitude: task.closestSubpointLatitude,
+    closestSubpointLongitude: task.closestSubpointLongitude,
+    minimumGroundTrackDistanceKm: task.minimumGroundTrackDistanceKm,
+    orbitSearchRadiusKm: task.orbitSearchRadiusKm,
+    opportunityOrbitDirection: task.opportunityOrbitDirection,
+    orbitDirectionPreference: task.orbitDirectionPreference,
+    referenceAcquisitionRequired: task.referenceAcquisitionRequired,
+    sarAnalysisMode: task.sarAnalysisMode,
   };
 }
 
@@ -1708,6 +2420,9 @@ function rebaseUnsyncedDraft(task: SatelliteTask, event: DisasterEvent): Satelli
     approvedAt: task.approvedAt,
     approvedBy: task.approvedBy,
     approvalReason: task.approvalReason,
+    orbitDirectionPreference: task.orbitDirectionPreference,
+    referenceAcquisitionRequired: task.referenceAcquisitionRequired,
+    sarAnalysisMode: task.sarAnalysisMode,
     status: "candidate",
     revision: 0,
     updatedAt: new Date().toISOString(),
@@ -1815,6 +2530,30 @@ function customGeometryPatch(geometry: CustomAoiGeometry | undefined, aoiType: A
   if (!geometry || !["polygon", "multi"].includes(aoiType)) return {};
   if (aoiType === "multi") return { customGeometry: asMultiPolygon(geometry) };
   return { customGeometry: firstPolygon(geometry) };
+}
+
+function isResponseScenario(value: unknown): value is ResponseScenario {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const scenario = value as Record<string, unknown>;
+  const validCoordinate = (candidate: unknown) => Array.isArray(candidate) && candidate.length === 2
+    && Number.isFinite(Number(candidate[0])) && Number(candidate[0]) >= -180 && Number(candidate[0]) <= 180
+    && Number.isFinite(Number(candidate[1])) && Number(candidate[1]) >= -90 && Number(candidate[1]) <= 90;
+  if (scenario.schemaVersion !== 1 || typeof scenario.scenarioId !== "string" || scenario.scenarioId.length > 300 || typeof scenario.masterEventId !== "string" || scenario.masterEventId.length > 300) return false;
+  if (typeof scenario.eventRevision !== "string" || !/^[a-f0-9]{64}$/.test(scenario.eventRevision) || !Number.isFinite(Date.parse(String(scenario.departureAt ?? "")))) return false;
+  if (!validCoordinate(scenario.origin) || !validCoordinate(scenario.destination) || !Number.isFinite(Number(scenario.travelSpeedKph)) || Number(scenario.travelSpeedKph) < 5 || Number(scenario.travelSpeedKph) > 160) return false;
+  if (scenario.travelMode !== undefined && !["driving", "walking", "bicycling", "electrobike"].includes(String(scenario.travelMode))) return false;
+  if (scenario.roadDisruptions !== undefined && !isRoadDisruptionList(scenario.roadDisruptions)) return false;
+  if (scenario.roadDisruptionCheckCount !== undefined && (!Number.isInteger(Number(scenario.roadDisruptionCheckCount)) || Number(scenario.roadDisruptionCheckCount) < 0 || Number(scenario.roadDisruptionCheckCount) > 500)) return false;
+  if (!Array.isArray(scenario.routes) || scenario.routes.length < 1 || scenario.routes.length > 10) return false;
+  return scenario.routes.every((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+    const route = candidate as Record<string, unknown>;
+    const geometry = route.geometry as Record<string, unknown> | undefined;
+    const conflictsValid = route.disruptionConflicts === undefined || Array.isArray(route.disruptionConflicts) && route.disruptionConflicts.length <= 50 && route.disruptionConflicts.every((conflict) => conflict && typeof conflict === "object" && !Array.isArray(conflict) && typeof (conflict as Record<string, unknown>).label === "string" && String((conflict as Record<string, unknown>).label).length <= 120);
+    return conflictsValid && typeof route.routeId === "string" && ["clear", "limited", "blocked", "unverified"].includes(String(route.status))
+      && geometry?.type === "LineString" && Array.isArray(geometry.coordinates) && geometry.coordinates.length >= 2 && geometry.coordinates.length <= 2_000
+      && geometry.coordinates.every(validCoordinate);
+  });
 }
 
 

@@ -1,8 +1,10 @@
 import { ApiInputError, apiActor, apiRole, authorizeApiRequest, enforceRateLimit, readJsonObject, rejectCrossOriginBrowserWrite } from "../../../lib/api-security";
 import { validateSatelliteTask } from "../../../lib/task-contract";
-import { getCanonicalEventForTask, getSatelliteTask } from "../../../db/operational";
+import { getCanonicalEventForTask, getSatelliteTask, listSatelliteOrbitCache } from "../../../db/operational";
 import { buildTaskAoi } from "../../../lib/task-aoi";
 import { aoiFingerprint, eventRevisionFingerprint, geometryEquals } from "../../../lib/event-integrity";
+import { buildSatelliteOrbitSnapshot } from "../../../lib/satellite-orbits";
+import { screenTleOpportunities } from "../../../lib/tle-opportunities";
 
 export const dynamic = "force-dynamic";
 
@@ -46,7 +48,34 @@ export async function POST(request: Request) {
   if (task.aoiHash !== aoiFingerprint(aoi)) return Response.json({ state: "error", windows: [], message: "AOI 指纹不一致，请重新保存任务" }, { status: 409 });
   const endpoint = process.env.SATELLITE_VISIBILITY_API_URL;
   if (!endpoint) {
-    return Response.json({ state: "needs_config", windows: [], message: "尚未配置卫星仿真/可见性服务地址 SATELLITE_VISIBILITY_API_URL" }, { status: 503 });
+    if (!Array.isArray(task.sensors) || !task.sensors.includes("SAR")) {
+      return Response.json({ state: "error", mode: "orbit_only", windows: [], message: "本地 TLE 粗筛仅对应当前登记的 SAR 星座，请先选择 SAR 载荷" }, { status: 400 });
+    }
+    try {
+      const satellites = buildSatelliteOrbitSnapshot(await listSatelliteOrbitCache());
+      const now = new Date();
+      const imagingStart = new Date(Math.max(now.getTime(), Date.parse(String(task.imagingStart))));
+      const result = screenTleOpportunities({
+        geometry: aoi,
+        imagingStart,
+        imagingEnd: String(task.imagingEnd),
+        satellites,
+        orbitDirectionPreference: ["ascending", "descending"].includes(String(task.orbitDirectionPreference)) ? task.orbitDirectionPreference as "ascending" | "descending" : "either",
+        searchRadiusKm: Number(process.env.TLE_ORBIT_SEARCH_RADIUS_KM ?? 350),
+        now,
+      });
+      return Response.json({
+        ...result,
+        schemaVersion: "tianxun.visibility.v3",
+        state: "ready",
+        mode: "orbit_only",
+        message: result.windows.length
+          ? `已用 ${result.satelliteCount} 颗当前 TLE 生成 ${result.windows.length} 个轨道近接候选；仅供排程粗筛，不代表 SAR 可成像。`
+          : `已完成 ${result.satelliteCount} 颗卫星的 TLE 轨道粗筛，当前时间窗内未发现满足搜索半径的近接候选。`,
+      }, { headers: { "Cache-Control": "no-store" } });
+    } catch (error) {
+      return Response.json({ state: "error", mode: "orbit_only", windows: [], message: error instanceof Error ? error.message : "本地 TLE 轨道粗筛失败" }, { status: 503 });
+    }
   }
   try {
     const serviceUrl = validateSimulationEndpoint(endpoint);
@@ -67,7 +96,7 @@ export async function POST(request: Request) {
     const computedAt = validIso(result.computedAt) ?? new Date().toISOString();
     const windows = result.windows.map((window) => normalizeWindow(window, task, orbitVersion, computedAt)).filter((window): window is NonNullable<typeof window> => window !== null);
     if (result.windows.length && !windows.length) throw new Error("仿真服务没有返回有效的 UTC 可见窗口");
-    return Response.json({ schemaVersion: "tianxun.visibility.v2", orbitVersion, computedAt, windows, state: "ready" });
+    return Response.json({ schemaVersion: "tianxun.visibility.v3", mode: "sensor_model", orbitVersion, computedAt, windows, state: "ready", message: "已由外部传感器级仿真服务返回可见窗口；仍需按任务约束复核后方可排程。" });
   } catch (error) {
     return Response.json({ state: "error", windows: [], message: error instanceof Error ? error.message : "可见性计算失败" }, { status: 502 });
   }
@@ -83,17 +112,21 @@ function normalizeWindow(window: Record<string, unknown>, task: Record<string, u
   const coverage = Number(window.coveragePercent ?? window.coverage);
   const incidenceAngle = Number(window.incidenceAngleDeg ?? window.groundIncidenceAngleDeg);
   const offNadirAngle = Number(window.offNadirAngleDeg ?? window.lookAngleDeg ?? window.lookAngle);
+  const orbitDirection = ["ascending", "descending"].includes(String(window.orbitDirection ?? window.direction)) ? String(window.orbitDirection ?? window.direction) : undefined;
   if (Number.isFinite(coverage) && coverage < Number(task.minimumCoveragePercent)) return null;
   if (Number.isFinite(incidenceAngle) && (incidenceAngle < Number(task.incidenceAngleMinDeg) || incidenceAngle > Number(task.incidenceAngleMaxDeg))) return null;
+  if (["ascending", "descending"].includes(String(task.orbitDirectionPreference)) && orbitDirection && orbitDirection !== task.orbitDirectionPreference) return null;
   const constraintNotes = [];
   if (!Number.isFinite(coverage)) constraintNotes.push("仿真服务未返回覆盖率，尚未验证最低覆盖约束");
   if (!Number.isFinite(incidenceAngle)) constraintNotes.push("仿真服务未返回地面入射角；离轴/侧摆角不会代替入射角参与判定");
+  if (["ascending", "descending"].includes(String(task.orbitDirectionPreference)) && !orbitDirection) constraintNotes.push("仿真服务未返回轨向，尚未验证升降轨偏好");
   const satelliteId = boundedText(window.satelliteId ?? window.satellite ?? window.name ?? "", 120);
   if (!satelliteId) return null;
   const opportunityId = boundedText(window.opportunityId, 160) || `SIM-${aoiFingerprint({ satelliteId, start: start.toISOString(), end: end.toISOString(), orbitVersion, aoiHash: task.aoiHash }).slice(0, 24)}`;
   return {
     opportunityId,
     satelliteId,
+    satelliteNoradId: Number.isInteger(Number(window.satelliteNoradId ?? window.noradId)) ? Number(window.satelliteNoradId ?? window.noradId) : undefined,
     instrumentId: boundedText(window.instrumentId, 120) || undefined,
     imagingMode: boundedText(window.imagingMode, 120) || undefined,
     orbitVersion,
@@ -103,6 +136,8 @@ function normalizeWindow(window: Record<string, unknown>, task: Record<string, u
     coveragePercent: Number.isFinite(coverage) ? Math.min(100, Math.max(0, coverage)) : undefined,
     incidenceAngleDeg: Number.isFinite(incidenceAngle) ? incidenceAngle : undefined,
     offNadirAngleDeg: Number.isFinite(offNadirAngle) ? offNadirAngle : undefined,
+    orbitDirection,
+    simulationLevel: "sensor_model" as const,
     constraintNotes,
   };
 }

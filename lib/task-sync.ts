@@ -4,6 +4,9 @@ const taskDraftFields = [
   "incidenceAngleMaxDeg", "revisitCount", "deliveryDeadline", "imagingStart", "imagingEnd", "sensors", "observationTargets",
   "aoiApproval", "approvalReason", "createdAt", "updatedAt", "status", "revision", "eventRevision",
   "satelliteId", "instrumentId", "imagingMode", "opportunityId", "orbitVersion", "visibilityComputedAt", "incidenceAngleDeg", "offNadirAngleDeg",
+  "simulationLevel", "satelliteNoradId", "closestApproachAt", "closestSubpointLatitude", "closestSubpointLongitude",
+  "minimumGroundTrackDistanceKm", "orbitSearchRadiusKm", "opportunityOrbitDirection",
+  "orbitDirectionPreference", "referenceAcquisitionRequired", "sarAnalysisMode",
 ] as const;
 
 /**
