@@ -5,6 +5,7 @@ import { buildTaskAoi } from "../../../lib/task-aoi";
 import { aoiFingerprint, eventRevisionFingerprint, geometryEquals } from "../../../lib/event-integrity";
 import { buildSatelliteOrbitSnapshot } from "../../../lib/satellite-orbits";
 import { screenTleOpportunities } from "../../../lib/tle-opportunities";
+import { screenConfiguredSarOpportunities } from "../../../lib/configured-sar-opportunities";
 
 export const dynamic = "force-dynamic";
 
@@ -55,6 +56,30 @@ export async function POST(request: Request) {
       const satellites = buildSatelliteOrbitSnapshot(await listSatelliteOrbitCache());
       const now = new Date();
       const imagingStart = new Date(Math.max(now.getTime(), Date.parse(String(task.imagingStart))));
+      const configured = satellites.some((satellite) => satellite.orbitStatus === "current" && satellite.payloadProfile && satellite.identityStatus === "configured");
+      if (configured) {
+        const result = screenConfiguredSarOpportunities({
+          geometry: aoi,
+          imagingStart,
+          imagingEnd: String(task.imagingEnd),
+          satellites,
+          incidenceAngleMinDeg: Number(task.incidenceAngleMinDeg),
+          incidenceAngleMaxDeg: Number(task.incidenceAngleMaxDeg),
+          spatialResolutionMeters: Number(task.spatialResolutionMeters),
+          minimumCoveragePercent: Number(task.minimumCoveragePercent),
+          orbitDirectionPreference: ["ascending", "descending"].includes(String(task.orbitDirectionPreference)) ? task.orbitDirectionPreference as "ascending" | "descending" : "either",
+          now,
+        });
+        return Response.json({
+          ...result,
+          schemaVersion: "tianxun.visibility.v3",
+          state: "ready",
+          mode: "assumed_sensor",
+          message: result.windows.length
+            ? `已用 ${result.satelliteCount} 颗配置卫星生成 ${result.windows.length} 个假设传感器机会；可用于试排程，禁止自动下发。`
+            : `已完成 ${result.satelliteCount} 颗配置卫星的假设传感器计算；当前时间窗没有同时满足入射角、分辨率和覆盖率的机会。`,
+        }, { headers: { "Cache-Control": "no-store" } });
+      }
       const result = screenTleOpportunities({
         geometry: aoi,
         imagingStart,

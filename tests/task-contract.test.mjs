@@ -143,3 +143,26 @@ test("accepts bounded orbit-only provenance but forbids direct execution", async
   task.orbitSearchRadiusKm = 5_000;
   assert.equal(validateSatelliteTask(task).ok, false);
 });
+
+test("allows assumed sensor trials for review but forbids scheduling them", async () => {
+  const { unknownTaskFields, validateSatelliteTask } = await contract();
+  const task = validTask();
+  task.simulationLevel = "assumed_sensor";
+  task.opportunityLookSide = "right";
+  task.opportunityCoveragePercent = 100;
+  task.opportunitySpatialResolutionM = 3;
+  task.opportunitySceneCrossTrackKm = 25;
+  task.opportunitySceneAlongTrackKm = 25;
+  task.sensorParameterStatus = "provisional_assumption";
+  task.opportunityFootprint = { type: "Polygon", coordinates: [[[120, 30], [120.2, 30], [120.2, 30.2], [120, 30.2], [120, 30]]] };
+  assert.deepEqual(unknownTaskFields(task), []);
+  assert.equal(validateSatelliteTask(task).ok, true);
+  task.status = "reviewed";
+  assert.equal(validateSatelliteTask(task).ok, true);
+  task.status = "scheduled";
+  assert.equal(validateSatelliteTask(task).ok, false);
+  assert.match(validateSatelliteTask(task).errors.join(" "), /不得直接排程或下发/);
+  task.status = "candidate";
+  task.opportunityFootprint = { type: "Polygon", coordinates: [[[120, 30], [121, 31]]] };
+  assert.equal(validateSatelliteTask(task).ok, false);
+});

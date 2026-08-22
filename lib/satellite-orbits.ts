@@ -1,3 +1,5 @@
+import { satellitePayloadProfile, type SarPayloadProfile } from "./satellite-payloads.ts";
+
 export type SatelliteIdentityStatus = "configured" | "unverified";
 
 export type TrackedSarSatellite = {
@@ -7,6 +9,7 @@ export type TrackedSarSatellite = {
   commonName: string;
   commonCode?: string;
   identityStatus: SatelliteIdentityStatus;
+  payloadProfileId?: string;
 };
 
 export type SatelliteTleRecord = {
@@ -29,6 +32,7 @@ export type SatelliteOrbitCacheRecord = {
 };
 
 export type SatelliteOrbitSnapshot = TrackedSarSatellite & {
+  payloadProfile?: SarPayloadProfile;
   providerName?: string;
   tleLine1?: string;
   tleLine2?: string;
@@ -48,11 +52,11 @@ export const CELESTRAK_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1_000;
 export const CELESTRAK_SOURCE_URL = "https://celestrak.org/NORAD/elements/gp.php";
 
 export const trackedSarSatellites: readonly TrackedSarSatellite[] = [
-  { noradId: 51832, interfaceName: "TY-CSAR-2", interfaceCode: "天仪C波段卫星-2", commonName: "TY-39", commonCode: "巢湖一号", identityStatus: "configured" },
-  { noradId: 56846, interfaceName: "TY-CSAR-3", interfaceCode: "天仪C波段卫星-3", commonName: "TY-40", commonCode: "涪城一号", identityStatus: "configured" },
-  { noradId: 61231, interfaceName: "TY-CSAR-4", interfaceCode: "天仪C波段卫星-4", commonName: "TY-41", commonCode: "神启号", identityStatus: "configured" },
-  { noradId: 64048, interfaceName: "TY-CSAR-5", interfaceCode: "天仪C波段卫星-5", commonName: "TY-42", commonCode: "神启02号", identityStatus: "configured" },
-  { noradId: 69100, commonName: "TY-50", identityStatus: "configured" },
+  { noradId: 51832, interfaceName: "TY-CSAR-2", interfaceCode: "天仪C波段卫星-2", commonName: "TY-39", commonCode: "巢湖一号", identityStatus: "configured", payloadProfileId: "ty-csar-v1" },
+  { noradId: 56846, interfaceName: "TY-CSAR-3", interfaceCode: "天仪C波段卫星-3", commonName: "TY-40", commonCode: "涪城一号", identityStatus: "configured", payloadProfileId: "ty-csar-v1" },
+  { noradId: 61231, interfaceName: "TY-CSAR-4", interfaceCode: "天仪C波段卫星-4", commonName: "TY-41", commonCode: "神启号", identityStatus: "configured", payloadProfileId: "ty-csar-v1" },
+  { noradId: 64048, interfaceName: "TY-CSAR-5", interfaceCode: "天仪C波段卫星-5", commonName: "TY-42", commonCode: "神启02号", identityStatus: "configured", payloadProfileId: "ty-csar-v1" },
+  { noradId: 69100, commonName: "TY-50", commonCode: "电建一号", identityStatus: "configured", payloadProfileId: "ty-xsar-provisional-v1" },
   { noradId: 58918, commonName: "OSE-GF01", commonCode: "东方慧眼（不确定）", identityStatus: "unverified" },
 ] as const;
 
@@ -132,6 +136,7 @@ export function buildSatelliteOrbitSnapshot(cache: SatelliteOrbitCacheRecord[], 
         : "current" as const;
     return {
       ...satellite,
+      payloadProfile: satellitePayloadProfile(satellite.payloadProfileId),
       providerName: saved?.tle?.providerName,
       tleLine1: saved?.tle?.tleLine1,
       tleLine2: saved?.tle?.tleLine2,

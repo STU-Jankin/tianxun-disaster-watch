@@ -55,3 +55,21 @@ test("builds immutable planning packages with 4D cyclone features and CSV inject
   assert.match(csv.body, /ascending,true,amplitude_change_and_insar_pair/);
   assert.match(csv.body, /orbit_only,51832,2026-08-20T00:45:00.000Z,84.2,350,ascending/);
 });
+
+test("exports an assumed-sensor footprint as a separate GeoJSON feature", async () => {
+  const { buildTaskExportArtifact } = await import(new URL("../lib/task-export.ts", import.meta.url));
+  const aoi = { type: "Polygon", coordinates: [[[120, 30], [120.1, 30], [120.1, 30.1], [120, 30]]] };
+  const footprint = { type: "Polygon", coordinates: [[[119.9, 29.9], [120.2, 29.9], [120.2, 30.2], [119.9, 30.2], [119.9, 29.9]]] };
+  const task = {
+    taskId: "TASK-FOOTPRINT-1", masterEventId: "ME-2", title: "SAR试算", hazard: "flood", status: "reviewed", priority: 80,
+    latitude: 30.05, longitude: 120.05, aoiType: "polygon", customGeometry: aoi, sensors: ["SAR"],
+    imagingStart: "2026-08-20T00:00:00.000Z", imagingEnd: "2026-08-20T01:00:00.000Z", eventRevision: "c".repeat(64), aoiHash: "d".repeat(64),
+    simulationLevel: "assumed_sensor", opportunityLookSide: "left", opportunityCoveragePercent: 100, opportunitySpatialResolutionM: 10,
+    opportunitySceneCrossTrackKm: 100, opportunitySceneAlongTrackKm: 100, sensorParameterStatus: "provisional_assumption", opportunityFootprint: footprint,
+  };
+  const artifact = buildTaskExportArtifact([task], "geojson", "operator-a", "2026-08-20T00:00:00.000Z");
+  const parsed = JSON.parse(artifact.body);
+  assert.deepEqual(parsed.features.map((feature) => feature.properties.geometryRole), ["planning_aoi", "assumed_sensor_footprint"]);
+  assert.deepEqual(parsed.features[1].geometry, footprint);
+  assert.equal("opportunityFootprint" in parsed.features[0].properties, false);
+});

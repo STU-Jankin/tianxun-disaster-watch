@@ -33,6 +33,7 @@ const allowedTaskFields = new Set([
   "approvalReason", "createdAt", "updatedAt", "status", "revision", "eventRevision", "aoiHash",
   "timeIndexedAoi", "forecastAdvisoryId", "forecastIssuedAt", "forecastValidUntil",
   "satelliteId", "instrumentId", "imagingMode", "opportunityId", "orbitVersion", "visibilityComputedAt",
+  "opportunityLookSide", "opportunityCoveragePercent", "opportunitySpatialResolutionM", "opportunitySceneCrossTrackKm", "opportunitySceneAlongTrackKm", "sensorParameterStatus", "opportunityFootprint",
   "simulationLevel", "satelliteNoradId", "closestApproachAt", "closestSubpointLatitude", "closestSubpointLongitude",
   "minimumGroundTrackDistanceKm", "orbitSearchRadiusKm", "opportunityOrbitDirection",
   "orbitDirectionPreference", "referenceAcquisitionRequired", "sarAnalysisMode",
@@ -73,8 +74,8 @@ export function validateSatelliteTask(task: Record<string, unknown>, options: { 
   if (!Array.isArray(task.observationTargets) || task.observationTargets.length === 0) errors.push("至少需要一个观测目标");
   else if (task.observationTargets.length > 30 || task.observationTargets.some((target) => typeof target !== "string" || target.length > 120)) errors.push("观测目标数量或长度超限");
   if (task.orbitDirectionPreference !== undefined && !["ascending", "descending", "either"].includes(String(task.orbitDirectionPreference))) errors.push("轨向偏好无效");
-  if (task.simulationLevel !== undefined && !["orbit_only", "sensor_model"].includes(String(task.simulationLevel))) errors.push("仿真层级无效");
-  if (task.simulationLevel === "orbit_only" && !["candidate", "reviewed"].includes(String(task.status))) errors.push("TLE 轨道级粗筛结果不得直接排程或下发");
+  if (task.simulationLevel !== undefined && !["orbit_only", "assumed_sensor", "sensor_model"].includes(String(task.simulationLevel))) errors.push("仿真层级无效");
+  if (["orbit_only", "assumed_sensor"].includes(String(task.simulationLevel)) && !["candidate", "reviewed"].includes(String(task.status))) errors.push("轨道粗筛或假设传感器结果不得直接排程或下发");
   if (task.satelliteNoradId !== undefined) boundedNumber(task.satelliteNoradId, 1, 69_999, "NORAD 编号", errors, true);
   if (task.closestApproachAt !== undefined && !Number.isFinite(Date.parse(String(task.closestApproachAt)))) errors.push("最近轨道近接时间无效");
   if (task.closestSubpointLatitude !== undefined) boundedNumber(task.closestSubpointLatitude, -90, 90, "最近子星点纬度", errors);
@@ -82,6 +83,16 @@ export function validateSatelliteTask(task: Record<string, unknown>, options: { 
   if (task.minimumGroundTrackDistanceKm !== undefined) boundedNumber(task.minimumGroundTrackDistanceKm, 0, 20_050, "最小地面轨迹距离", errors);
   if (task.orbitSearchRadiusKm !== undefined) boundedNumber(task.orbitSearchRadiusKm, 50, 1_000, "轨道搜索半径", errors);
   if (task.opportunityOrbitDirection !== undefined && !["ascending", "descending"].includes(String(task.opportunityOrbitDirection))) errors.push("候选机会轨向无效");
+  if (task.opportunityLookSide !== undefined && !["left", "right"].includes(String(task.opportunityLookSide))) errors.push("候选机会侧视方向无效");
+  if (task.opportunityCoveragePercent !== undefined) boundedNumber(task.opportunityCoveragePercent, 0, 100, "候选机会覆盖率", errors);
+  if (task.opportunitySpatialResolutionM !== undefined) boundedNumber(task.opportunitySpatialResolutionM, 0.1, 10_000, "候选机会分辨率", errors);
+  if (task.opportunitySceneCrossTrackKm !== undefined) boundedNumber(task.opportunitySceneCrossTrackKm, 0.1, 1_000, "候选场景横轨宽度", errors);
+  if (task.opportunitySceneAlongTrackKm !== undefined) boundedNumber(task.opportunitySceneAlongTrackKm, 0.1, 3_000, "候选场景沿轨长度", errors);
+  if (task.sensorParameterStatus !== undefined && !["user_provided", "provisional_assumption"].includes(String(task.sensorParameterStatus))) errors.push("传感器参数状态无效");
+  if (task.opportunityFootprint !== undefined) {
+    const footprint = validateGeoGeometry(task.opportunityFootprint, { maximumVertices: 20, maximumRingVertices: 20, maximumAreaKm2: 500_000, rejectUnsplitAntimeridian: true });
+    if (!footprint.ok || !["Polygon", "MultiPolygon"].includes(String((task.opportunityFootprint as { type?: unknown })?.type))) errors.push("候选成像足迹无效");
+  }
   if (task.referenceAcquisitionRequired !== undefined && typeof task.referenceAcquisitionRequired !== "boolean") errors.push("灾前参考影像要求必须是布尔值");
   if (task.sarAnalysisMode !== undefined && !["amplitude_change", "insar_pair", "amplitude_change_and_insar_pair"].includes(String(task.sarAnalysisMode))) errors.push("SAR 分析模式无效");
   if (task.sarAnalysisMode !== undefined && (!Array.isArray(task.sensors) || !task.sensors.includes("SAR"))) errors.push("SAR 分析模式必须选择 SAR 载荷");

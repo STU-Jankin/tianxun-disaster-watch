@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildSatelliteOrbitSnapshot, fetchTrackedSatelliteTles, parseTleResponse, trackedSarSatellites } from "../lib/satellite-orbits.ts";
+import { sarPayloadProfiles } from "../lib/satellite-payloads.ts";
 
 function checkedLine(value) {
   const base = value.padEnd(68, " ").slice(0, 68);
@@ -53,4 +54,24 @@ test("marks old elements stale while retaining their last valid TLE", () => {
   assert.equal(satellite?.orbitStatus, "stale");
   assert.equal(satellite?.tleLine1, old.tleLine1);
   assert.equal(snapshot.find((item) => item.noradId === 58918)?.identityStatus, "unverified");
+});
+
+test("binds TY-50 to a provisional XSAR profile without changing its X-band geometry", () => {
+  const ty50 = trackedSarSatellites.find((item) => item.noradId === 69100);
+  assert.equal(ty50?.commonName, "TY-50");
+  assert.equal(ty50?.commonCode, "电建一号");
+  assert.equal(ty50?.payloadProfileId, "ty-xsar-provisional-v1");
+  const xsar = sarPayloadProfiles["ty-xsar-provisional-v1"];
+  const csar = sarPayloadProfiles["ty-csar-v1"];
+  assert.equal(xsar.payloadType, "XSAR");
+  assert.equal(xsar.frequencyBand, "X");
+  assert.deepEqual(xsar.lookSides, ["left", "right"]);
+  assert.deepEqual(xsar.incidenceAngleDeg, { min: 17, max: 50 });
+  assert.equal(xsar.parameterStatus, "provisional_assumption");
+  assert.deepEqual(
+    xsar.imagingModes.map(({ id, resolutionM, nominalSceneCrossTrackKm, nominalSceneAlongTrackKm }) => ({ id, resolutionM, nominalSceneCrossTrackKm, nominalSceneAlongTrackKm })),
+    csar.imagingModes.map(({ id, resolutionM, nominalSceneCrossTrackKm, nominalSceneAlongTrackKm }) => ({ id, resolutionM, nominalSceneCrossTrackKm, nominalSceneAlongTrackKm })),
+  );
+  const snapshot = buildSatelliteOrbitSnapshot([], new Date("2026-08-19T00:00:00Z"));
+  assert.equal(snapshot.find((item) => item.noradId === 69100)?.payloadProfile?.id, "ty-xsar-provisional-v1");
 });

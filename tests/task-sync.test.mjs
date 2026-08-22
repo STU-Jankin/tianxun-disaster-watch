@@ -32,3 +32,22 @@ test("task sync retains operator-authored AOI and bounded orbit-screening proven
   assert.equal(compact.satelliteNoradId, 51832);
   assert.equal(compact.minimumGroundTrackDistanceKm, 72.5);
 });
+
+test("task sync retains a bounded assumed-sensor footprint for map review", () => {
+  const footprint = { type: "Polygon", coordinates: [[[120, 30], [120.2, 30], [120.2, 30.2], [120, 30.2], [120, 30]]] };
+  const compact = compactSatelliteTaskForSync({
+    taskId: "task-3",
+    simulationLevel: "assumed_sensor",
+    opportunityLookSide: "right",
+    opportunityCoveragePercent: 96.5,
+    opportunitySpatialResolutionM: 3,
+    opportunitySceneCrossTrackKm: 25,
+    opportunitySceneAlongTrackKm: 25,
+    sensorParameterStatus: "provisional_assumption",
+    opportunityFootprint: footprint,
+  });
+  assert.deepEqual(compact.opportunityFootprint, footprint);
+  assert.equal(compact.opportunityLookSide, "right");
+  assert.equal(compact.opportunityCoveragePercent, 96.5);
+  assert.equal(compact.opportunitySceneCrossTrackKm, 25);
+});

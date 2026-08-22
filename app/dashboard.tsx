@@ -11,7 +11,7 @@ import {
   type ScopeId,
 } from "../lib/disasters";
 import { allowedOperatorTaskStatuses, canTransitionTask, safeHttpUrl, validateSatelliteTask } from "../lib/task-contract";
-import { buildTaskAoi, customAoiPartCount, normalizeCustomAoiGeoJson, type CustomAoiGeometry } from "../lib/task-aoi";
+import { buildTaskAoi, customAoiPartCount, normalizeCustomAoiGeoJson, type CustomAoiGeometry, type GeoGeometry } from "../lib/task-aoi";
 import { aoiFingerprint, eventRevisionFingerprint, latestEventVersionsByMasterId } from "../lib/event-integrity";
 import { cycloneTaskAoiSlices, cycloneUncertaintyGeometry, cycloneWindGeometry, type CycloneTaskAoiSlice } from "../lib/cyclone-forecast";
 import { weatherImagingWindows, type WeatherForecastReady, type WeatherForecastResponse } from "../lib/qweather";
@@ -135,7 +135,14 @@ type SatelliteTask = {
   visibilityComputedAt?: string;
   incidenceAngleDeg?: number;
   offNadirAngleDeg?: number;
-  simulationLevel?: "orbit_only" | "sensor_model";
+  opportunityLookSide?: "left" | "right";
+  opportunityCoveragePercent?: number;
+  opportunitySpatialResolutionM?: number;
+  opportunitySceneCrossTrackKm?: number;
+  opportunitySceneAlongTrackKm?: number;
+  sensorParameterStatus?: "user_provided" | "provisional_assumption";
+  opportunityFootprint?: GeoGeometry;
+  simulationLevel?: "orbit_only" | "assumed_sensor" | "sensor_model";
   satelliteNoradId?: number;
   closestApproachAt?: string;
   closestSubpointLatitude?: number;
@@ -163,8 +170,14 @@ type VisibilityWindow = {
   coveragePercent?: number;
   incidenceAngleDeg?: number;
   offNadirAngleDeg?: number;
+  lookSide?: "left" | "right";
+  spatialResolutionM?: number;
+  nominalSceneCrossTrackKm?: number;
+  nominalSceneAlongTrackKm?: number;
+  parameterStatus?: "user_provided" | "provisional_assumption";
+  footprintGeometry?: GeoGeometry;
   orbitDirection?: "ascending" | "descending";
-  simulationLevel?: "orbit_only" | "sensor_model";
+  simulationLevel?: "orbit_only" | "assumed_sensor" | "sensor_model";
   satelliteLabel?: string;
   satelliteNoradId?: number;
   closestApproachAt?: string;
@@ -179,7 +192,7 @@ type VisibilityWindow = {
 
 type VisibilityState = {
   state: "idle" | "loading" | "ready" | "needs_config" | "error";
-  mode?: "orbit_only" | "sensor_model";
+  mode?: "orbit_only" | "assumed_sensor" | "sensor_model";
   message?: string;
   windows: VisibilityWindow[];
 };
@@ -191,6 +204,16 @@ type SatelliteOrbitView = {
   commonName: string;
   commonCode?: string;
   identityStatus: "configured" | "unverified";
+  payloadProfile?: {
+    id: string;
+    payloadType: "CSAR" | "XSAR";
+    frequencyBand: "C" | "X";
+    lookSides: Array<"left" | "right">;
+    incidenceAngleDeg: { min: number; max: number };
+    imagingModes: Array<{ id: string; name: string; resolutionM: number; nominalSceneCrossTrackKm: number; nominalSceneAlongTrackKm: number }>;
+    parameterStatus: "user_provided" | "provisional_assumption";
+    parameterNote: string;
+  };
   providerName?: string;
   epoch?: string;
   fetchedAt?: string;
@@ -510,6 +533,8 @@ export function Dashboard() {
     const opportunityReset: Partial<SatelliteTask> = invalidatesOpportunity ? {
       satelliteId: undefined, instrumentId: undefined, imagingMode: undefined, opportunityId: undefined,
       orbitVersion: undefined, visibilityComputedAt: undefined, incidenceAngleDeg: undefined, offNadirAngleDeg: undefined,
+      opportunityLookSide: undefined, opportunityCoveragePercent: undefined, opportunitySpatialResolutionM: undefined,
+      opportunitySceneCrossTrackKm: undefined, opportunitySceneAlongTrackKm: undefined, sensorParameterStatus: undefined, opportunityFootprint: undefined,
       simulationLevel: undefined, satelliteNoradId: undefined, closestApproachAt: undefined,
       closestSubpointLatitude: undefined, closestSubpointLongitude: undefined, minimumGroundTrackDistanceKm: undefined,
       orbitSearchRadiusKm: undefined, opportunityOrbitDirection: undefined,
@@ -1308,7 +1333,7 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
     const layer = opportunityLayerRef.current;
     if (!mapReady || !map || !layer) return;
     layer.clearLayers();
-    if (activeTask?.simulationLevel !== "orbit_only" || !activeTask.closestApproachAt || !activeTask.satelliteNoradId) return;
+    if (!activeTask || !["orbit_only", "assumed_sensor"].includes(String(activeTask.simulationLevel)) || !activeTask.closestApproachAt || !activeTask.satelliteNoradId) return;
     const satellite = fleet.satellites.find((candidate) => candidate.noradId === activeTask.satelliteNoradId && candidate.orbitStatus === "current" && candidate.tleLine1 && candidate.tleLine2);
     if (!satellite) return;
     let cancelled = false;
@@ -1319,19 +1344,34 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
       if (!position) return;
       // Keep the review overlay close to the actual coarse-screening interval;
       // a full orbital arc would dwarf the AOI and falsely resemble a swath.
-      const track = orbit.buildGroundTrack(satellite.tleLine1!, satellite.tleLine2!, at, 2, 2, 15);
+      const assumedSensor = activeTask.simulationLevel === "assumed_sensor";
+      const track = orbit.buildGroundTrack(satellite.tleLine1!, satellite.tleLine2!, at, assumedSensor ? 0.25 : 2, assumedSensor ? 0.25 : 2, assumedSensor ? 5 : 15);
       [...track.past, ...track.future].forEach((segment) => L.polyline(segment.map(([latitude, longitude]) => [latitude, unwrapLongitudeNear(longitude, activeTask.longitude)]), { color: "#6546b3", weight: 3, opacity: 0.92, dashArray: "8 4", interactive: false, className: "selected-opportunity-track" }).addTo(layer));
       const radiusKm = activeTask.orbitSearchRadiusKm ?? 350;
-      const searchCircle = L.circle([position.latitude, position.longitude], { radius: radiusKm * 1_000, color: "#6546b3", weight: 2, fillColor: "#8d78cf", fillOpacity: 0.08, dashArray: "6 5", className: "selected-opportunity-search-circle" });
-      searchCircle.bindTooltip(`TLE 轨道粗筛搜索圈 · 半径 ${radiusKm} km（不是 SAR 幅宽）`, { sticky: true });
-      searchCircle.addTo(layer);
+      if (activeTask.simulationLevel === "orbit_only") {
+        const searchCircle = L.circle([position.latitude, position.longitude], { radius: radiusKm * 1_000, color: "#6546b3", weight: 2, fillColor: "#8d78cf", fillOpacity: 0.08, dashArray: "6 5", className: "selected-opportunity-search-circle" });
+        searchCircle.bindTooltip(`TLE 轨道粗筛搜索圈 · 半径 ${radiusKm} km（不是 SAR 幅宽）`, { sticky: true });
+        searchCircle.addTo(layer);
+      } else {
+        const lookLine = L.polyline([[position.latitude, position.longitude], [activeTask.latitude, activeTask.longitude]], { color: "#6546b3", weight: 2, opacity: 0.8, dashArray: "5 4", interactive: true });
+        lookLine.bindTooltip(`假设传感器侧视关系 · 地面轨迹距AOI中心约 ${activeTask.minimumGroundTrackDistanceKm ?? "--"} km`, { sticky: true });
+        lookLine.addTo(layer);
+      }
       const closestMarker = L.circleMarker([position.latitude, position.longitude], { radius: 7, color: "#6546b3", weight: 3, fillColor: "#fff", fillOpacity: 1, className: "selected-opportunity-subpoint" });
       closestMarker.bindTooltip(`${satellite.interfaceName || satellite.commonName} · 最近子星点 · ${formatTimeWithYear(position.at)} UTC+08 · ${position.direction === "ascending" ? "升轨" : "降轨"} · 距 AOI 中心约 ${activeTask.minimumGroundTrackDistanceKm ?? "--"} km`, { direction: "top" });
       closestMarker.addTo(layer);
-      const bounds = layer.getBounds();
       const aoiBounds = aoiLayerRef.current?.getBounds();
-      if (aoiBounds?.isValid()) bounds.extend(aoiBounds);
-      if (bounds.isValid()) fitWithOverlay(map, bounds, 7);
+      if (assumedSensor && activeTask.opportunityFootprint) {
+        const footprintLayer = L.geoJSON(unwrapForecastGeometry(activeTask.opportunityFootprint as DisasterEvent["geometry"], activeTask.longitude) as GeoJSON.GeoJsonObject, { style: { color: "#006dc7", weight: 3, fillColor: "#2c8ee0", fillOpacity: 0.18, dashArray: "7 4", className: "selected-opportunity-footprint" } }).addTo(layer);
+        footprintLayer.bindTooltip(`${activeTask.imagingMode ?? "成像模式"} · 标称场景 ${activeTask.opportunitySceneCrossTrackKm ?? "--"}×${activeTask.opportunitySceneAlongTrackKm ?? "--"} km · 预计覆盖 ${activeTask.opportunityCoveragePercent ?? "--"}%`, { sticky: true });
+        const focusBounds = footprintLayer.getBounds();
+        if (aoiBounds?.isValid()) focusBounds.extend(aoiBounds);
+        if (focusBounds.isValid()) fitWithOverlay(map, focusBounds, 12);
+      } else {
+        const bounds = layer.getBounds();
+        if (aoiBounds?.isValid()) bounds.extend(aoiBounds);
+        if (bounds.isValid()) fitWithOverlay(map, bounds, 7);
+      }
     }).catch(() => setMapError("已选 TLE 轨道机会无法绘制；AOI 和任务字段仍可使用。"));
     return () => { cancelled = true; layer.clearLayers(); };
   }, [activeTask, fitWithOverlay, fleet.satellites, mapReady]);
@@ -1419,7 +1459,7 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
       <small>{activeForecastFrame.windFields.length ? activeForecastFrame.windFields.map((field) => `≥${field.thresholdKnots} kt 象限风圈`).join(" · ") : "本时次无可用官方风圈"} · {activeForecastFrame.uncertaintyRadiusKm || activeForecastFrame.uncertaintyGeometry ? "含分时不确定区" : selected?.cycloneForecast?.uncertaintyGeometry ? "显示本报次总体不确定区" : "无不确定区数据"}</small>
     </div> : null}
     {activeTask ? <div className="map-review-toolbar" role="group" aria-label="任务AOI地图复核">
-      <div><strong>{activeTask.title}</strong><span>{["polygon", "multi"].includes(activeTask.aoiType) ? `${customAoiPartCount(activeTask.customGeometry)} 块自定义 AOI` : "正在显示任务 AOI"}{activeTask.simulationLevel === "orbit_only" ? ` · TLE 轨道粗筛 · 最近约 ${activeTask.minimumGroundTrackDistanceKm ?? "--"} km` : ""}</span></div>
+      <div><strong>{activeTask.title}</strong><span>{["polygon", "multi"].includes(activeTask.aoiType) ? `${customAoiPartCount(activeTask.customGeometry)} 块自定义 AOI` : "正在显示任务 AOI"}{activeTask.simulationLevel === "orbit_only" ? ` · TLE 轨道粗筛 · 最近约 ${activeTask.minimumGroundTrackDistanceKm ?? "--"} km` : activeTask.simulationLevel === "assumed_sensor" ? ` · 假设传感器试算 · ${activeTask.imagingMode ?? "模式待选"}` : ""}</span></div>
       {["polygon", "multi"].includes(activeTask.aoiType) ? <>
         <button onClick={() => { setDrawingTaskId(activeTask.taskId); setDrawing(true); setDraftVertices([]); setDrawingError(""); }}>{activeTask.aoiType === "multi" && activeTask.customGeometry ? "添加子区" : "开始绘制"}</button>
         <button onClick={() => setDraftVertices((current) => current.slice(0, -1))} disabled={!activeDrawing || !activeDraftVertices.length}>撤销顶点</button>
@@ -2023,6 +2063,8 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
           <div><b>{satellite.interfaceName || satellite.commonName}</b><span>NORAD {satellite.noradId}</span></div>
           <strong>{satellite.commonCode || satellite.interfaceCode || satellite.commonName}</strong>
           <small>{satellite.identityStatus === "unverified" ? "业务身份待核验" : "业务映射已配置"} · CelesTrak：{satellite.providerName || "尚无返回名称"}</small>
+          {satellite.payloadProfile ? <small>{satellite.payloadProfile.payloadType} · {satellite.payloadProfile.frequencyBand}频段 · 左右侧视 · 入射角 {satellite.payloadProfile.incidenceAngleDeg.min}°～{satellite.payloadProfile.incidenceAngleDeg.max}° · {satellite.payloadProfile.parameterStatus === "provisional_assumption" ? "临时假设参数" : "用户提供参数"}</small> : null}
+          {satellite.payloadProfile ? <small>{satellite.payloadProfile.imagingModes.map((mode) => `${mode.name} ${mode.resolutionM}m/${mode.nominalSceneCrossTrackKm}×${mode.nominalSceneAlongTrackKm}km`).join(" · ")}</small> : null}
           <time>{satellite.epoch ? `轨道历元 ${formatTimeWithYear(satellite.epoch)} UTC+08 · ${satellite.elementAgeHours ?? "--"}小时` : satellite.lastError || "尚未取得有效TLE"}</time>
         </article>)}
         <footer>每天自动刷新一次；失败保留上次有效TLE。业务名称与CelesTrak目录名称分开保存。 <a href="https://celestrak.org/NORAD/documentation/gp-data-formats.php" target="_blank" rel="noreferrer">接口说明 ↗</a></footer>
@@ -2089,14 +2131,15 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
         <div className={`visibility-box ${visibility[task.taskId]?.state ?? "idle"}`}>
           <button onClick={() => void calculateVisibility(task)} disabled={visibility[task.taskId]?.state === "loading"}>{visibility[task.taskId]?.state === "loading" ? "正在计算轨道机会…" : "计算卫星任务机会"}</button>
           {visibility[task.taskId]?.message ? <p>{visibility[task.taskId].message}</p> : null}
-          {task.opportunityId ? <p className="selected-opportunity">已选机会：{task.satelliteId} · {task.opportunityId} · {task.simulationLevel === "orbit_only" ? `轨道级粗筛${task.minimumGroundTrackDistanceKm == null ? "" : ` · 最近 ${task.minimumGroundTrackDistanceKm} km`}` : "传感器级仿真"}</p> : null}
+          {task.opportunityId ? <p className="selected-opportunity">已选机会：{task.satelliteId} · {task.opportunityId} · {task.simulationLevel === "orbit_only" ? `轨道级粗筛${task.minimumGroundTrackDistanceKm == null ? "" : ` · 最近 ${task.minimumGroundTrackDistanceKm} km`}` : task.simulationLevel === "assumed_sensor" ? "假设传感器试算" : "传感器级仿真"}</p> : null}
           {visibility[task.taskId]?.windows.map((window, windowIndex) => <div key={window.opportunityId || `${window.start}-${windowIndex}`}>
-            <strong>{window.satelliteLabel || window.satelliteId || `窗口 ${windowIndex + 1}`}{window.simulationLevel === "orbit_only" ? " · 轨道近接候选" : ""}</strong>
+            <strong>{window.satelliteLabel || window.satelliteId || `窗口 ${windowIndex + 1}`}{window.simulationLevel === "orbit_only" ? " · 轨道近接候选" : window.simulationLevel === "assumed_sensor" ? ` · ${window.imagingMode ?? "假设传感器"}` : ""}</strong>
             <span>{formatTimeWithYear(window.start)} — {formatTimeWithYear(window.end)} UTC+08</span>
             {window.closestApproachAt ? <small>最近近接 {formatTimeWithYear(window.closestApproachAt)} UTC+08 · 地面轨迹距 AOI 中心 {window.minimumGroundTrackDistanceKm ?? "--"} km · 高度 {window.altitudeKm ?? "--"} km</small> : null}
-            <small>{window.coveragePercent == null ? (window.simulationLevel === "orbit_only" ? "真实覆盖率未计算" : "覆盖率待仿真服务返回") : `覆盖 ${window.coveragePercent}%`}{window.incidenceAngleDeg == null ? (window.simulationLevel === "orbit_only" ? " · 地面入射角未计算" : " · 入射角待验证") : ` · 地面入射角 ${window.incidenceAngleDeg}°`}{window.offNadirAngleDeg == null ? "" : ` · 离轴 ${window.offNadirAngleDeg}°`}{window.orbitDirection ? ` · ${window.orbitDirection === "ascending" ? "升轨" : "降轨"}` : ""}</small>
+            <small>{window.coveragePercent == null ? (window.simulationLevel === "orbit_only" ? "真实覆盖率未计算" : "覆盖率待仿真服务返回") : `覆盖 ${window.coveragePercent}%`}{window.incidenceAngleDeg == null ? (window.simulationLevel === "orbit_only" ? " · 地面入射角未计算" : " · 入射角待验证") : ` · 地面入射角 ${window.incidenceAngleDeg}°`}{window.offNadirAngleDeg == null ? "" : ` · 离轴 ${window.offNadirAngleDeg}°`}{window.lookSide ? ` · ${window.lookSide === "left" ? "左视" : "右视"}` : ""}{window.orbitDirection ? ` · ${window.orbitDirection === "ascending" ? "升轨" : "降轨"}` : ""}</small>
+            {window.spatialResolutionM != null ? <small>标称分辨率 {window.spatialResolutionM} m · 标称场景 {window.nominalSceneCrossTrackKm}×{window.nominalSceneAlongTrackKm} km · {window.parameterStatus === "provisional_assumption" ? "临时假设参数" : "当前登记参数"}</small> : null}
             {window.constraintNotes?.map((note) => <small className="constraint-note" key={note}>{note}</small>)}
-            <button className="choose-opportunity" onClick={() => onUpdate(task.taskId, { satelliteId: window.satelliteId, instrumentId: window.instrumentId, imagingMode: window.imagingMode, opportunityId: window.opportunityId, orbitVersion: window.orbitVersion, visibilityComputedAt: window.computedAt, incidenceAngleDeg: window.incidenceAngleDeg, offNadirAngleDeg: window.offNadirAngleDeg, simulationLevel: window.simulationLevel ?? "sensor_model", satelliteNoradId: window.satelliteNoradId, closestApproachAt: window.closestApproachAt, closestSubpointLatitude: window.closestSubpoint?.latitude, closestSubpointLongitude: window.closestSubpoint?.longitude, minimumGroundTrackDistanceKm: window.minimumGroundTrackDistanceKm, orbitSearchRadiusKm: window.searchRadiusKm, opportunityOrbitDirection: window.orbitDirection })}>{task.opportunityId === window.opportunityId ? "已选择" : window.simulationLevel === "orbit_only" ? "选择为轨道粗筛候选" : "选择此仿真机会"}</button>
+            <button className="choose-opportunity" onClick={() => onUpdate(task.taskId, { satelliteId: window.satelliteId, instrumentId: window.instrumentId, imagingMode: window.imagingMode, opportunityId: window.opportunityId, orbitVersion: window.orbitVersion, visibilityComputedAt: window.computedAt, incidenceAngleDeg: window.incidenceAngleDeg, offNadirAngleDeg: window.offNadirAngleDeg, opportunityLookSide: window.lookSide, opportunityCoveragePercent: window.coveragePercent, opportunitySpatialResolutionM: window.spatialResolutionM, opportunitySceneCrossTrackKm: window.nominalSceneCrossTrackKm, opportunitySceneAlongTrackKm: window.nominalSceneAlongTrackKm, sensorParameterStatus: window.parameterStatus, opportunityFootprint: window.footprintGeometry, simulationLevel: window.simulationLevel ?? "sensor_model", satelliteNoradId: window.satelliteNoradId, closestApproachAt: window.closestApproachAt, closestSubpointLatitude: window.closestSubpoint?.latitude, closestSubpointLongitude: window.closestSubpoint?.longitude, minimumGroundTrackDistanceKm: window.minimumGroundTrackDistanceKm, orbitSearchRadiusKm: window.searchRadiusKm, opportunityOrbitDirection: window.orbitDirection })}>{task.opportunityId === window.opportunityId ? "已选择" : window.simulationLevel === "orbit_only" ? "选择为轨道粗筛候选" : window.simulationLevel === "assumed_sensor" ? "选择为试算候选" : "选择此仿真机会"}</button>
           </div>)}
         </div>
       </article>)}
@@ -2366,6 +2409,13 @@ function migrateSatelliteTask(task: Partial<SatelliteTask>): SatelliteTask {
     visibilityComputedAt: task.visibilityComputedAt,
     incidenceAngleDeg: task.incidenceAngleDeg,
     offNadirAngleDeg: task.offNadirAngleDeg,
+    opportunityLookSide: task.opportunityLookSide,
+    opportunityCoveragePercent: task.opportunityCoveragePercent,
+    opportunitySpatialResolutionM: task.opportunitySpatialResolutionM,
+    opportunitySceneCrossTrackKm: task.opportunitySceneCrossTrackKm,
+    opportunitySceneAlongTrackKm: task.opportunitySceneAlongTrackKm,
+    sensorParameterStatus: task.sensorParameterStatus,
+    opportunityFootprint: task.opportunityFootprint,
     simulationLevel: task.simulationLevel,
     satelliteNoradId: task.satelliteNoradId,
     closestApproachAt: task.closestApproachAt,

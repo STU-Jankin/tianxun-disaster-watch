@@ -53,6 +53,12 @@ export function buildTaskExportArtifact(tasks: Record<string, unknown>[], format
       minimum_ground_track_distance_km: task.minimumGroundTrackDistanceKm,
       orbit_search_radius_km: task.orbitSearchRadiusKm,
       opportunity_orbit_direction: task.opportunityOrbitDirection,
+      opportunity_look_side: task.opportunityLookSide,
+      estimated_coverage_percent: task.opportunityCoveragePercent,
+      estimated_resolution_m: task.opportunitySpatialResolutionM,
+      nominal_scene_cross_track_km: task.opportunitySceneCrossTrackKm,
+      nominal_scene_along_track_km: task.opportunitySceneAlongTrackKm,
+      sensor_parameter_status: task.sensorParameterStatus,
       event_revision_sha256: task.eventRevision,
       aoi_sha256: task.aoiHash,
       aoi_geojson: stableJson(task.aoi),
@@ -71,13 +77,19 @@ export function buildTaskExportArtifact(tasks: Record<string, unknown>[], format
 }
 
 function taskGeoJsonFeatures(task: Record<string, unknown>) {
-  const properties = withoutKeys(task, ["aoi", "sourceGeometry", "customGeometry", "timeIndexedAoi", "cycloneForecast"]);
+  const properties = withoutKeys(task, ["aoi", "sourceGeometry", "customGeometry", "timeIndexedAoi", "cycloneForecast", "opportunityFootprint"]);
   const features: Record<string, unknown>[] = [{
     type: "Feature",
     id: task.taskId,
     geometry: task.aoi,
     properties: { ...properties, geometryRole: "planning_aoi" },
   }];
+  if (task.opportunityFootprint) features.push({
+    type: "Feature",
+    id: `${task.taskId}-opportunity-footprint`,
+    geometry: task.opportunityFootprint,
+    properties: { ...properties, geometryRole: "assumed_sensor_footprint" },
+  });
   const slices = Array.isArray(task.timeIndexedAoi) ? task.timeIndexedAoi : [];
   slices.forEach((rawSlice, index) => {
     if (!rawSlice || typeof rawSlice !== "object" || Array.isArray(rawSlice)) return;

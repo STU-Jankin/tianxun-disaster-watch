@@ -130,10 +130,12 @@ test("models canonical events, evidence provenance and AOI dispatch gates", asyn
   for (const table of ["canonical_events", "event_evidence", "satellite_tasks", "task_status_history"]) assert.ok(schema.includes(table));
 });
 
-test("falls back to an explicit TLE-only screen when a sensor simulator is not configured", async () => {
+test("uses configured assumed-SAR geometry and retains an explicit TLE-only fallback", async () => {
   const { readFile } = await import("node:fs/promises");
   const route = await readFile(new URL("../app/api/visibility/route.ts", import.meta.url), "utf8");
   assert.match(route, /SATELLITE_VISIBILITY_API_URL/);
+  assert.match(route, /screenConfiguredSarOpportunities/);
+  assert.match(route, /mode: "assumed_sensor"/);
   assert.match(route, /screenTleOpportunities/);
   assert.match(route, /mode: "orbit_only"/);
   assert.match(route, /windows/);
