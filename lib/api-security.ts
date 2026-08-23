@@ -42,7 +42,9 @@ export function apiRole(request: Request): ApiRole | null {
 }
 
 export function rejectCrossOriginBrowserWrite(request: Request) {
-  if (request.headers.get("authorization")?.startsWith("Bearer ") || request.headers.get("x-tianxun-proxy-secret")) return null;
+  // A trusted reverse proxy authenticates the server-to-server hop, not the
+  // browser origin. Keep same-origin enforcement for proxied browser writes.
+  if (request.headers.get("authorization")?.startsWith("Bearer ")) return null;
   const origin = request.headers.get("origin");
   if (!origin) return null;
   try {

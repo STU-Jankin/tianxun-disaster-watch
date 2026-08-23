@@ -43,3 +43,35 @@ test("enforces API roles and ignores forged proxy identity headers", async () =>
     }
   }
 });
+
+test("trusted proxy authentication does not bypass browser same-origin checks", async () => {
+  const previousProxySecret = process.env.TIANXUN_TRUSTED_PROXY_SECRET;
+  process.env.TIANXUN_TRUSTED_PROXY_SECRET = "p".repeat(64);
+  try {
+    const { rejectCrossOriginBrowserWrite } = await import(new URL("../lib/api-security.ts", import.meta.url));
+    const crossOrigin = new Request("https://watch.example/api/tasks", {
+      method: "POST",
+      headers: {
+        Origin: "https://attacker.example",
+        "X-Tianxun-Proxy-Secret": "p".repeat(64),
+        "X-Tianxun-User": "public-203.0.113.8",
+        "X-Tianxun-Role": "operator",
+      },
+    });
+    assert.equal(rejectCrossOriginBrowserWrite(crossOrigin)?.status, 403);
+
+    const sameOrigin = new Request("https://watch.example/api/tasks", {
+      method: "POST",
+      headers: {
+        Origin: "https://watch.example",
+        "X-Tianxun-Proxy-Secret": "p".repeat(64),
+        "X-Tianxun-User": "public-203.0.113.8",
+        "X-Tianxun-Role": "operator",
+      },
+    });
+    assert.equal(rejectCrossOriginBrowserWrite(sameOrigin), null);
+  } finally {
+    if (previousProxySecret === undefined) delete process.env.TIANXUN_TRUSTED_PROXY_SECRET;
+    else process.env.TIANXUN_TRUSTED_PROXY_SECRET = previousProxySecret;
+  }
+});
