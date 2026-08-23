@@ -2036,7 +2036,10 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
   const calculateVisibility = async (task: SatelliteTask) => {
     setVisibility((current) => ({ ...current, [task.taskId]: { state: "loading", windows: [] } }));
     try {
-      const response = await fetch("/api/visibility", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ taskId: task.taskId, revision: task.revision }) });
+      const requestBody = storageMode === "public-read-only"
+        ? compactSatelliteTaskForSync(task as unknown as Record<string, unknown>)
+        : { taskId: task.taskId, revision: task.revision };
+      const response = await fetch("/api/visibility", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody) });
       const result = await response.json() as { state?: VisibilityState["state"]; mode?: VisibilityState["mode"]; message?: string; windows?: VisibilityWindow[]; orbitVersion?: string; computedAt?: string };
       const windows = (result.windows ?? []).map((window) => ({ ...window, orbitVersion: window.orbitVersion ?? result.orbitVersion, computedAt: window.computedAt ?? result.computedAt }));
       setVisibility((current) => ({ ...current, [task.taskId]: { state: result.state ?? (response.ok ? "ready" : "error"), mode: result.mode, message: result.message, windows } }));

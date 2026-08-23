@@ -1,5 +1,5 @@
 import { ApiInputError, apiActor, apiRole, authorizeApiRequest, enforceRateLimit, readJsonObject, rejectCrossOriginBrowserWrite } from "../../../lib/api-security";
-import { validateSatelliteTask } from "../../../lib/task-contract";
+import { unknownTaskFields, validateSatelliteTask } from "../../../lib/task-contract";
 import { getCanonicalEventForTask, getSatelliteTask, listSatelliteOrbitCache } from "../../../db/operational";
 import { buildTaskAoi } from "../../../lib/task-aoi";
 import { aoiFingerprint, eventRevisionFingerprint, geometryEquals } from "../../../lib/event-integrity";
@@ -19,22 +19,77 @@ export async function POST(request: Request) {
   catch (error) { return Response.json({ state: "error", windows: [], message: error instanceof Error ? error.message : "请求无效" }, { status: error instanceof ApiInputError ? error.status : 400 }); }
   const taskId = typeof requestTask.taskId === "string" ? requestTask.taskId.trim() : "";
   if (!taskId) return Response.json({ state: "error", windows: [], message: "缺少 taskId" }, { status: 400 });
+  const statelessPublicTrial = request.headers.get("x-tianxun-stateless-visibility") === "1" && apiActor(request).startsWith("public-");
   let storedTask;
   try { storedTask = await getSatelliteTask(taskId, apiRole(request) === "admin" ? undefined : apiActor(request)); }
   catch (error) {
     console.error("visibility task lookup unavailable", error);
     return Response.json({ state: "error", windows: [], message: "任务数据库暂不可用" }, { status: 503 });
   }
-  if (!storedTask) return Response.json({ state: "error", windows: [], message: "任务尚未保存、已取消或不存在" }, { status: 404 });
-  if (Number(requestTask.revision) !== Number(storedTask.revision)) {
-    return Response.json({ state: "error", windows: [], message: "任务已有新版本，请刷新后重新计算" }, { status: 409 });
+  let canonical: Awaited<ReturnType<typeof getCanonicalEventForTask>> = null;
+  let task: Record<string, unknown>;
+  if (storedTask) {
+    if (Number(requestTask.revision) !== Number(storedTask.revision)) {
+      return Response.json({ state: "error", windows: [], message: "任务已有新版本，请刷新后重新计算" }, { status: 409 });
+    }
+    task = storedTask as Record<string, unknown>;
+  } else if (statelessPublicTrial) {
+    const unknownFields = unknownTaskFields(requestTask);
+    if (unknownFields.length) return Response.json({ state: "error", windows: [], message: "任务包含未允许字段" }, { status: 400 });
+    if (!["candidate", "reviewed"].includes(String(requestTask.status))) {
+      return Response.json({ state: "error", windows: [], message: "试算只接受候选或已复核任务" }, { status: 400 });
+    }
+    const masterEventId = typeof requestTask.masterEventId === "string" ? requestTask.masterEventId.trim() : "";
+    if (!masterEventId) return Response.json({ state: "error", windows: [], message: "缺少 masterEventId" }, { status: 400 });
+    canonical = await getCanonicalEventForTask(masterEventId, {
+      eventId: typeof requestTask.eventId === "string" ? requestTask.eventId : undefined,
+      entityKey: typeof requestTask.entityKey === "string" ? requestTask.entityKey : undefined,
+      hazard: typeof requestTask.hazard === "string" ? requestTask.hazard : undefined,
+    });
+    if (!canonical) return Response.json({ state: "error", windows: [], message: "主事件不存在或尚未可靠入库" }, { status: 409 });
+    const sourceGeometry = canonical.event.cycloneForecast?.impactGeometry ?? canonical.event.geometry;
+    if (requestTask.aoiApproval === "source_verified" && (canonical.event.dispatchEligibility !== "ready" || requestTask.aoiType !== "source")) {
+      return Response.json({ state: "error", windows: [], message: "来源坐标不具备直接试算资格，请先人工核对 AOI" }, { status: 409 });
+    }
+    task = {
+      ...requestTask,
+      eventId: canonical.event.id,
+      masterEventId: canonical.event.masterEventId,
+      entityKey: canonical.event.entityKey,
+      title: canonical.event.title,
+      hazard: canonical.event.hazard,
+      priority: canonical.event.priority,
+      latitude: canonical.event.latitude,
+      longitude: canonical.event.longitude,
+      eventOccurredAt: canonical.event.occurredAt,
+      eventUpdatedAt: canonical.event.updatedAt,
+      eventIssuedAt: canonical.event.issuedAt,
+      eventValidFrom: canonical.event.validFrom,
+      eventValidTo: canonical.event.validTo,
+      phenomenonStage: canonical.event.phenomenonStage,
+      observationPhase: canonical.event.observationPhase,
+      source: canonical.event.source,
+      sourceUrl: canonical.event.sourceUrl,
+      locationQuality: canonical.event.locationQuality,
+      locationAccuracyKm: canonical.event.locationAccuracyKm,
+      evidenceCount: canonical.event.evidenceCount,
+      cycloneForecast: canonical.event.cycloneForecast,
+      sourceGeometry,
+      eventRevision: eventRevisionFingerprint(canonical.event),
+      approvedAt: new Date().toISOString(),
+      approvedBy: apiActor(request),
+    };
+    const statelessAoi = buildTaskAoi(task);
+    if (!statelessAoi) return Response.json({ state: "error", windows: [], message: "服务端无法重建任务 AOI" }, { status: 400 });
+    task.aoiHash = aoiFingerprint(statelessAoi);
+  } else {
+    return Response.json({ state: "error", windows: [], message: "任务尚未保存、已取消或不存在" }, { status: 404 });
   }
-  const task = storedTask as Record<string, unknown>;
   const validation = validateSatelliteTask(task, { requireApproved: true, requirePayload: true, requireProvenance: true });
   if (!validation.ok) return Response.json({ state: "error", windows: [], message: validation.errors.join("；") }, { status: 400 });
   const aoi = buildTaskAoi(task);
   if (!aoi) return Response.json({ state: "error", windows: [], message: "服务端无法重建任务 AOI" }, { status: 400 });
-  const canonical = await getCanonicalEventForTask(String(task.masterEventId));
+  canonical ??= await getCanonicalEventForTask(String(task.masterEventId));
   if (!canonical || ["resolved", "archived"].includes(canonical.lifecycleStatus) || Date.parse(canonical.observationExpiresAt) <= Date.now()) {
     return Response.json({ state: "error", windows: [], message: "关联主事件不存在、已解除或已超过观测期" }, { status: 409 });
   }

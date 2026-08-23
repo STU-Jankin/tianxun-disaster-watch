@@ -262,15 +262,16 @@ test("adds a bounded phase-three response simulation, disruption review and infr
 test("keeps the public Nginx trial bounded and leaves internal services unexposed", async () => {
   const { readFile } = await import("node:fs/promises");
   const nginx = await readFile(new URL("../vps/nginx/tianxun-public-readonly.conf", import.meta.url), "utf8");
+  const visibilityRoute = await readFile(new URL("../app/api/visibility/route.ts", import.meta.url), "utf8");
   assert.match(nginx, /listen 80 default_server/);
-  assert.equal(nginx.match(/tianxun-proxy-secret\.conf/g)?.length, 8);
+  assert.equal(nginx.match(/tianxun-proxy-secret\.conf/g)?.length, 6);
   assert.match(nginx, /location = \/api\/weather[\s\S]*limit_req[\s\S]*tianxun-proxy-secret\.conf/);
   assert.match(nginx, /location = \/api\/tasks[\s\S]*public-read-only[\s\S]*return 403/);
   assert.match(nginx, /location = \/api\/road-disruptions[\s\S]*public-read-only[\s\S]*return 403/);
-  assert.match(nginx, /location = \/api\/tasks[\s\S]*limit_except GET POST DELETE[\s\S]*X-Tianxun-Role "operator"/);
-  assert.match(nginx, /location = \/api\/tasks\/export[\s\S]*limit_except POST[\s\S]*X-Tianxun-Role "operator"/);
-  assert.match(nginx, /location = \/api\/visibility[\s\S]*limit_except POST[\s\S]*X-Tianxun-Role "operator"/);
+  assert.match(nginx, /location = \/api\/tasks[\s\S]*storage":"public-read-only/);
+  assert.match(nginx, /location = \/api\/visibility[\s\S]*limit_except POST[\s\S]*X-Tianxun-Role "operator"[\s\S]*X-Tianxun-Stateless-Visibility "1"/);
   assert.match(nginx, /location ~ \^\/api\/\(changes\|routing\|infrastructure\|landslide-terrain\)[\s\S]*return 403/);
+  assert.match(visibilityRoute, /statelessPublicTrial/);
   assert.doesNotMatch(nginx, /listen\s+(?:127\.0\.0\.1:)?(?:3000|8644)/);
 });
 
