@@ -38,8 +38,11 @@ test("requires a server-side login before rendering the operations dashboard", a
   const response = await render("/", false);
   assert.equal(response.status, 200);
   const html = await response.text();
-  assert.match(html, /登录灾情预报系统/);
-  assert.match(html, /SECURE OPERATIONS CONSOLE/);
+  assert.match(html, /登录天巡系统/);
+  assert.match(html, /全球灾害监测与卫星任务规划/);
+  assert.match(html, /登录并进入系统/);
+  assert.match(html, /显示密码/);
+  assert.doesNotMatch(html, /SECURE OPERATIONS CONSOLE|HttpOnly 会话|生产环境必须使用 HTTPS/);
   assert.doesNotMatch(html, /个可观测事件/);
 });
 
@@ -352,9 +355,22 @@ test("implements a server-side login, revocable sessions and password-hash confi
   assert.match(auth, /secureLoginTransportRequired/);
   assert.match(operational, /CREATE TABLE IF NOT EXISTS web_sessions/);
   assert.match(operational, /DELETE FROM web_sessions WHERE session_hash/);
-  assert.match(login, /登录灾情预报系统/);
+  assert.match(login, /登录天巡系统/);
+  assert.match(login, /aria-invalid/);
+  assert.match(login, /login-caps-lock/);
+  assert.match(login, /Retry-After/);
+  assert.doesNotMatch(login, /稍后后重试/);
   assert.match(dashboard, /安全退出/);
   assert.match(loginRoute, /enforceRateLimit\(request, "web-login", 5, 15 \* 60_000\)/);
+});
+
+test("keeps the login form reachable on tablets and short mobile viewports", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(css, /\.login-shell\s*\{[^}]*height:\s*100dvh[^}]*overflow-y:\s*auto/);
+  assert.match(css, /@media \(max-width: 900px\)\s*\{[\s\S]*?\.login-shell\s*\{\s*grid-template-columns:\s*1fr/);
+  assert.match(css, /\.topbar \.brand-logo-frame\s*\{\s*display:\s*none/);
+  assert.doesNotMatch(css, /@media \(max-width: 360px\)[\s\S]*?\n\s*\.brand-logo-frame\s*\{\s*display:\s*none/);
 });
 
 test("includes every Vinext build dependency in the hardened VPS release allow-list", async () => {
