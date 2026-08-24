@@ -5,6 +5,7 @@ test("enforces API roles and ignores forged proxy identity headers", async () =>
   const previous = {
     NODE_ENV: process.env.NODE_ENV,
     TIANXUN_API_TOKEN: process.env.TIANXUN_API_TOKEN,
+    TIANXUN_VIEWER_TOKEN: process.env.TIANXUN_VIEWER_TOKEN,
     TIANXUN_OPERATOR_TOKEN: process.env.TIANXUN_OPERATOR_TOKEN,
     TIANXUN_EXECUTOR_TOKEN: process.env.TIANXUN_EXECUTOR_TOKEN,
     TIANXUN_TRUSTED_PROXY_SECRET: process.env.TIANXUN_TRUSTED_PROXY_SECRET,
@@ -12,12 +13,14 @@ test("enforces API roles and ignores forged proxy identity headers", async () =>
     TIANXUN_LOGIN_PASSWORD_HASH: process.env.TIANXUN_LOGIN_PASSWORD_HASH,
   };
   const admin = "a".repeat(64);
+  const viewerToken = "e".repeat(64);
   const operator = "b".repeat(64);
   const executor = "c".repeat(64);
   const proxy = "d".repeat(64);
   Object.assign(process.env, {
     NODE_ENV: "production",
     TIANXUN_API_TOKEN: admin,
+    TIANXUN_VIEWER_TOKEN: viewerToken,
     TIANXUN_OPERATOR_TOKEN: operator,
     TIANXUN_EXECUTOR_TOKEN: executor,
     TIANXUN_TRUSTED_PROXY_SECRET: proxy,
@@ -31,6 +34,8 @@ test("enforces API roles and ignores forged proxy identity headers", async () =>
     assert.equal(await authorizeApiRequest(request({ authorization: `Bearer ${operator}` }), "operator"), null);
     assert.equal((await authorizeApiRequest(request({ authorization: `Bearer ${executor}` }), "operator"))?.status, 403);
     assert.equal(await authorizeApiRequest(request({ authorization: `Bearer ${admin}` }), "admin"), null);
+    assert.equal(await apiRole(request({ authorization: `Bearer ${viewerToken}` })), "viewer");
+    assert.equal((await authorizeApiRequest(request({ authorization: `Bearer ${viewerToken}` }), "operator"))?.status, 403);
 
     const forged = request({ "x-tianxun-user": "victim", "x-tianxun-role": "admin" });
     assert.equal(await apiRole(forged), null);
@@ -106,6 +111,7 @@ test("treats configured web login as authentication and requires origin proof fo
   const previous = {
     NODE_ENV: process.env.NODE_ENV,
     TIANXUN_API_TOKEN: process.env.TIANXUN_API_TOKEN,
+    TIANXUN_VIEWER_TOKEN: process.env.TIANXUN_VIEWER_TOKEN,
     TIANXUN_OPERATOR_TOKEN: process.env.TIANXUN_OPERATOR_TOKEN,
     TIANXUN_EXECUTOR_TOKEN: process.env.TIANXUN_EXECUTOR_TOKEN,
     TIANXUN_TRUSTED_PROXY_SECRET: process.env.TIANXUN_TRUSTED_PROXY_SECRET,
@@ -116,6 +122,7 @@ test("treats configured web login as authentication and requires origin proof fo
   Object.assign(process.env, {
     NODE_ENV: "production",
     TIANXUN_API_TOKEN: "",
+    TIANXUN_VIEWER_TOKEN: "",
     TIANXUN_OPERATOR_TOKEN: "",
     TIANXUN_EXECUTOR_TOKEN: "",
     TIANXUN_TRUSTED_PROXY_SECRET: "",

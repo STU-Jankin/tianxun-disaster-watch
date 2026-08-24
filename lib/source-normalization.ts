@@ -29,7 +29,7 @@ export function latestTrackPoint(coordinates: unknown, geometryDates: unknown[] 
   const points = coordinates.map(coordinatePair).filter((point): point is [number, number] => Boolean(point));
   if (!points.length) return null;
   if (geometryDates.length !== points.length) return points[points.length - 1];
-  const latest = geometryDates.reduce((best, value, index) => {
+  const latest = geometryDates.reduce<{ index: number; time: number }>((best, value, index) => {
     const time = Date.parse(String(value));
     return Number.isFinite(time) && time > best.time ? { index, time } : best;
   }, { index: points.length - 1, time: -Infinity });

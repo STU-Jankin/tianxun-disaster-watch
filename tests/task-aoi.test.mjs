@@ -17,6 +17,7 @@ function longitudes(value, result = []) {
 
 test("splits AOI crossing the international date line", async () => {
   const { buildTaskAoi } = await taskAoi();
+  const { validateGeoGeometry } = await import(new URL("../lib/geo-geometry.ts", import.meta.url));
   const geometry = buildTaskAoi({
     aoiType: "circle",
     latitude: 12,
@@ -25,6 +26,7 @@ test("splits AOI crossing the international date line", async () => {
   });
   assert.equal(geometry?.type, "MultiPolygon");
   assert.ok(longitudes(geometry?.coordinates).every((longitude) => longitude >= -180 && longitude <= 180));
+  assert.equal(validateGeoGeometry(geometry, { rejectUnsplitAntimeridian: true }).ok, true, "date-line split parts may share only their artificial seam");
 });
 
 test("keeps ordinary point and rectangle AOIs deterministic", async () => {
@@ -59,4 +61,13 @@ test("normalizes uploaded Polygon features and multiple AOI feature collections"
   assert.equal(multi?.type, "MultiPolygon");
   assert.equal(multi?.coordinates.length, 2);
   assert.equal(normalizeCustomAoiGeoJson({ type: "LineString", coordinates: [[120, 31], [121, 32]] }), null);
+});
+
+test("rejects an entire FeatureCollection when any feature is invalid", async () => {
+  const { normalizeCustomAoiGeoJson } = await taskAoi();
+  const mixed = normalizeCustomAoiGeoJson({ type: "FeatureCollection", features: [
+    { type: "Feature", geometry: { type: "Polygon", coordinates: [[[120, 31], [121, 31], [121, 32], [120, 31]]] } },
+    { type: "Feature", geometry: { type: "LineString", coordinates: [[120, 31], [121, 32]] } },
+  ] });
+  assert.equal(mixed, null);
 });

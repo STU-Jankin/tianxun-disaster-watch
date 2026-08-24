@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-engine_token="$(sed -n 's/^TIANXUN_API_TOKEN=//p' /etc/tianxun/engine.env | head -n1)"
+engine_token="$(sed -n 's/^TIANXUN_VIEWER_TOKEN=//p' /etc/tianxun/engine.env | head -n1)"
 [[ "$engine_token" =~ ^[a-fA-F0-9]{64}$ ]] || { echo "engine API token is missing or invalid" >&2; exit 1; }
 engine="$(curl --fail --silent --show-error -H "Authorization: Bearer $engine_token" http://127.0.0.1:3000/api/health)"
 hermes="$(curl --fail --silent --show-error http://127.0.0.1:8644/health)"

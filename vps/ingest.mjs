@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
 const endpoint = process.env.TIANXUN_ENGINE_URL || "http://127.0.0.1:3000/api/events";
-const token = String(process.env.TIANXUN_API_TOKEN || "").trim();
+const token = String(process.env.TIANXUN_VIEWER_TOKEN || process.env.TIANXUN_API_TOKEN || "").trim();
 
-if (token.length < 32) throw new Error("TIANXUN_API_TOKEN is not configured");
+if (token.length < 32) throw new Error("TIANXUN_VIEWER_TOKEN is not configured");
 
 const response = await fetch(endpoint, {
   headers: {

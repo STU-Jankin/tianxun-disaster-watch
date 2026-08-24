@@ -122,7 +122,7 @@ export function defaultConfig(env = process.env) {
   return {
     engineUrl: env.TIANXUN_ENGINE_URL || "http://127.0.0.1:3000/api/events",
     changesUrl: env.TIANXUN_CHANGES_URL || new URL("/api/changes", env.TIANXUN_ENGINE_URL || "http://127.0.0.1:3000/api/events").toString(),
-    engineToken: env.TIANXUN_API_TOKEN || "",
+    engineToken: env.TIANXUN_VIEWER_TOKEN || env.TIANXUN_API_TOKEN || "",
     dbPath: resolve(env.TIANXUN_NOTIFY_DB || ".data/notifier.sqlite"),
     webhookUrl: env.HERMES_WEBHOOK_URL || "http://127.0.0.1:8644/webhooks/tianxun-alerts",
     webhookSecret: env.HERMES_WEBHOOK_SECRET || "",
@@ -146,7 +146,7 @@ export async function runOnce(config = defaultConfig(), fetchImpl = fetch) {
     const payload = await fetchEvents(config, fetchImpl);
     let operationalChangeError = "";
     processSourceHealth(db, Array.isArray(payload.sourceStatus) ? payload.sourceStatus : [], config);
-    if (!payload.fallback) {
+    if (!payload.fallback && payload.persistenceAvailable !== false) {
       processEvents(db, Array.isArray(payload.events) ? payload.events : [], payload, config);
       try {
         const changePayload = await fetchChanges(config, db, fetchImpl);
@@ -160,7 +160,9 @@ export async function runOnce(config = defaultConfig(), fetchImpl = fetch) {
       setMeta(db, "consecutive_collection_failures", "0");
       recordRun(db, startedAt, operationalChangeError ? "degraded" : "ok", Array.isArray(payload.events) ? payload.events.length : 0, operationalChangeError);
     } else {
-      const message = "全部上游源不可用，API 返回了演示回退数据；未更新事件基线。";
+      const message = payload.persistenceAvailable === false
+        ? "灾害引擎持久化不可用；本轮内存事件未进入通知基线，也不会触发灾害告警。"
+        : "全部上游源不可用，API 返回了演示回退数据；未更新事件基线。";
       runError = message;
       recordCollectionProblem(db, message, config);
       recordRun(db, startedAt, "degraded", 0, message);
@@ -537,9 +539,15 @@ function enqueue(db, notification) {
 }
 
 function recordRun(db, startedAt, status, eventCount, error) {
+  const now = new Date();
+  const deliveredCutoff = new Date(now.getTime() - 30 * 86_400_000).toISOString();
+  const stateCutoff = new Date(now.getTime() - 180 * 86_400_000).toISOString();
   db.prepare("INSERT INTO collection_runs (started_at, completed_at, status, event_count, error) VALUES (?, ?, ?, ?, ?)")
-    .run(startedAt, new Date().toISOString(), status, eventCount, clean(error, 500));
+    .run(startedAt, now.toISOString(), status, eventCount, clean(error, 500));
   db.prepare("DELETE FROM collection_runs WHERE id NOT IN (SELECT id FROM collection_runs ORDER BY id DESC LIMIT 1000)").run();
+  db.prepare("DELETE FROM notification_queue WHERE status='delivered' AND delivered_at < ?").run(deliveredCutoff);
+  db.prepare("DELETE FROM event_state WHERE seen_at < ?").run(stateCutoff);
+  db.prepare("DELETE FROM source_state WHERE updated_at < ?").run(stateCutoff);
 }
 
 function setMeta(db, key, value) {

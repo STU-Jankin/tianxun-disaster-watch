@@ -1,5 +1,6 @@
 import { listOperationalChanges } from "../../../db/operational";
-import { authorizeApiRequest } from "../../../lib/api-security";
+import { apiRole, authorizeApiRequest } from "../../../lib/api-security";
+import { changesVisibleToViewer } from "../../../lib/operational-change-visibility";
 
 export const dynamic = "force-dynamic";
 
@@ -16,7 +17,8 @@ export async function GET(request: Request) {
   if (!Number.isFinite(after.getTime())) return Response.json({ error: "after 必须是有效 ISO 时间" }, { status: 400 });
   try {
     const normalizedAfter = after.toISOString();
-    const changes = await listOperationalChanges(normalizedAfter, afterId, Number(url.searchParams.get("limit") ?? 200));
+    const storedChanges = await listOperationalChanges(normalizedAfter, afterId, Number(url.searchParams.get("limit") ?? 200));
+    const changes = await apiRole(request) === "viewer" ? changesVisibleToViewer(storedChanges) : storedChanges;
     const last = changes.at(-1);
     return Response.json({ changes, cursor: last ? `${last.createdAt}|${last.id}` : afterValue }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {

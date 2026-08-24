@@ -213,10 +213,10 @@ export function analyzeTerrainElevations(plan: TerrainSamplingPlan, elevations: 
   };
 }
 
-function squareRing(longitude: number, latitude: number, sizeKm: number) {
+function squareRing(longitude: number, latitude: number, sizeKm: number): [number, number][] {
   const half = sizeKm / 2;
   const corners = [offsetCoordinate(longitude, latitude, -half, -half), offsetCoordinate(longitude, latitude, half, -half), offsetCoordinate(longitude, latitude, half, half), offsetCoordinate(longitude, latitude, -half, half)];
-  return [...corners, corners[0]].map(([lon, lat]) => [round(lon, 6), round(lat, 6)]);
+  return [...corners, corners[0]].map(([lon, lat]) => [round(lon, 6), round(lat, 6)] as [number, number]);
 }
 
 function offsetCoordinate(longitude: number, latitude: number, eastKm: number, northKm: number): [number, number] {

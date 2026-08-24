@@ -140,7 +140,7 @@ sudo sqlite3 /var/lib/tianxun/notifier/notifier.sqlite \
 sudo bash /opt/tianxun/current/vps/scripts/backup.sh
 ```
 
-默认备份到 `/var/backups/tianxun`，保留 14 天，并为每个备份生成 SHA-256。使用受控恢复脚本；它会验证路径、校验和与 SQLite 完整性，并停止相关写入服务：
+默认备份到 `/var/backups/tianxun`，保留 14 天，并为每个备份生成 SHA-256。生产环境应在 `/etc/tianxun/backup.env` 配置 `TIANXUN_BACKUP_RCLONE_REMOTE`，把同一批数据库和校验文件同步到独立存储；未配置时健康检查只证明本机备份存在，不能抵御 VPS 整盘损坏。使用受控恢复脚本；它会验证路径、校验和与 SQLite 完整性，并停止相关写入服务：
 
 ```bash
 sudo bash /opt/tianxun/current/vps/scripts/restore.sh operational /var/backups/tianxun/operational-YYYYMMDDTHHMMSSZ.sqlite
@@ -158,7 +158,7 @@ sudo bash /opt/tianxun/current/vps/scripts/restore.sh notifier /var/backups/tian
 
 ## 安全换钥
 
-任何曾出现在聊天、截图、Shell 历史或工单里的 VPS 密码、FIRMS key、飞书密钥和 Webhook 密钥都应视为已经泄露并立即轮换。VPS 应改用 SSH key，禁用 root 密码登录；应用密钥只保存在 `/etc/tianxun/*.env`，不要写入仓库或 URL。轮换 `TIANXUN_API_TOKEN` 时必须同时更新 `engine.env` 与 `notifier.env` 后重启两个服务。
+任何曾出现在聊天、截图、Shell 历史或工单里的 VPS 密码、FIRMS key、飞书密钥和 Webhook 密钥都应视为已经泄露并立即轮换。VPS 应改用 SSH key，禁用 root 密码登录；应用密钥只保存在 `/etc/tianxun/*.env`，不要写入仓库或 URL。后台采集器与通知器只使用 `TIANXUN_VIEWER_TOKEN`；管理员、操作员和执行器令牌不得复制到通知器环境。轮换只读令牌时必须同时更新 `engine.env` 与 `notifier.env` 后重启相关服务。
 
 ## 公网登录控制台
 

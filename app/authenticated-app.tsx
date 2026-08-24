@@ -9,6 +9,29 @@ export function AuthenticatedApp({ user }: { user: SessionUser }) {
   const [logoutBusy, setLogoutBusy] = useState(false);
   const [logoutError, setLogoutError] = useState("");
 
+  useEffect(() => {
+    let stopped = false;
+    const verifySession = async () => {
+      if (document.visibilityState === "hidden") return;
+      try {
+        const response = await fetch("/api/auth/session", { cache: "no-store" });
+        if (!stopped && response.status === 401) window.location.replace("/");
+      } catch {
+        // A transient network failure must not discard a still-valid session.
+      }
+    };
+    const timer = window.setInterval(() => void verifySession(), 60_000);
+    const onVisible = () => { if (document.visibilityState === "visible") void verifySession(); };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+    };
+  }, []);
+
   const logout = async () => {
     setLogoutBusy(true);
     setLogoutError("");

@@ -1,7 +1,11 @@
 import { normalizeAntimeridianGeometry, validateGeoGeometry } from "./geo-geometry.ts";
 
 export type GeoGeometry = { type: "Point" | "Polygon" | "MultiPolygon" | "LineString"; coordinates: unknown };
-export type CustomAoiGeometry = { type: "Polygon" | "MultiPolygon"; coordinates: unknown };
+export type AoiCoordinate = [number, number];
+export type AoiPolygonCoordinates = AoiCoordinate[][];
+export type CustomAoiGeometry =
+  | { type: "Polygon"; coordinates: AoiPolygonCoordinates }
+  | { type: "MultiPolygon"; coordinates: AoiPolygonCoordinates[] };
 
 export function buildTaskAoi(task: Record<string, unknown>): GeoGeometry | null {
   const type = String(task.aoiType ?? "");
@@ -24,45 +28,46 @@ export function buildTaskAoi(task: Record<string, unknown>): GeoGeometry | null 
 }
 
 export function normalizeCustomAoiGeoJson(value: unknown): CustomAoiGeometry | null {
-  const polygons: number[][][][] = [];
+  const polygons: AoiPolygonCoordinates[] = [];
   let vertices = 0;
-  const addGeometry = (candidate: unknown) => {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return;
+  const addGeometry = (candidate: unknown): boolean => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
     const geometry = candidate as { type?: unknown; coordinates?: unknown; geometry?: unknown; features?: unknown };
     if (geometry.type === "Feature") {
-      addGeometry(geometry.geometry);
-      return;
+      return addGeometry(geometry.geometry);
     }
-    if (geometry.type === "FeatureCollection" && Array.isArray(geometry.features) && geometry.features.length <= 100) {
-      geometry.features.forEach(addGeometry);
-      return;
+    if (geometry.type === "FeatureCollection") {
+      if (!Array.isArray(geometry.features) || geometry.features.length === 0 || geometry.features.length > 100) return false;
+      return geometry.features.every(addGeometry);
     }
     const candidates = geometry.type === "Polygon" ? [geometry.coordinates] : geometry.type === "MultiPolygon" ? geometry.coordinates : null;
-    if (!Array.isArray(candidates)) return;
-    candidates.forEach((polygon) => {
-      if (!Array.isArray(polygon) || !polygon.length || polygon.length > 100) return;
-      const rings: number[][][] = [];
+    if (!Array.isArray(candidates) || candidates.length === 0) return false;
+    for (const polygon of candidates) {
+      if (!Array.isArray(polygon) || !polygon.length || polygon.length > 100) return false;
+      const rings: AoiPolygonCoordinates = [];
       for (const rawRing of polygon) {
-        if (!Array.isArray(rawRing) || rawRing.length < 3 || rawRing.length > 10_000) return;
-        const ring: number[][] = [];
+        if (!Array.isArray(rawRing) || rawRing.length < 3 || rawRing.length > 2_000) return false;
+        const ring: AoiCoordinate[] = [];
         for (const rawCoordinate of rawRing) {
-          if (!Array.isArray(rawCoordinate) || rawCoordinate.length < 2) return;
+          if (!Array.isArray(rawCoordinate) || rawCoordinate.length < 2) return false;
           const longitude = Number(rawCoordinate[0]);
           const latitude = Number(rawCoordinate[1]);
-          if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180 || !Number.isFinite(latitude) || latitude < -90 || latitude > 90) return;
+          if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180 || !Number.isFinite(latitude) || latitude < -90 || latitude > 90) return false;
           vertices += 1;
-          if (vertices > 10_000) return;
+          if (vertices > 10_000) return false;
           ring.push([Number(longitude.toFixed(7)), Number(latitude.toFixed(7))]);
         }
-        if (ring.length < 3) return;
-        if (ring[0][0] !== ring[ring.length - 1][0] || ring[0][1] !== ring[ring.length - 1][1]) ring.push([...ring[0]]);
-        if (ring.length < 4) return;
+        if (ring.length < 3) return false;
+        if (ring[0][0] !== ring[ring.length - 1][0] || ring[0][1] !== ring[ring.length - 1][1]) ring.push([...ring[0]] as AoiCoordinate);
+        if (ring.length < 4) return false;
         rings.push(ring);
       }
-      if (rings.length === polygon.length) polygons.push(rings);
-    });
+      if (rings.length !== polygon.length) return false;
+      polygons.push(rings);
+    }
+    return true;
   };
-  addGeometry(value);
+  if (!addGeometry(value)) return null;
   if (!polygons.length || vertices > 10_000) return null;
   const geometry: CustomAoiGeometry = polygons.length === 1
     ? { type: "Polygon", coordinates: polygons[0] }

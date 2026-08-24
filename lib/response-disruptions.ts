@@ -194,7 +194,11 @@ function normalizeGeometry(value: unknown): RoadDisruptionGeometry {
     if (!Array.isArray(value.coordinates) || value.coordinates.length < 2 || value.coordinates.length > 5_000) throw new Error("道路中断线至少需要 2 个点且不能超过 5000 点");
     return { type: "LineString", coordinates: value.coordinates.map((item) => coordinate(item, "道路中断线")) };
   }
-  if (value.type === "Polygon" || value.type === "MultiPolygon") return normalizeCustomAoiGeoJson(value);
+  if (value.type === "Polygon" || value.type === "MultiPolygon") {
+    const normalized = normalizeCustomAoiGeoJson(value);
+    if (!normalized) throw new Error("道路中断面几何无效、自相交或范围过大");
+    return normalized;
+  }
   throw new Error("道路中断 geometry 类型不受支持");
 }
 
@@ -263,12 +267,12 @@ function routeIntersectsGeometry(route: RoutingCoordinate[], geometry: RoadDisru
     || polygon.some((ring) => route.some((routeEnd, routeIndex) => routeIndex > 0 && ring.some((ringEnd, ringIndex) => ringIndex > 0 && segmentsIntersect(route[routeIndex - 1], routeEnd, ring[ringIndex - 1] as RoutingCoordinate, ringEnd as RoutingCoordinate)))));
 }
 
-function pointInPolygon(point: RoutingCoordinate, polygon: number[][][]) {
+function pointInPolygon(point: RoutingCoordinate, polygon: RoutingCoordinate[][]) {
   if (!polygon.length || !pointInRing(point, polygon[0])) return false;
   return !polygon.slice(1).some((ring) => pointInRing(point, ring));
 }
 
-function pointInRing(point: RoutingCoordinate, ring: number[][]) {
+function pointInRing(point: RoutingCoordinate, ring: RoutingCoordinate[]) {
   let inside = false;
   for (let index = 0, prior = ring.length - 1; index < ring.length; prior = index++) {
     const left = ring[index];

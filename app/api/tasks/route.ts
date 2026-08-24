@@ -132,7 +132,7 @@ export async function POST(request: Request) {
     const approvedTask = { ...draft, approvedAt, approvedBy, aoiHash: nextAoiHash };
     const finalValidation = validateSatelliteTask(approvedTask, { requireApproved: true, requireProvenance: true });
     if (!finalValidation.ok) return Response.json({ error: "任务校验失败", errors: finalValidation.errors }, { status: 400 });
-    return Response.json({ task: await upsertSatelliteTask(approvedTask as Parameters<typeof upsertSatelliteTask>[0], { payloadJson: JSON.stringify(canonical.event) }, actor, isAdmin), storage: "operational-database" });
+    return Response.json({ task: await upsertSatelliteTask(approvedTask as unknown as Parameters<typeof upsertSatelliteTask>[0], { payloadJson: JSON.stringify(canonical.event) }, actor, isAdmin), storage: "operational-database" });
   } catch (error) {
     if (error instanceof ApiInputError) return Response.json({ error: error.message }, { status: error.status });
     if (error instanceof Error && /任务不属于当前操作员/.test(error.message)) return Response.json({ error: "任务不存在或不属于当前操作员" }, { status: 404 });

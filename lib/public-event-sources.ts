@@ -35,7 +35,7 @@ const copernicusPublicUrl = "https://rapidmapping.emergency.copernicus.eu/";
 
 export function parseNwsAlerts(payload: unknown, now = Date.now()): PublicEventCandidate[] {
   const features = featureArray(payload);
-  return features.flatMap((feature) => {
+  return features.flatMap((feature): PublicEventCandidate[] => {
     const properties = record(feature.properties);
     const status = text(properties.status);
     const messageType = text(properties.messageType);
@@ -74,7 +74,7 @@ export function parseNwsAlerts(payload: unknown, now = Date.now()): PublicEventC
 }
 
 export function parseEcccAlerts(payload: unknown, now = Date.now()): PublicEventCandidate[] {
-  return featureArray(payload).flatMap((feature) => {
+  return featureArray(payload).flatMap((feature): PublicEventCandidate[] => {
     const properties = record(feature.properties);
     const status = text(properties.status_en);
     const expiresAt = validIso(properties.expiration_datetime ?? properties.event_end_datetime);
@@ -113,7 +113,7 @@ export function parseEcccAlerts(payload: unknown, now = Date.now()): PublicEvent
 }
 
 export function parseEmscEvents(payload: unknown): PublicEventCandidate[] {
-  return featureArray(payload).flatMap((feature) => {
+  return featureArray(payload).flatMap((feature): PublicEventCandidate[] => {
     const properties = record(feature.properties);
     const geometry = geometryValue(feature.geometry);
     const sourceEventId = stableId(feature.id ?? properties.unid ?? properties.source_id);
@@ -145,7 +145,7 @@ export function parseEmscEvents(payload: unknown): PublicEventCandidate[] {
 
 export function parseCopernicusActivations(payload: unknown, now = Date.now()): PublicEventCandidate[] {
   const results = resultArray(payload);
-  return results.flatMap((activation) => {
+  return results.flatMap((activation): PublicEventCandidate[] => {
     const code = stableId(activation.code);
     const hazard = copernicusHazard(text(activation.category), text(activation.subCategory));
     const eventTime = validUtcIso(activation.eventTime ?? activation.activationTime);

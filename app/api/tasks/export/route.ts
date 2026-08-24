@@ -40,7 +40,7 @@ export async function POST(request: Request) {
       if (["resolved", "archived"].includes(row.lifecycleStatus) || Date.parse(row.observationExpiresAt) <= Date.now() || row.activeEvidenceCount < 1) return conflict(reference.taskId, "主事件已解除、过期或失去有效证据");
       const canonicalRevision = eventRevisionFingerprint(row.event);
       if (canonicalRevision !== row.eventRevision) return conflict(reference.taskId, "主事件或官方报次已有新版本");
-      const task = { ...row.task, status: row.status, revision: row.revision, eventRevision: row.eventRevision, aoiHash: row.aoiHash };
+      const task: Record<string, unknown> = { ...row.task, status: row.status, revision: row.revision, eventRevision: row.eventRevision, aoiHash: row.aoiHash };
       const validation = validateSatelliteTask(task, { requireApproved: true, requirePayload: true, requireProvenance: true });
       if (!validation.ok) return conflict(reference.taskId, validation.errors.join("；"));
       const aoi = buildTaskAoi(task);

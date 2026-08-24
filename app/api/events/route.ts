@@ -12,6 +12,8 @@ import {
   type PhenomenonStage,
 } from "../../../lib/disasters";
 import { normalizeAntimeridianGeometry, validateGeoGeometry } from "../../../lib/geo-geometry";
+import { latestByKey } from "../../../lib/latest-by-key";
+import { applyEventSourcePresence } from "../../../lib/event-presence";
 import { listRetainedCanonicalEvents, persistCanonicalEvents, resolveCanonicalEventsByReferences } from "../../../db/operational";
 import { circularGeometryCenter, cycloneSeverityFromKnots, firmsConfidenceScore, firmsHeatSeverity, latestTrackPoint } from "../../../lib/source-normalization";
 import { authorizeApiRequest } from "../../../lib/api-security";
@@ -101,8 +103,9 @@ type SourceRun = {
 
 type CancellationReference = { source: string; sourceEventId: string; reason: string };
 const cancellationBuffer: CancellationReference[] = [];
-let eventsCache: { body: string; status: number; contentType: string; expiresAt: number; etag: string } | null = null;
-let eventsRefresh: Promise<NonNullable<typeof eventsCache>> | null = null;
+type EventsCacheEntry = { body: string; status: number; contentType: string; expiresAt: number; etag: string };
+let eventsCache: EventsCacheEntry | null = null;
+let eventsRefresh: Promise<EventsCacheEntry> | null = null;
 let lastSuccessfulFetchAt: string | null = null;
 let copernicusCache: { events: DisasterEvent[]; expiresAt: number } | null = null;
 let usgsGroundFailureCache: { events: DisasterEvent[]; expiresAt: number } | null = null;
@@ -127,7 +130,7 @@ export async function GET(request: Request) {
   return cachedEventsResponse(await eventsRefresh, request);
 }
 
-function cachedEventsResponse(cached: NonNullable<typeof eventsCache>, request: Request) {
+function cachedEventsResponse(cached: EventsCacheEntry, request: Request) {
   const headers = { "Content-Type": cached.contentType, "Cache-Control": "private, max-age=30", "X-Tianxun-Cache": "shared-refresh", ETag: cached.etag };
   if (request.headers.get("if-none-match") === cached.etag) return new Response(null, { status: 304, headers });
   return new Response(cached.body, { status: cached.status, headers });
@@ -320,7 +323,7 @@ async function refreshEvents() {
   ];
   const runs = await Promise.all(connectors.map(runConnector));
   const refreshCompletedAt = new Date().toISOString();
-  if (runs.some((run) => run.online)) lastSuccessfulFetchAt = refreshCompletedAt;
+  if (runs.some((run) => run.producing && run.role !== "核验")) lastSuccessfulFetchAt = refreshCompletedAt;
   const cancellations = cancellationBuffer.splice(0);
   const collected = runs.flatMap((run) => run.events).filter(isOperationalEventValid);
   const currentEvents = canonicalizeEvents(collected.filter((event) => !eventHasInvalidIdentity(event)))
@@ -331,6 +334,11 @@ async function refreshEvents() {
   // evidence chain with the one source that happened to answer this refresh.
   const retained = await listRetainedEventsSafely();
   const normalized = canonicalizeEvents([...currentEvents, ...retained]).map(finalize);
+  const liveEvidence = new Set(currentEvents.flatMap((event) => event.evidence.map((item) => `${sourceFamily(item.source)}|${item.sourceEventId}`)));
+  const normalizedWithPresence = normalized.map((event) => {
+    const presentInCurrentFeeds = event.evidence.some((item) => liveEvidence.has(`${sourceFamily(item.source)}|${item.sourceEventId}`));
+    return applyEventSourcePresence(event, presentInCurrentFeeds);
+  });
   const allSourcesUnavailable = runs.every((source) => !source.online);
   const sourceCounts = runs.map((run) => ({
     name: run.name,
@@ -343,7 +351,7 @@ async function refreshEvents() {
     producing: run.producing,
     count: currentEvents.filter((event) => event.evidence.some((item) => item.source.startsWith(run.name))).length,
   }));
-  const persistedEvents = allSourcesUnavailable ? normalized : await persistCanonicalEvents(normalized);
+  const persistedEvents = allSourcesUnavailable ? normalizedWithPresence : await persistCanonicalEvents(normalizedWithPresence);
   const persistenceAvailable = persistedEvents !== null;
   if (cancellations.length) {
     const byReason = new Map<string, CancellationReference[]>();
@@ -357,11 +365,10 @@ async function refreshEvents() {
     totalSources: runs.length,
     onlineSources: runs.filter((run) => run.online).length,
     producingSources: runs.filter((run) => run.producing).length,
-    eventCapableSources: runs.filter((run) => run.online && run.role !== "核验").length,
+    eventCapableSources: runs.filter((run) => run.producing && run.role !== "核验").length,
     persistenceAvailable,
   });
-  const liveEvidence = new Set(currentEvents.flatMap((event) => event.evidence.map((item) => `${sourceFamily(item.source)}|${item.sourceEventId}`)));
-  const operationalEvents = latestEventVersionsByMasterId(persistedEvents ?? normalized).map((event) => {
+  const operationalEvents = latestEventVersionsByMasterId(persistedEvents ?? normalizedWithPresence).map((event) => {
     const presentInCurrentFeeds = event.evidence.some((item) => liveEvidence.has(`${sourceFamily(item.source)}|${item.sourceEventId}`));
     const finalized = finalize(event);
     return { ...finalized, sourcePresence: presentInCurrentFeeds ? "current" as const : "retained" as const, lifecycleStatus: presentInCurrentFeeds ? finalized.lifecycleStatus : "monitoring" as const };
@@ -427,7 +434,9 @@ async function runConnector(connector: SourceConnector): Promise<SourceRun> {
       online: true,
       producing: events.length > 0,
       count: events.length,
-      message: connector.successMessage ?? (connector.role === "核验" ? "在线，仅用于交叉核验，不生成任务坐标" : "在线"),
+      message: connector.successMessage ?? (connector.role === "核验"
+        ? "在线，仅用于交叉核验，不生成任务坐标"
+        : events.length ? "在线并产出本轮有效事件" : "连接成功，但本轮没有通过时间、身份与几何校验的有效事件"),
       events,
     };
   } catch (error) {
@@ -850,13 +859,16 @@ async function fetchNveLandslideWarnings(): Promise<DisasterEvent[]> {
     .filter((warning) => Number(warning.ActivityLevel) >= 2)
     .slice(0, 16);
   if (!warnings.length) return [];
+  const boundaryKeys = [...new Map(warnings.flatMap(nveWarningBoundaryKeys).map((key) => [`${key.kind}:${key.id}`, key])).values()].slice(0, 64);
+  const boundaryResults = await Promise.allSettled(boundaryKeys.map(fetchNveBoundary));
+  const boundaries = new Map(boundaryKeys.flatMap((key, index) => {
+    const result = boundaryResults[index];
+    return result.status === "fulfilled" && result.value ? [[`${key.kind}:${key.id}`, result.value] as const] : [];
+  }));
+  const boundaryFailures = boundaryResults.filter((result) => result.status === "rejected").length;
   const candidates: PublicEventCandidate[] = [];
-  let boundaryFailures = 0;
   for (const warning of warnings) {
-    const keys = nveWarningBoundaryKeys(warning);
-    const results = await Promise.allSettled(keys.map(fetchNveBoundary));
-    const geometries = results.flatMap((result) => result.status === "fulfilled" && result.value ? [result.value] : []);
-    boundaryFailures += results.filter((result) => result.status === "rejected").length;
+    const geometries = nveWarningBoundaryKeys(warning).flatMap((key) => boundaries.get(`${key.kind}:${key.id}`) ?? []);
     const candidate = parseNveLandslideWarning(warning, combinePolygonGeometries(geometries));
     if (candidate) candidates.push(candidate);
   }
@@ -871,9 +883,9 @@ async function fetchNveBoundary(key: { kind: "kommuner" | "fylker"; id: string }
   const path = `${key.kind}/${encodeURIComponent(key.id)}/omrade`;
   let payload: unknown;
   try {
-    payload = await fetchJson(`${endpoints.nveBoundary}/${path}`, { maximumBytes: 4_000_000, timeoutMs: 15_000, headers: { Accept: "application/geo+json,application/json" } });
+    payload = await fetchJson(`${endpoints.nveBoundary}/${path}`, { maximumBytes: 4_000_000, timeoutMs: 7_000, headers: { Accept: "application/geo+json,application/json" } });
   } catch {
-    payload = await fetchJson(`https://ws.geonorge.no/kommuneinfo/v1/${path}`, { maximumBytes: 4_000_000, timeoutMs: 15_000, headers: { Accept: "application/geo+json,application/json" } });
+    payload = await fetchJson(`https://ws.geonorge.no/kommuneinfo/v1/${path}`, { maximumBytes: 4_000_000, timeoutMs: 7_000, headers: { Accept: "application/geo+json,application/json" } });
   }
   const geometry = geoJsonBoundaryGeometry(payload);
   if (!geometry) throw new Error(`Kartverket ${cacheKey} 几何无效`);
@@ -887,9 +899,11 @@ async function fetchCopernicusRapidMapping(): Promise<DisasterEvent[]> {
   listUrl.search = new URLSearchParams({ limit: "30", ordering: "-lastUpdate" }).toString();
   const overview = await fetchJson(listUrl.toString(), { maximumBytes: 3_000_000, timeoutMs: 12_000 }) as { results?: unknown[] };
   const recent = (Array.isArray(overview.results) ? overview.results : []).filter((item): item is Record<string, unknown> => {
-    if (!item || typeof item !== "object" || Array.isArray(item) || typeof item.code !== "string") return false;
-    const updated = validIso(item.lastUpdate ?? item.activationTime);
-    return !item.closed || Boolean(updated && Date.now() - +new Date(updated) <= 7 * 86_400_000);
+    if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+    const record = item as Record<string, unknown>;
+    if (typeof record.code !== "string") return false;
+    const updated = validIso(record.lastUpdate ?? record.activationTime);
+    return !record.closed || Boolean(updated && Date.now() - +new Date(updated) <= 7 * 86_400_000);
   }).slice(0, 8);
   const details = await Promise.allSettled(recent.map((item) => {
     const url = new URL("https://rapidmapping.emergency.copernicus.eu/backend/dashboard-api/public-activations/");
@@ -967,7 +981,8 @@ async function fetchEonet(): Promise<DisasterEvent[]> {
     if (!hazard) return [];
     const source = ((p.sources as Array<{ id?: string; url?: string }> | undefined) ?? [])[0];
     const magnitude = Number(p.magnitudeValue ?? 0) || undefined;
-    const occurredAt = String(p.date ?? new Date().toISOString());
+    const occurredAt = validIso(p.date);
+    if (!occurredAt) return [];
     return [baseEvent({
       id: `eonet-${sourceEventId}`,
       title: String(p.title ?? categories[0]?.title ?? "自然灾害事件"),
@@ -1003,7 +1018,8 @@ async function fetchGdacs(): Promise<DisasterEvent[]> {
     const point = tag(item, "georss:point").trim().split(/\s+/).map(Number);
     if (!hazard || point.length < 2 || point.some(Number.isNaN)) return [];
     const sourceSeverity = tag(item, "gdacs:alertlevel") || "Green";
-    const occurredAt = new Date(tag(item, "pubDate") || Date.now()).toISOString();
+    const occurredAt = validIso(tag(item, "pubDate"));
+    if (!occurredAt) return [];
     return [baseEvent({
       id: `gdacs-${tag(item, "guid") || `${typeCode}-${index}`}`,
       title: decodeXml(tag(item, "title") || `${hazardMeta[hazard].label}事件`),
@@ -1042,11 +1058,12 @@ async function fetchFirms(): Promise<DisasterEvent[]> {
     cells.set(cell, [...(cells.get(cell) ?? []), row]);
   });
   const events = [...cells.entries()]
-    .map(([cell, detections]) => {
+    .flatMap(([cell, detections]): DisasterEvent[] => {
       const latitude = detections.reduce((sum, row) => sum + Number(row.latitude), 0) / detections.length;
       const longitude = detections.reduce((sum, row) => sum + Number(row.longitude), 0) / detections.length;
       const newest = detections.sort((a, b) => String(b.acq_date + b.acq_time).localeCompare(String(a.acq_date + a.acq_time)))[0];
       const occurredAt = firmsDate(newest.acq_date, newest.acq_time);
+      if (!occurredAt) return [];
       const confidenceCode = String(newest.confidence ?? "").toLowerCase();
       const confidence = firmsConfidenceScore(newest.confidence);
       const frp = Math.max(...detections.map((row) => Number(row.frp) || 0));
@@ -1067,7 +1084,7 @@ async function fetchFirms(): Promise<DisasterEvent[]> {
         description: `同一0.1°网格聚合 ${detections.length} 个VIIRS近实时热异常（置信度 ${confidenceCode || "未知"}）；它不是已确认森林火灾，必须结合地表覆盖、常年热源和其他证据复核。`,
       });
       const detectionConfidence = Math.min(event.confidenceScore, confidence);
-      return { ...event, confidenceScore: detectionConfidence, confidenceLevel: confidenceLevel(detectionConfidence), observable: "conditional" as const, dispatchEligibility: "review_required" as const, aoiApprovalRequired: true };
+      return [{ ...event, confidenceScore: detectionConfidence, confidenceLevel: confidenceLevel(detectionConfidence), observable: "conditional" as const, dispatchEligibility: "review_required" as const, aoiApprovalRequired: true }];
     });
   // A global VIIRS day can contain tens of thousands of 0.1° cells. Keeping
   // every low-confidence cell makes canonicalization and SQLite persistence
@@ -1087,7 +1104,8 @@ async function fetchNhc(): Promise<DisasterEvent[]> {
     const forecastTrack = isRecord(storm.forecastTrack) ? storm.forecastTrack : {};
     const trackCone = isRecord(storm.trackCone) ? storm.trackCone : {};
     const forecastWindRadii = isRecord(storm.forecastWindRadiiGIS) ? storm.forecastWindRadiiGIS : {};
-    const occurredAt = validIso(storm.lastUpdate ?? publicAdvisory.issuance ?? storm.advisoryDate ?? storm.binNumber) ?? new Date().toISOString();
+    const occurredAt = validIso(storm.lastUpdate ?? publicAdvisory.issuance ?? storm.advisoryDate);
+    if (!occurredAt) return null;
     const name = String(storm.stormName ?? storm.name ?? storm.id ?? `热带气旋 ${index + 1}`);
     const windKt = Number(storm.intensity ?? storm.windSpeed ?? 0);
     const pressureHpa = Number(storm.pressure);
@@ -1326,7 +1344,9 @@ async function fetchUsgsVolcanoes(): Promise<DisasterEvent[]> {
     const latitude = firstFinite(volcano.latitude, volcano.lat, volcano.latitude_dd);
     const longitude = firstFinite(volcano.longitude, volcano.lon, volcano.longitude_dd);
     if (latitude === null || longitude === null) return null;
-    const occurredAt = new Date(Number(notice.sent_unixtime ?? Date.now() / 1000) * 1000).toISOString();
+    const sentUnixTime = Number(notice.sent_unixtime);
+    if (!Number.isFinite(sentUnixTime) || sentUnixTime <= 0) return null;
+    const occurredAt = new Date(sentUnixTime * 1000).toISOString();
     const level = `${String(notice.color_code ?? "")} ${String(notice.alert_level ?? "")}`.trim();
     return baseEvent({
       id: `hans-${vnum}-${String(notice.sent_unixtime ?? "current")}`,
@@ -1594,15 +1614,19 @@ function canonicalizeEvents(events: DisasterEvent[]) {
   }
 
   return groups.map((candidates) => {
-    const latestCandidates = [...new Map([...candidates]
-      .sort((a, b) => +new Date(b.updatedAt) - +new Date(a.updatedAt))
-      .map((event) => [`${sourceFamily(event.source)}|${stablePrimaryId(event.id)}`, event])).values()];
+    const latestCandidates = latestByKey(
+      candidates,
+      (event) => `${sourceFamily(event.source)}|${stablePrimaryId(event.id)}`,
+      (event) => Date.parse(event.updatedAt),
+    );
     const authoritativeCandidates = latestCandidates.filter((event) => !isCmaSurfaceSource(event.source));
     const canonicalCandidates = authoritativeCandidates.length ? authoritativeCandidates : latestCandidates;
     const primary = [...canonicalCandidates].sort((a, b) => eventAuthority(b) - eventAuthority(a) || +new Date(b.updatedAt) - +new Date(a.updatedAt))[0];
-    const evidence = [...new Map(candidates.flatMap((event) => event.evidence)
-      .sort((a, b) => +new Date(b.observedAt) - +new Date(a.observedAt))
-      .map((item) => [`${sourceFamily(item.source)}|${item.sourceEventId}`, item])).values()];
+    const evidence = latestByKey(
+      candidates.flatMap((event) => event.evidence),
+      (item) => `${sourceFamily(item.source)}|${item.sourceEventId}`,
+      (item) => Date.parse(item.observedAt),
+    );
     const updateHistory = [...new Map(candidates.flatMap((event) => event.updateHistory?.length ? event.updateHistory : event.evidence.map((item) => ({
       ...item,
       title: event.title,
@@ -1967,10 +1991,10 @@ function csvColumns(line: string) {
   return cells;
 }
 
-function firmsDate(date: string, time: string) {
+function firmsDate(date: string, time: string): string | null {
   const compact = String(time ?? "").padStart(4, "0");
   const parsed = new Date(`${date}T${compact.slice(0, 2)}:${compact.slice(2)}:00Z`);
-  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : new Date().toISOString();
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : null;
 }
 
 function parseCoordinate(value: unknown): number | null {

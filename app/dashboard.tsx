@@ -11,7 +11,7 @@ import {
   type ScopeId,
 } from "../lib/disasters";
 import { allowedOperatorTaskStatuses, canTransitionTask, safeHttpUrl, validateSatelliteTask } from "../lib/task-contract";
-import { buildTaskAoi, customAoiPartCount, normalizeCustomAoiGeoJson, type CustomAoiGeometry, type GeoGeometry } from "../lib/task-aoi";
+import { buildTaskAoi, customAoiPartCount, normalizeCustomAoiGeoJson, type AoiPolygonCoordinates, type CustomAoiGeometry, type GeoGeometry } from "../lib/task-aoi";
 import { aoiFingerprint, eventRevisionFingerprint, latestEventVersionsByMasterId } from "../lib/event-integrity";
 import { cycloneTaskAoiSlices, cycloneUncertaintyGeometry, cycloneWindGeometry, type CycloneTaskAoiSlice } from "../lib/cyclone-forecast";
 import { weatherImagingWindows, type WeatherForecastReady, type WeatherForecastResponse } from "../lib/qweather";
@@ -51,6 +51,7 @@ type ApiResponse = {
 
 const scopeOrder: ScopeId[] = ["wuxi", "jiangsu", "china", "global"];
 const severityLabels = { red: "红色", orange: "橙色", yellow: "黄色", blue: "蓝色" };
+const severityRanks = { blue: 1, yellow: 2, orange: 3, red: 4 };
 const locationQualityLabels: Record<DisasterEvent["locationQuality"], string> = { precise: "精确点位", estimated: "估算点位", representative: "区域代表点", unknown: "位置待核验" };
 const confidenceLabels: Record<DisasterEvent["confidenceLevel"], string> = { high: "高可信", medium: "中可信", low: "低可信" };
 const phenomenonLabels: Record<DisasterEvent["phenomenonStage"], string> = { observed: "实况", forecast: "预报", warning: "预警", driver: "驱动因子", context: "背景资料" };
@@ -298,6 +299,9 @@ const defaultAoiRadiusKm: Record<HazardType, number> = {
 };
 
 export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { currentUser?: { username: string; role: "viewer" | "operator" | "admin" }; onLogout?: () => void; logoutBusy?: boolean }) {
+  const storageOwner = encodeURIComponent(currentUser?.username ?? "local-developer");
+  const userTaskStorageKey = `${taskStorageKey}:${storageOwner}`;
+  const userResponseStorageKey = `${responseStorageKey}:${storageOwner}`;
   const [data, setData] = useState<ApiResponse | null>(null);
   const [scope, setScope] = useState<ScopeId>("global");
   const [hazard, setHazard] = useState<HazardType | "all">("all");
@@ -339,6 +343,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
   const taskSaveTimers = useRef(new Map<string, number>());
   const taskSaveControllers = useRef(new Map<string, AbortController>());
   const taskMutationGeneration = useRef(new Map<string, number>());
+  const opportunityResetNotices = useRef(new Map<string, string>());
   const tasksRef = useRef<SatelliteTask[]>([]);
   const closeTaskPanel = useCallback(() => { setTaskPanelOpen(false); }, []);
   const closeResponsePanel = useCallback(() => { setResponsePanelOpen(false); }, []);
@@ -414,8 +419,12 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     const restore = window.setTimeout(async () => {
       let localTasks: SatelliteTask[] = [];
       try {
-        const saved = window.localStorage.getItem(taskStorageKey);
+        const saved = window.localStorage.getItem(userTaskStorageKey) ?? window.localStorage.getItem(taskStorageKey);
         if (saved) localTasks = (JSON.parse(saved) as Array<Partial<SatelliteTask>>).map(migrateSatelliteTask);
+        if (!window.localStorage.getItem(userTaskStorageKey) && window.localStorage.getItem(taskStorageKey)) {
+          window.localStorage.setItem(userTaskStorageKey, saved ?? "[]");
+          window.localStorage.removeItem(taskStorageKey);
+        }
       } catch {
         // 本地缓存损坏时从空候选单重新开始，不影响实时事件监测。
       }
@@ -444,15 +453,19 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
       }
     }, 0);
     return () => window.clearTimeout(restore);
-  }, []);
+  }, [userTaskStorageKey]);
 
   useEffect(() => {
     const restore = window.setTimeout(() => {
       try {
-        const saved = window.localStorage.getItem(responseStorageKey);
+        const saved = window.localStorage.getItem(userResponseStorageKey) ?? window.localStorage.getItem(responseStorageKey);
         if (saved) {
           const parsed = JSON.parse(saved) as ResponseScenario[];
           setResponseScenarios(parsed.filter(isResponseScenario).slice(0, 50));
+        }
+        if (!window.localStorage.getItem(userResponseStorageKey) && window.localStorage.getItem(responseStorageKey)) {
+          window.localStorage.setItem(userResponseStorageKey, saved ?? "[]");
+          window.localStorage.removeItem(responseStorageKey);
         }
       } catch {
         // 损坏的本机推演场景不能影响灾害监测和卫星任务主链。
@@ -461,17 +474,17 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
       }
     }, 0);
     return () => window.clearTimeout(restore);
-  }, []);
+  }, [userResponseStorageKey]);
 
   useEffect(() => {
     if (!tasksHydrated) return;
-    window.localStorage.setItem(taskStorageKey, JSON.stringify(tasks));
-  }, [tasks, tasksHydrated]);
+    window.localStorage.setItem(userTaskStorageKey, JSON.stringify(tasks));
+  }, [tasks, tasksHydrated, userTaskStorageKey]);
 
   useEffect(() => {
     if (!responseHydrated) return;
-    window.localStorage.setItem(responseStorageKey, JSON.stringify(responseScenarios.slice(0, 50)));
-  }, [responseHydrated, responseScenarios]);
+    window.localStorage.setItem(userResponseStorageKey, JSON.stringify(responseScenarios.slice(0, 50)));
+  }, [responseHydrated, responseScenarios, userResponseStorageKey]);
 
   useEffect(() => {
     if (!tasksHydrated || !data?.events.length) return;
@@ -512,7 +525,9 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
         const serverTask = migrateSatelliteTask(result.task);
         setTasks((current) => current.map((item) => item.taskId !== task.taskId ? item : item.updatedAt === task.updatedAt ? serverTask : { ...item, revision: serverTask.revision, eventRevision: serverTask.eventRevision, aoiHash: serverTask.aoiHash }));
       }
-      setTaskSync((current) => ({ ...current, [task.taskId]: { state: "synced" } }));
+      const resetNotice = opportunityResetNotices.current.get(task.taskId);
+      opportunityResetNotices.current.delete(task.taskId);
+      setTaskSync((current) => ({ ...current, [task.taskId]: { state: "synced", message: resetNotice } }));
       return true;
     } catch (saveError) {
       if (controller.signal.aborted || (taskMutationGeneration.current.get(task.taskId) ?? 0) !== generation) return false;
@@ -564,6 +579,10 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     const touchesAoi = Object.keys(patch).some((key) => aoiKeys.includes(key));
     const opportunityInputKeys = [...aoiKeys, "imagingStart", "imagingEnd", "sensors", "sarImagingModes", "minimumCoveragePercent", "spatialResolutionMeters", "incidenceAngleMinDeg", "incidenceAngleMaxDeg", "orbitDirectionPreference", "cycloneTrackingTarget"];
     const invalidatesOpportunity = Object.keys(patch).some((key) => opportunityInputKeys.includes(key));
+    const taskBeforeUpdate = tasksRef.current.find((task) => task.taskId === taskId);
+    if (invalidatesOpportunity && taskBeforeUpdate?.opportunityId) {
+      opportunityResetNotices.current.set(taskId, "规划条件已修改，原成像机会已清除；请重新计算并选择卫星机会");
+    }
     const opportunityReset: Partial<SatelliteTask> = invalidatesOpportunity ? {
       satelliteId: undefined, instrumentId: undefined, imagingMode: undefined, opportunityId: undefined,
       orbitVersion: undefined, visibilityComputedAt: undefined, incidenceAngleDeg: undefined, offNadirAngleDeg: undefined,
@@ -751,9 +770,11 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     if (window.matchMedia("(max-width: 1050px)").matches) setListOpen(false);
   }, [deduplicatedEvents, responseScenarios]);
   const removeResponseScenario = useCallback((scenarioId: string) => {
+    const scenario = responseScenarios.find((item) => item.scenarioId === scenarioId);
+    if (scenario && !window.confirm(`确认删除处置推演“${scenario.title}”？`)) return;
     setResponseScenarios((current) => current.filter((scenario) => scenario.scenarioId !== scenarioId));
     if (activeResponseScenarioId === scenarioId) setActiveResponseScenarioId(null);
-  }, [activeResponseScenarioId]);
+  }, [activeResponseScenarioId, responseScenarios]);
   const selectResponseRoute = useCallback((scenarioId: string, routeId: string) => {
     setResponseScenarios((current) => current.map((scenario) => scenario.scenarioId === scenarioId ? { ...scenario, selectedRouteId: routeId, updatedAt: new Date().toISOString() } : scenario));
   }, []);
@@ -815,7 +836,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
       </section>
 
       <section className={`workspace ${modalPanelOpen ? "tasks-open" : ""} ${responsePanelOpen ? "response-open" : ""}`}>
-        <aside className={`event-panel ${listOpen ? "open" : "closed"}`} inert={modalPanelOpen ? true : undefined} aria-hidden={modalPanelOpen || undefined}>
+        <aside className={`event-panel ${listOpen ? "open" : "closed"}`} inert={!listOpen || modalPanelOpen ? true : undefined} aria-hidden={!listOpen || modalPanelOpen || undefined}>
           <div className="panel-heading">
             <div><p>{scopes[scope].label} · {runtimeMode}</p><h1>{filtered.length}<span> 个可观测事件</span></h1></div>
             <button onClick={() => setListOpen(false)} aria-label="收起列表">‹</button>
@@ -975,6 +996,7 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
   const [draftVertices, setDraftVertices] = useState<Array<[number, number]>>([]);
   const [drawingError, setDrawingError] = useState("");
   const [orbitsVisible, setOrbitsVisible] = useState(false);
+  const [clusterSelection, setClusterSelection] = useState<DisasterEvent[]>([]);
   const activeTrackingSlice = useMemo(() => {
     if (activeTask?.hazard !== "cyclone" || !activeTask.closestApproachAt || !activeTask.timeIndexedAoi?.length) return undefined;
     return cycloneTrackingSliceAt(activeTask.timeIndexedAoi, activeTask.closestApproachAt);
@@ -1159,14 +1181,16 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
       });
       groups.forEach((group) => {
         if (group.length > 1) {
+          const orderedGroup = [...group].sort((left, right) => severityRanks[right.severity] - severityRanks[left.severity] || right.priority - left.priority);
+          const dominantSeverity = orderedGroup[0].severity;
           const latitude = group.reduce((sum, event) => sum + event.latitude, 0) / group.length;
           const longitude = circularLongitude(group.map((event) => event.longitude));
           const cluster = L.marker([latitude, longitude], {
-            icon: L.divIcon({ className: "event-div-icon", html: `<span class="geo-cluster"><b>${group.length}</b></span>`, iconSize: [38, 38], iconAnchor: [19, 19] }),
+            icon: L.divIcon({ className: "event-div-icon", html: `<span class="geo-cluster ${dominantSeverity}"><b>${group.length}</b></span>`, iconSize: [38, 38], iconAnchor: [19, 19] }),
             title: `${group.length} 个邻近灾害事件`, keyboard: true,
           });
-          cluster.bindTooltip(`${group.length} 个共址/邻近事件：${group.slice(0, 4).map((event) => event.title).join("；")}${group.length > 4 ? "…" : ""}`, { direction: "top", offset: [0, -17] });
-          cluster.on("click", () => map.getZoom() >= 12 ? onSelectRef.current(group[0]) : map.setView([latitude, longitude], Math.min(12, map.getZoom() + 3), { animate: true }));
+          cluster.bindTooltip(`${group.length} 个共址/邻近事件：${orderedGroup.slice(0, 4).map((event) => event.title).join("；")}${group.length > 4 ? "…" : ""}`, { direction: "top", offset: [0, -17] });
+          cluster.on("click", () => map.getZoom() >= 12 ? setClusterSelection(orderedGroup) : map.setView([latitude, longitude], Math.min(12, map.getZoom() + 3), { animate: true }));
           cluster.addTo(layer);
           return;
         }
@@ -1582,7 +1606,12 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
     const geometry: CustomAoiGeometry = activeTask.aoiType !== "multi" && polygons.length === 1
       ? { type: "Polygon", coordinates: polygons[0] }
       : { type: "MultiPolygon", coordinates: polygons };
-    onCustomAoiChange(activeTask.taskId, geometry);
+    const normalized = normalizeCustomAoiGeoJson(geometry);
+    if (!normalized) {
+      setDrawingError("当前边界存在自相交、重叠、面积越界或日期变更线问题，请撤销顶点后重画");
+      return;
+    }
+    onCustomAoiChange(activeTask.taskId, normalized);
     setDraftVertices([]);
     setDrawing(false);
     setDrawingError("");
@@ -1595,6 +1624,10 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
     <div className="map-shade" />
     <div className="map-title"><span>观测视图</span><strong>{scopes[scope].label}</strong><small>{events.length} 个事件 · 行政范围为快速筛选近似边界</small><button className="orbit-toggle" aria-pressed={orbitsVisible} disabled={!fleet.current} onClick={() => setOrbitsVisible((visible) => !visible)}><i />{orbitsVisible ? "隐藏卫星轨道" : "显示卫星轨道"}<b>{fleet.state === "loading" ? "…" : fleet.current}</b></button>{orbitsVisible ? <small className="orbit-disclaimer">TLE/SGP4 外推 · 非星上遥测</small> : null}</div>
     <div className="coordinates">WGS 84 · {viewLabel || "地图初始化中"}</div>
+    {clusterSelection.length ? <aside className="cluster-selection" aria-label="选择邻近灾害事件">
+      <div><strong>此处有 {clusterSelection.length} 个事件</strong><button onClick={() => setClusterSelection([])} aria-label="关闭邻近事件列表">×</button></div>
+      {clusterSelection.map((event) => <button key={event.masterEventId} className={event.severity} onClick={() => { setClusterSelection([]); onSelect(event); }}><span>{hazardMeta[event.hazard].symbol}</span><b>{event.title}</b><small>{severityLabels[event.severity]} · 优先级 {event.priority}</small></button>)}
+    </aside> : null}
     {forecastFrames.length > 0 && activeForecastFrame ? <div className="cyclone-timeline" role="group" aria-label="台风四维影响场时间轴">
       <div><strong>{activeTask?.hazard === "cyclone" ? "任务 4D 预测路径" : "4D 影响场"}</strong><span>{browsingTaskForecast ? "浏览模式" : activeTask?.hazard === "cyclone" ? "拍摄时刻" : activeForecastFrame.centerBasis === "official_node" ? "官方节点" : "逐时插值"} · +{activeForecastFrame.leadHours}h</span></div>
       <div className="cyclone-timeline-meta"><time>{formatTimeWithYear(activeForecastFrame.forecastAt)} UTC+08</time>{activeTask?.hazard === "cyclone" && activeTask.closestApproachAt ? <button disabled={!browsingTaskForecast} onClick={() => setForecastSelection({ eventId: forecastOwnerId, index: acquisitionForecastFrameIndex })}>回到拍摄时刻</button> : null}</div>
@@ -1713,6 +1746,7 @@ function LandslidePlanningCard({ event, terrain, templateCount, taskAllowed, onT
         setLoad({ state: "flat", message: result.message });
         return;
       }
+      if (result.state !== "ready") throw new Error("地形服务返回了无法识别的状态");
       onTerrainChange(result);
       setLoad({ state: "idle" });
     } catch (error) {
@@ -2012,7 +2046,7 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
 
   return <aside ref={panelRef} className="task-panel response-panel" role="dialog" aria-modal="true" aria-labelledby="response-panel-title">
     <div className="task-panel-heading response-panel-heading">
-      <div><span>PHASE 3 · DECISION SUPPORT</span><h2 id="response-panel-title">处置推演 <b>{scenarios.length}</b></h2><p>真实路网 + 中断台账 + 设施暴露 · WGS 84</p></div>
+      <div><span>处置支持</span><h2 id="response-panel-title">处置推演 <b>{scenarios.length}</b></h2><p>真实路网 + 中断台账 + 设施暴露 · WGS 84</p></div>
       <button ref={closeRef} onClick={onClose} aria-label="关闭处置推演">×</button>
     </div>
     <div className="response-panel-body">
@@ -2109,6 +2143,7 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
   const [weatherTaskId, setWeatherTaskId] = useState<string | null>(activeTaskId);
   const panelRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const visibilityRequestGeneration = useRef(new Map<string, number>());
   const visibilityInputKeys = useMemo(() => Object.fromEntries(tasks.map((task) => [task.taskId, aoiFingerprint({
     eventRevision: task.eventRevision,
     aoiType: task.aoiType,
@@ -2134,7 +2169,10 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
     const previous = previousVisibilityInputKeys.current;
     const changed = new Set(Object.keys(visibilityInputKeys).filter((taskId) => previous[taskId] && previous[taskId] !== visibilityInputKeys[taskId]));
     const removed = Object.keys(previous).some((taskId) => !(taskId in visibilityInputKeys));
-    if (changed.size || removed) setVisibility((current) => Object.fromEntries(Object.entries(current).filter(([taskId]) => taskId in visibilityInputKeys && !changed.has(taskId))));
+    if (changed.size || removed) {
+      changed.forEach((taskId) => visibilityRequestGeneration.current.set(taskId, (visibilityRequestGeneration.current.get(taskId) ?? 0) + 1));
+      setVisibility((current) => Object.fromEntries(Object.entries(current).filter(([taskId]) => taskId in visibilityInputKeys && !changed.has(taskId))));
+    }
     previousVisibilityInputKeys.current = visibilityInputKeys;
   }, [visibilityInputKeys]);
   useEffect(() => {
@@ -2176,6 +2214,8 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
     }
   };
   const calculateVisibility = async (task: SatelliteTask) => {
+    const requestGeneration = (visibilityRequestGeneration.current.get(task.taskId) ?? 0) + 1;
+    visibilityRequestGeneration.current.set(task.taskId, requestGeneration);
     setVisibility((current) => ({ ...current, [task.taskId]: { state: "loading", windows: [] } }));
     try {
       const requestBody = storageMode === "public-read-only"
@@ -2184,8 +2224,10 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
       const response = await fetch("/api/visibility", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody) });
       const result = await response.json() as { state?: VisibilityState["state"]; mode?: VisibilityState["mode"]; message?: string; windows?: VisibilityWindow[]; orbitVersion?: string; computedAt?: string };
       const windows = (result.windows ?? []).map((window) => ({ ...window, orbitVersion: window.orbitVersion ?? result.orbitVersion, computedAt: window.computedAt ?? result.computedAt }));
+      if (visibilityRequestGeneration.current.get(task.taskId) !== requestGeneration) return;
       setVisibility((current) => ({ ...current, [task.taskId]: { state: result.state ?? (response.ok ? "ready" : "error"), mode: result.mode, message: result.message, windows } }));
     } catch {
+      if (visibilityRequestGeneration.current.get(task.taskId) !== requestGeneration) return;
       setVisibility((current) => ({ ...current, [task.taskId]: { state: "error", message: "无法连接可见性计算接口", windows: [] } }));
     }
   };
@@ -2717,9 +2759,9 @@ async function readCustomAoiFile(file: File) {
   return geometry;
 }
 
-function customAoiPolygonParts(geometry: CustomAoiGeometry | undefined): number[][][][] {
-  if (!geometry || !Array.isArray(geometry.coordinates)) return [];
-  return geometry.type === "Polygon" ? [geometry.coordinates as number[][][]] : geometry.coordinates as number[][][][];
+function customAoiPolygonParts(geometry: CustomAoiGeometry | undefined): AoiPolygonCoordinates[] {
+  if (!geometry) return [];
+  return geometry.type === "Polygon" ? [geometry.coordinates] : geometry.coordinates;
 }
 
 function taskGeometry(task: SatelliteTask) {

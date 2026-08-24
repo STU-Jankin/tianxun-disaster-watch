@@ -18,7 +18,7 @@ test("engine API token is forwarded to backend collection requests", async () =>
   let headers;
   try {
     const tokenConfig = defaultConfig({
-      TIANXUN_API_TOKEN: "test-secret",
+      TIANXUN_VIEWER_TOKEN: "test-secret",
       TIANXUN_NOTIFY_DB: join(directory, "notifier.sqlite"),
       HERMES_WEBHOOK_SECRET: "webhook-secret",
       BOOTSTRAP_NOTIFY: "false",
@@ -250,4 +250,35 @@ test("failed Hermes delivery remains queued for retry", async (context) => {
   assert.equal(result.delivered, 0);
   assert.equal(result.pending, 1);
   assert.match(result.error, /Hermes HTTP 502/);
+});
+
+test("non-persisted in-memory events never enter the notification baseline", async (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "tianxun-persistence-guard-"));
+  context.after(() => rmSync(directory, { recursive: true, force: true }));
+  let deliveries = 0;
+  const result = await runOnce({
+    ...config,
+    dbPath: join(directory, "notifier.sqlite"),
+    engineUrl: "http://engine/api/events",
+    webhookUrl: "http://hermes/webhooks/tianxun-alerts",
+    webhookSecret: "test-secret",
+    sourceFailureThreshold: 3,
+    maxDeliveryAttempts: 8,
+    maxBatchSize: 5,
+    requestTimeoutMs: 5000,
+    bootstrapNotify: true,
+  }, async (url) => {
+    if (String(url).includes("/api/events")) return Response.json({
+      events: [event({ priority: 90 })],
+      sourceStatus: [],
+      fallback: false,
+      persistenceAvailable: false,
+      fetchedAt: "2026-08-13T00:00:00.000Z",
+    });
+    deliveries += 1;
+    return Response.json({ status: "delivered" });
+  });
+  assert.equal(deliveries, 0);
+  assert.equal(result.delivered, 0);
+  assert.match(result.error, /持久化不可用/);
 });

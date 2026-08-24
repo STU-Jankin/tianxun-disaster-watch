@@ -38,6 +38,7 @@ export type WebSessionRecord = {
 
 let schemaReady: Promise<void> | null = null;
 let databaseReady: Promise<DatabaseLike> | null = null;
+let lastRetentionPruneAt = 0;
 
 type DatabaseStatement = {
   bind(...values: unknown[]): DatabaseStatement;
@@ -48,7 +49,7 @@ type DatabaseStatement = {
 
 type DatabaseLike = {
   prepare(sql: string): DatabaseStatement;
-  batch(statements: DatabaseStatement[]): Promise<unknown>;
+  batch(statements: DatabaseStatement[]): Promise<unknown[]>;
 };
 
 type NodePreparedStatement = {
@@ -259,10 +260,37 @@ export async function persistCanonicalEvents(events: DisasterEvent[]): Promise<D
     await resolveClaimAliases(db);
     await db.prepare(`UPDATE canonical_events SET lifecycle_status = CASE WHEN observation_expires_at <= ? THEN 'archived' ELSE 'monitoring' END WHERE synced_at < ? AND lifecycle_status IN ('active', 'monitoring')`)
       .bind(syncMarker, syncMarker).run();
+    await pruneOperationalDataIfDue(db, Date.now());
     return await readPersistedCanonicalEvents(db, canonicalEvents);
   } catch (error) {
     console.error("canonical event persistence unavailable", error);
     return null;
+  }
+}
+
+async function pruneOperationalDataIfDue(db: DatabaseLike, nowMs: number) {
+  if (nowMs - lastRetentionPruneAt < 6 * 60 * 60_000) return;
+  const eventCutoff = new Date(nowMs - 180 * 86_400_000).toISOString();
+  const auditCutoff = new Date(nowMs - 365 * 86_400_000).toISOString();
+  const expiredSessionCutoff = new Date(nowMs).toISOString();
+  const removableEvents = `SELECT id FROM canonical_events c WHERE c.lifecycle_status IN ('resolved','archived') AND c.observation_expires_at < ? AND NOT EXISTS (SELECT 1 FROM satellite_tasks t WHERE t.master_event_id=c.id)`;
+  try {
+    await db.batch([
+      db.prepare(`DELETE FROM event_evidence WHERE master_event_id IN (${removableEvents})`).bind(eventCutoff),
+      db.prepare(`DELETE FROM event_source_claims WHERE master_event_id IN (${removableEvents})`).bind(eventCutoff),
+      db.prepare(`DELETE FROM event_quarantine WHERE master_event_id IN (${removableEvents})`).bind(eventCutoff),
+      db.prepare(`DELETE FROM canonical_events WHERE id IN (${removableEvents})`).bind(eventCutoff),
+      db.prepare(`DELETE FROM operational_changes WHERE created_at < ?`).bind(eventCutoff),
+      db.prepare(`DELETE FROM task_export_packages WHERE created_at < ?`).bind(auditCutoff),
+      db.prepare(`DELETE FROM task_status_history WHERE changed_at < ? AND EXISTS (SELECT 1 FROM satellite_tasks t WHERE t.task_id=task_status_history.task_id AND t.status='cancelled')`).bind(auditCutoff),
+      db.prepare(`DELETE FROM task_revision_history WHERE changed_at < ? AND EXISTS (SELECT 1 FROM satellite_tasks t WHERE t.task_id=task_revision_history.task_id AND t.status='cancelled')`).bind(auditCutoff),
+      db.prepare(`DELETE FROM road_disruption_history WHERE changed_at < ? AND EXISTS (SELECT 1 FROM road_disruptions r WHERE r.disruption_id=road_disruption_history.disruption_id AND r.lifecycle_status IN ('resolved','rejected'))`).bind(auditCutoff),
+      db.prepare(`DELETE FROM event_tombstones WHERE resolved_at < ? AND NOT EXISTS (SELECT 1 FROM event_evidence e WHERE e.source=event_tombstones.source AND e.source_event_id=event_tombstones.source_event_id)`).bind(auditCutoff),
+      db.prepare(`DELETE FROM web_sessions WHERE expires_at <= ?`).bind(expiredSessionCutoff),
+    ]);
+    lastRetentionPruneAt = nowMs;
+  } catch (error) {
+    console.error("operational retention prune failed", error);
   }
 }
 
@@ -671,7 +699,6 @@ export async function resolveCanonicalEventsByReferences(references: Array<{ sou
       .bind(reference.source, reference.sourceEventId).all<{ master_event_id: string }>();
     for (const row of rows.results) {
       if (await hasActiveEvidence(db, row.master_event_id)) continue;
-      if (/CAP Update/i.test(reason)) continue;
       const canonical = await db.prepare(`SELECT payload_json FROM canonical_events WHERE id=?`).bind(row.master_event_id).first<{ payload_json: string }>();
       const taskRows = await db.prepare(`SELECT task_id, owner, status, revision, payload_json FROM satellite_tasks WHERE master_event_id = ? AND status IN ('candidate', 'reviewed', 'scheduled', 'submitted')`)
         .bind(row.master_event_id).all<LifecycleTaskRow>();

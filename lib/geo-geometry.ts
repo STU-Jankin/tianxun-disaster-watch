@@ -111,7 +111,7 @@ export function validateGeoGeometry(
       const leftOuter = unwrapRing(polygons[left].rings[0]);
       for (let right = left + 1; right < polygons.length; right += 1) {
         const rightOuter = unwrapRingRelative(polygons[right].rings[0], leftOuter[0][0]);
-        if (ringsIntersect(leftOuter, rightOuter) || pointInRing(leftOuter[0], rightOuter) || pointInRing(rightOuter[0], leftOuter)) return fail("复合多边形的分块重叠或相交");
+        if (ringsHaveDisallowedIntersection(leftOuter, rightOuter) || pointStrictlyInsideRing(leftOuter[0], rightOuter) || pointStrictlyInsideRing(rightOuter[0], leftOuter)) return fail("复合多边形的分块重叠或相交");
       }
     }
   }
@@ -255,6 +255,39 @@ function ringsIntersect(left: Coordinate[], right: Coordinate[]) {
   return false;
 }
 
+function ringsHaveDisallowedIntersection(left: Coordinate[], right: Coordinate[]) {
+  for (let leftIndex = 0; leftIndex < left.length - 1; leftIndex += 1) {
+    for (let rightIndex = 0; rightIndex < right.length - 1; rightIndex += 1) {
+      const leftStart = left[leftIndex];
+      const leftEnd = left[leftIndex + 1];
+      const rightStart = right[rightIndex];
+      const rightEnd = right[rightIndex + 1];
+      if (segmentsIntersect(leftStart, leftEnd, rightStart, rightEnd)
+        && !touchesOnlyAlongAntimeridian(leftStart, leftEnd, rightStart, rightEnd)) return true;
+    }
+  }
+  return false;
+}
+
+function touchesOnlyAlongAntimeridian(a: Coordinate, b: Coordinate, c: Coordinate, d: Coordinate) {
+  const minimum = Math.min(a[0], b[0], c[0], d[0]);
+  const maximum = Math.max(a[0], b[0], c[0], d[0]);
+  const firstSeam = Math.ceil((minimum - 180 - EPSILON) / 360);
+  const lastSeam = Math.floor((maximum - 180 + EPSILON) / 360);
+  for (let index = firstSeam; index <= lastSeam; index += 1) {
+    const seam = 180 + index * 360;
+    const leftTouches = Math.abs(a[0] - seam) <= EPSILON || Math.abs(b[0] - seam) <= EPSILON;
+    const rightTouches = Math.abs(c[0] - seam) <= EPSILON || Math.abs(d[0] - seam) <= EPSILON;
+    if (!leftTouches || !rightTouches) continue;
+    const leftBelow = a[0] <= seam + EPSILON && b[0] <= seam + EPSILON;
+    const leftAbove = a[0] >= seam - EPSILON && b[0] >= seam - EPSILON;
+    const rightBelow = c[0] <= seam + EPSILON && d[0] <= seam + EPSILON;
+    const rightAbove = c[0] >= seam - EPSILON && d[0] >= seam - EPSILON;
+    if ((leftBelow && rightAbove) || (leftAbove && rightBelow)) return true;
+  }
+  return false;
+}
+
 function segmentsIntersect(a: Coordinate, b: Coordinate, c: Coordinate, d: Coordinate) {
   const o1 = orientation(a, b, c);
   const o2 = orientation(a, b, d);
@@ -285,6 +318,13 @@ function pointInRing(point: Coordinate, ring: Coordinate[]) {
       && point[0] < (prior[0] - current[0]) * (point[1] - current[1]) / (prior[1] - current[1]) + current[0]) inside = !inside;
   }
   return inside;
+}
+
+function pointStrictlyInsideRing(point: Coordinate, ring: Coordinate[]) {
+  for (let index = 0; index < ring.length - 1; index += 1) {
+    if (Math.abs(orientation(ring[index], ring[index + 1], point)) <= EPSILON && onSegment(ring[index], ring[index + 1], point)) return false;
+  }
+  return pointInRing(point, ring);
 }
 
 function sphericalRingAreaKm2(ring: Coordinate[]) {

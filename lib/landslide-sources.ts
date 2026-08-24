@@ -9,7 +9,7 @@ const nvePublicUrl = "https://www.varsom.no/en/landslide-warning/";
 
 export function parseUsgsGroundFailureDetails(payload: unknown): PublicEventCandidate[] {
   const features = isRecord(payload) && Array.isArray(payload.features) ? payload.features.filter(isRecord) : [];
-  return features.flatMap((feature) => {
+  return features.flatMap((feature): PublicEventCandidate[] => {
     const properties = record(feature.properties);
     const products = record(properties.products);
     const groundFailure = Array.isArray(products["ground-failure"])

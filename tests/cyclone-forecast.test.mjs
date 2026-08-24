@@ -111,3 +111,23 @@ test("task AOI slices are clipped to the imaging window and split at the date li
   assert.equal(slices.at(-1).validTo, "2026-08-18T02:30:00.000Z");
   assert.equal(slices[0].windGeometry.type, "MultiPolygon");
 });
+
+test("task AOI slices retain hourly forecast centers without wind radii or uncertainty", async () => {
+  const { cycloneTaskAoiSlices } = await forecastTools();
+  const forecast = {
+    impactField: {
+      frames: [0, 1, 2].map((leadHours) => ({
+        forecastAt: new Date(Date.parse("2026-08-18T00:00:00Z") + leadHours * 3_600_000).toISOString(),
+        leadHours,
+        latitude: 15 + leadHours,
+        longitude: 120 + leadHours,
+        centerBasis: leadHours === 0 ? "official_node" : "interpolated_official_track",
+        windFields: [],
+      })),
+    },
+  };
+  const slices = cycloneTaskAoiSlices(forecast, "2026-08-18T00:00:00Z", "2026-08-18T03:00:00Z");
+  assert.equal(slices.length, 3);
+  assert.deepEqual(slices.map((slice) => slice.center), [[120, 15], [121, 16], [122, 17]]);
+  assert.ok(slices.every((slice) => slice.windGeometry === undefined && slice.uncertaintyGeometry === undefined));
+});

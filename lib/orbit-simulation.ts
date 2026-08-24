@@ -16,13 +16,13 @@ export type GroundTrack = {
 export function propagateTle(tleLine1: string, tleLine2: string, at = new Date()): GroundPosition | null {
   const satrec = twoline2satrec(tleLine1, tleLine2);
   if (satrec.error) return null;
-  const current = propagate(satrec, at).position;
+  const current = propagate(satrec, at)?.position;
   if (!current || typeof current === "boolean") return null;
   const geodetic = eciToGeodetic(current, gstime(at));
   const latitude = degreesLat(geodetic.latitude);
   const longitude = normalizeLongitude(degreesLong(geodetic.longitude));
   const laterAt = new Date(at.getTime() + 10_000);
-  const later = propagate(satrec, laterAt).position;
+  const later = propagate(satrec, laterAt)?.position;
   let direction: GroundPosition["direction"] = "ascending";
   if (later && typeof later !== "boolean") {
     const laterLatitude = degreesLat(eciToGeodetic(later, gstime(laterAt)).latitude);

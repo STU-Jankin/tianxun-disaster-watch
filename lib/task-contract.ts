@@ -37,7 +37,7 @@ const allowedTaskFields = new Set([
   "approvalReason", "createdAt", "updatedAt", "status", "revision", "eventRevision", "aoiHash",
   "timeIndexedAoi", "forecastAdvisoryId", "forecastIssuedAt", "forecastValidUntil",
   "cycloneTrackingTarget", "trackingValidFrom", "trackingValidTo", "trackingLeadHours", "trackingCenterLatitude", "trackingCenterLongitude", "trackingCenterBasis", "trackingThresholdKnots",
-  "satelliteId", "instrumentId", "imagingMode", "opportunityId", "orbitVersion", "visibilityComputedAt",
+  "satelliteId", "instrumentId", "imagingMode", "opportunityId", "orbitVersion", "visibilityComputedAt", "incidenceAngleDeg", "offNadirAngleDeg",
   "opportunityLookSide", "opportunityCoveragePercent", "opportunitySpatialResolutionM", "opportunitySceneCrossTrackKm", "opportunitySceneAlongTrackKm", "sensorParameterStatus", "opportunityFootprint",
   "simulationLevel", "satelliteNoradId", "closestApproachAt", "closestSubpointLatitude", "closestSubpointLongitude",
   "minimumGroundTrackDistanceKm", "orbitSearchRadiusKm", "opportunityOrbitDirection",
@@ -105,6 +105,8 @@ export function validateSatelliteTask(task: Record<string, unknown>, options: { 
   if (task.orbitSearchRadiusKm !== undefined) boundedNumber(task.orbitSearchRadiusKm, 50, 1_000, "轨道搜索半径", errors);
   if (task.opportunityOrbitDirection !== undefined && !["ascending", "descending"].includes(String(task.opportunityOrbitDirection))) errors.push("候选机会轨向无效");
   if (task.opportunityLookSide !== undefined && !["left", "right"].includes(String(task.opportunityLookSide))) errors.push("候选机会侧视方向无效");
+  if (task.incidenceAngleDeg !== undefined) boundedNumber(task.incidenceAngleDeg, 0, 90, "候选机会地面入射角", errors);
+  if (task.offNadirAngleDeg !== undefined) boundedNumber(task.offNadirAngleDeg, 0, 90, "候选机会离轴角", errors);
   if (task.opportunityCoveragePercent !== undefined) boundedNumber(task.opportunityCoveragePercent, 0, 100, "候选机会覆盖率", errors);
   if (task.opportunitySpatialResolutionM !== undefined) boundedNumber(task.opportunitySpatialResolutionM, 0.1, 10_000, "候选机会分辨率", errors);
   if (task.opportunitySceneCrossTrackKm !== undefined) boundedNumber(task.opportunitySceneCrossTrackKm, 0.1, 1_000, "候选场景横轨宽度", errors);
@@ -360,8 +362,7 @@ function isValidTimeIndexedAoi(value: unknown, taskStart: number, taskEnd: numbe
       && (slice.centerBasis === "official_node" || slice.centerBasis === "interpolated_official_track")
       && (threshold === undefined || (Number.isFinite(threshold) && threshold > 0 && threshold <= 250))
       && (slice.windGeometry === undefined || isGeometry(slice.windGeometry, 25_000_000))
-      && (slice.uncertaintyGeometry === undefined || isGeometry(slice.uncertaintyGeometry, 25_000_000))
-      && (slice.windGeometry !== undefined || slice.uncertaintyGeometry !== undefined);
+      && (slice.uncertaintyGeometry === undefined || isGeometry(slice.uncertaintyGeometry, 25_000_000));
     priorStart = validFrom;
     return valid;
   });

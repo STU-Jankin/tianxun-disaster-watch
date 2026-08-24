@@ -237,7 +237,8 @@ test("returns persisted canonical identities and heals stale local draft referen
   const eventsRoute = await readFile(new URL("../app/api/events/route.ts", import.meta.url), "utf8");
   const taskRoute = await readFile(new URL("../app/api/tasks/route.ts", import.meta.url), "utf8");
   const operational = await readFile(new URL("../db/operational.ts", import.meta.url), "utf8");
-  assert.match(eventsRoute, /\(persistedEvents \?\? normalized\)\.map/);
+  assert.match(eventsRoute, /\(persistedEvents \?\? normalizedWithPresence\)\.map/);
+  assert.match(eventsRoute, /applyEventSourcePresence/);
   assert.match(taskRoute, /entityKey: typeof task\.entityKey/);
   assert.match(operational, /matches\.length === 1/);
   assert.match(operational, /candidate\.event\.evidence\.some/);
@@ -361,7 +362,8 @@ test("implements a server-side login, revocable sessions and password-hash confi
   assert.match(login, /Retry-After/);
   assert.doesNotMatch(login, /稍后后重试/);
   assert.match(dashboard, /安全退出/);
-  assert.match(loginRoute, /enforceRateLimit\(request, "web-login", 5, 15 \* 60_000\)/);
+  assert.match(loginRoute, /enforceRateLimit\(request, `web-login:\$\{username/);
+  assert.match(login, /api\/auth\/session/);
 });
 
 test("keeps the login form reachable on tablets and short mobile viewports", async () => {
@@ -380,7 +382,8 @@ test("includes every Vinext build dependency in the hardened VPS release allow-l
   assert.match(viteConfig, /\.\/\.openai\/hosting\.json/);
   assert.match(viteConfig, /\.\/build\/sites-vite-plugin\.ts/);
   assert.match(viteConfig, /main: "\.\/worker\/index\.ts"/);
-  assert.match(installer, /for directory in \.openai app build db drizzle lib public vps worker/);
+  assert.match(installer, /for directory in \.openai app build db drizzle lib public tests types vps worker/);
+  assert.match(installer, /npm_config_cache=.*"\$npm_bin" run verify/);
 });
 
 test("adds evidence-safe landslide terrain screening and complementary SAR task templates", async () => {

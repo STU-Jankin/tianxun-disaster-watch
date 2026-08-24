@@ -4,7 +4,7 @@ import { buildTaskAoi } from "./task-aoi.ts";
 export type TaskExportFormat = "json" | "csv" | "geojson";
 
 export function buildTaskExportArtifact(tasks: Record<string, unknown>[], format: TaskExportFormat, actor: string, generatedAt = new Date().toISOString()) {
-  const snapshots = tasks.map((task) => ({ ...task, aoi: buildTaskAoi(task) }));
+  const snapshots: Record<string, unknown>[] = tasks.map((task) => ({ ...task, aoi: buildTaskAoi(task) }));
   const snapshotDigest = aoiFingerprint(snapshots);
   const packageId = `TXP-${generatedAt.replace(/[-:.TZ]/g, "").slice(0, 14)}-${snapshotDigest.slice(0, 12)}`;
   const manifest = {

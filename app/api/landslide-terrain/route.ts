@@ -17,7 +17,7 @@ export async function POST(request: Request) {
   try {
     const body = await readJsonObject(request, 8 * 1024);
     let plan: ReturnType<typeof prepareTerrainSamplingPlan>;
-    try { plan = prepareTerrainSamplingPlan(body); }
+    try { plan = prepareTerrainSamplingPlan({ longitude: body.longitude, latitude: body.latitude, radiusKm: body.radiusKm }); }
     catch (error) { throw new ApiInputError(error instanceof Error ? error.message : "地形筛查参数无效", 400); }
 
     const cache = terrainState.__tianxunTerrainCache ??= new Map();

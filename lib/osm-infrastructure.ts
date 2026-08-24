@@ -57,7 +57,13 @@ export type InfrastructureQueryPlan = {
   bbox: [number, number, number, number];
   areaKm2: number;
   routes: InfrastructureRouteInput[];
-} | Extract<InfrastructureAssessment, { state: "too_large" | "unsupported" }>;
+} | {
+  state: "too_large" | "unsupported";
+  provider: "OpenStreetMap · Overpass";
+  message: string;
+  queryBbox?: [number, number, number, number];
+  queryAreaKm2?: number;
+};
 
 const attribution = "© OpenStreetMap contributors · ODbL" as const;
 const osmCopyrightUrl = "https://www.openstreetmap.org/copyright" as const;

@@ -11,6 +11,7 @@ export type ApiRole = "viewer" | "operator" | "executor" | "admin";
 
 export async function authorizeApiRequest(request: Request, requiredRole: ApiRole = "viewer") {
   const expectedToken = process.env.TIANXUN_API_TOKEN?.trim();
+  const viewerToken = process.env.TIANXUN_VIEWER_TOKEN?.trim();
   const operatorToken = process.env.TIANXUN_OPERATOR_TOKEN?.trim();
   const executorToken = process.env.TIANXUN_EXECUTOR_TOKEN?.trim();
   const proxySecret = process.env.TIANXUN_TRUSTED_PROXY_SECRET?.trim();
@@ -28,8 +29,8 @@ export async function authorizeApiRequest(request: Request, requiredRole: ApiRol
 
   const url = new URL(request.url);
   const local = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "::1";
-  if (process.env.NODE_ENV !== "production" && !expectedToken && !operatorToken && !executorToken && local) return null;
-  if (![expectedToken, operatorToken, executorToken, proxySecret].some(isStrongSecret) && !webAuthConfiguration().configured) {
+  if (process.env.NODE_ENV !== "production" && !expectedToken && !viewerToken && !operatorToken && !executorToken && local) return null;
+  if (![expectedToken, viewerToken, operatorToken, executorToken, proxySecret].some(isStrongSecret) && !webAuthConfiguration().configured) {
     return Response.json({ error: "服务端鉴权尚未安全配置" }, { status: 503 });
   }
   return Response.json({ error: "未授权访问；请使用站点身份或配置的 API Bearer Token" }, { status: 401 });
@@ -38,6 +39,7 @@ export async function authorizeApiRequest(request: Request, requiredRole: ApiRol
 export async function apiRole(request: Request): Promise<ApiRole | null> {
   const bearer = request.headers.get("authorization")?.startsWith("Bearer ") ? request.headers.get("authorization")!.slice(7).trim() : "";
   if (isStrongSecret(process.env.TIANXUN_API_TOKEN?.trim()) && bearer && timingSafeEqualText(bearer, process.env.TIANXUN_API_TOKEN!.trim())) return "admin";
+  if (isStrongSecret(process.env.TIANXUN_VIEWER_TOKEN?.trim()) && bearer && timingSafeEqualText(bearer, process.env.TIANXUN_VIEWER_TOKEN!.trim())) return "viewer";
   if (isStrongSecret(process.env.TIANXUN_OPERATOR_TOKEN?.trim()) && bearer && timingSafeEqualText(bearer, process.env.TIANXUN_OPERATOR_TOKEN!.trim())) return "operator";
   if (isStrongSecret(process.env.TIANXUN_EXECUTOR_TOKEN?.trim()) && bearer && timingSafeEqualText(bearer, process.env.TIANXUN_EXECUTOR_TOKEN!.trim())) return "executor";
   const proxySecret = process.env.TIANXUN_TRUSTED_PROXY_SECRET?.trim();
@@ -47,7 +49,7 @@ export async function apiRole(request: Request): Promise<ApiRole | null> {
   if (webSession) return webSession.role;
   const url = new URL(request.url);
   const local = ["localhost", "127.0.0.1", "::1"].includes(url.hostname);
-  if (process.env.NODE_ENV !== "production" && local && ![process.env.TIANXUN_API_TOKEN, process.env.TIANXUN_OPERATOR_TOKEN, process.env.TIANXUN_EXECUTOR_TOKEN].some(isStrongSecret)) return "admin";
+  if (process.env.NODE_ENV !== "production" && local && ![process.env.TIANXUN_API_TOKEN, process.env.TIANXUN_VIEWER_TOKEN, process.env.TIANXUN_OPERATOR_TOKEN, process.env.TIANXUN_EXECUTOR_TOKEN].some(isStrongSecret)) return "admin";
   return null;
 }
 

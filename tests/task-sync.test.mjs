@@ -46,6 +46,8 @@ test("task sync retains a bounded assumed-sensor footprint for map review", () =
     opportunitySpatialResolutionM: 3,
     opportunitySceneCrossTrackKm: 25,
     opportunitySceneAlongTrackKm: 25,
+    incidenceAngleDeg: 34.2,
+    offNadirAngleDeg: 29.8,
     sensorParameterStatus: "provisional_assumption",
     opportunityFootprint: footprint,
   });
@@ -53,4 +55,6 @@ test("task sync retains a bounded assumed-sensor footprint for map review", () =
   assert.equal(compact.opportunityLookSide, "right");
   assert.equal(compact.opportunityCoveragePercent, 96.5);
   assert.equal(compact.opportunitySceneCrossTrackKm, 25);
+  assert.equal(compact.incidenceAngleDeg, 34.2);
+  assert.equal(compact.offNadirAngleDeg, 29.8);
 });

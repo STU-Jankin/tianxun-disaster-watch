@@ -216,9 +216,9 @@ export function cycloneTaskAoiSlices(forecast: CycloneForecast | undefined, imag
     const field = [...frame.windFields].sort((left, right) => left.thresholdKnots - right.thresholdKnots)[0];
     const windGeometry = field ? cycloneWindGeometry(frame, field) : undefined;
     const uncertaintyGeometry = cycloneUncertaintyGeometry(frame);
-    // Interpolated centers remain useful to animate the official track, but a
-    // time slice without a wind footprint or uncertainty area is not an AOI.
-    if (!windGeometry && !uncertaintyGeometry) return [];
+    // The forecast center is itself a valid time-indexed tracking target. Keep
+    // center-only slices so satellites can follow the storm between official
+    // nodes even when the provider publishes no wind radii or uncertainty cone.
     return [{
       validFrom: new Date(validFrom).toISOString(),
       validTo: new Date(validTo).toISOString(),
