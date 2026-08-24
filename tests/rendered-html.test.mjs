@@ -296,6 +296,7 @@ test("adds a bounded phase-three response simulation, disruption review and infr
 test("keeps the authenticated Nginx gateway bounded without synthetic browser roles", async () => {
   const { readFile } = await import("node:fs/promises");
   const nginx = await readFile(new URL("../vps/nginx/tianxun-public-readonly.conf", import.meta.url), "utf8");
+  const proxyCommon = await readFile(new URL("../vps/nginx/tianxun-proxy-common.conf", import.meta.url), "utf8");
   const visibilityRoute = await readFile(new URL("../app/api/visibility/route.ts", import.meta.url), "utf8");
   assert.match(nginx, /listen 80 default_server/);
   assert.match(nginx, /tianxun_login:10m rate=5r\/m/);
@@ -303,6 +304,9 @@ test("keeps the authenticated Nginx gateway bounded without synthetic browser ro
   assert.match(nginx, /location = \/api\/health\/live/);
   assert.match(nginx, /location \/api\/[\s\S]*proxy_pass http:\/\/127\.0\.0\.1:3000/);
   assert.doesNotMatch(nginx, /tianxun-proxy-secret\.conf|X-Tianxun-Role|X-Tianxun-Stateless-Visibility|public-read-only/);
+  assert.match(proxyCommon, /proxy_set_header Host \$host:\$server_port/);
+  assert.match(proxyCommon, /proxy_set_header X-Forwarded-Host \$host:\$server_port/);
+  assert.match(proxyCommon, /proxy_set_header X-Forwarded-Port \$server_port/);
   assert.match(visibilityRoute, /statelessPublicTrial/);
   assert.doesNotMatch(nginx, /listen\s+(?:127\.0\.0\.1:)?(?:3000|8644)/);
 });
