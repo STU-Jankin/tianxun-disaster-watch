@@ -12,7 +12,7 @@ type CacheEntry = { features: InfrastructureFeature[]; fetchedAt: string; expire
 const infrastructureState = globalThis as typeof globalThis & { __tianxunInfrastructureCache?: Map<string, CacheEntry> };
 
 export async function POST(request: Request) {
-  const unauthorized = authorizeApiRequest(request, "operator");
+  const unauthorized = await authorizeApiRequest(request, "operator");
   if (unauthorized) return unauthorized;
   const crossOrigin = rejectCrossOriginBrowserWrite(request);
   if (crossOrigin) return crossOrigin;

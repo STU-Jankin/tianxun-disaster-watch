@@ -17,7 +17,7 @@ const weatherState = globalThis as typeof globalThis & {
 };
 
 export async function GET(request: Request) {
-  const unauthorized = authorizeApiRequest(request);
+  const unauthorized = await authorizeApiRequest(request);
   if (unauthorized) return unauthorized;
   const rateLimited = enforceRateLimit(request, "weather-read", 40, 60_000);
   if (rateLimited) return rateLimited;

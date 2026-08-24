@@ -109,7 +109,7 @@ let usgsGroundFailureCache: { events: DisasterEvent[]; expiresAt: number } | nul
 const nveBoundaryCache = new Map<string, { geometry: { type: string; coordinates: unknown }; expiresAt: number }>();
 
 export async function GET(request: Request) {
-  const unauthorized = authorizeApiRequest(request);
+  const unauthorized = await authorizeApiRequest(request);
   if (unauthorized) return unauthorized;
   if (eventsCache && eventsCache.expiresAt > Date.now()) return cachedEventsResponse(eventsCache, request);
   if (!eventsRefresh) {

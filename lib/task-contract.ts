@@ -1,11 +1,15 @@
 import { validateGeoGeometry } from "./geo-geometry.ts";
+import { sarImagingModeOptions } from "./satellite-payloads.ts";
 
 export const taskStatuses = ["candidate", "reviewed", "scheduled", "submitted", "cancellation_requested", "cancel_acknowledged", "cancel_rejected", "acquired", "completed", "failed", "cancelled"] as const;
 export type TaskStatus = (typeof taskStatuses)[number];
 export const operatorEditableTaskStatuses: TaskStatus[] = ["candidate", "reviewed"];
 
 export const aoiTypes = ["source", "point", "circle", "rectangle", "corridor", "polygon", "multi"] as const;
-export const sensorOptions = ["高分辨率光学", "宽幅光学", "多光谱", "高光谱", "SAR", "热红外", "微波辐射计", "激光雷达"] as const;
+// The current planning UI exposes only these two mission-level payload classes.
+// Legacy values remain accepted so persisted drafts can be migrated without data loss.
+export const sensorOptions = ["光学", "SAR", "高分辨率光学", "宽幅光学", "多光谱", "高光谱", "热红外", "微波辐射计", "激光雷达"] as const;
+const sarImagingModeIds = new Set<string>(sarImagingModeOptions.map((mode) => mode.id));
 
 const transitions: Record<TaskStatus, TaskStatus[]> = {
   candidate: ["reviewed", "cancelled"],
@@ -27,7 +31,7 @@ const allowedTaskFields = new Set([
   "taskId", "eventId", "masterEventId", "entityKey", "title", "hazard", "priority", "latitude", "longitude",
   "eventOccurredAt", "eventUpdatedAt", "eventIssuedAt", "eventValidFrom", "eventValidTo", "phenomenonStage", "aoiType", "aoiRadiusKm", "aoiWidthKm", "aoiHeightKm", "aoiLengthKm",
   "aoiBearingDeg", "sourceGeometry", "customGeometry", "cycloneForecast", "minimumCoveragePercent", "maximumCloudPercent",
-  "spatialResolutionMeters", "incidenceAngleMinDeg", "incidenceAngleMaxDeg", "revisitCount", "deliveryDeadline",
+  "spatialResolutionMeters", "incidenceAngleMinDeg", "incidenceAngleMaxDeg", "revisitCount", "deliveryDeadline", "sarImagingModes",
   "imagingStart", "imagingEnd", "sensors", "observationTargets", "observationPhase", "source", "sourceUrl",
   "locationQuality", "locationAccuracyKm", "evidenceCount", "aoiApproval", "approvedAt", "approvedBy",
   "approvalReason", "createdAt", "updatedAt", "status", "revision", "eventRevision", "aoiHash",
@@ -71,11 +75,27 @@ export function validateSatelliteTask(task: Record<string, unknown>, options: { 
   if (!Array.isArray(task.sensors) || task.sensors.length > sensorOptions.length) errors.push("载荷字段必须是受限数组");
   else if (task.sensors.some((sensor) => !sensorOptions.includes(sensor as (typeof sensorOptions)[number]))) errors.push("包含未知载荷");
   else if (task.sensors.length === 0 && (options.requirePayload || task.status !== "candidate")) errors.push("至少选择一种载荷");
+  if (task.sarImagingModes !== undefined) {
+    if (!Array.isArray(task.sarImagingModes) || task.sarImagingModes.length > sarImagingModeOptions.length || task.sarImagingModes.some((mode) => !sarImagingModeIds.has(String(mode))) || new Set(task.sarImagingModes).size !== task.sarImagingModes.length) {
+      errors.push("SAR 成像方式必须是无重复的受限数组");
+    } else if (Array.isArray(task.sensors) && task.sensors.includes("SAR") && task.sarImagingModes.length === 0) {
+      errors.push("选择 SAR 后至少需要一种成像方式");
+    } else if (Array.isArray(task.sensors) && !task.sensors.includes("SAR") && task.sarImagingModes.length > 0) {
+      errors.push("未选择 SAR 时不能保留 SAR 成像方式");
+    }
+  }
   if (!Array.isArray(task.observationTargets) || task.observationTargets.length === 0) errors.push("至少需要一个观测目标");
   else if (task.observationTargets.length > 30 || task.observationTargets.some((target) => typeof target !== "string" || target.length > 120)) errors.push("观测目标数量或长度超限");
   if (task.orbitDirectionPreference !== undefined && !["ascending", "descending", "either"].includes(String(task.orbitDirectionPreference))) errors.push("轨向偏好无效");
   if (task.simulationLevel !== undefined && !["orbit_only", "assumed_sensor", "sensor_model"].includes(String(task.simulationLevel))) errors.push("仿真层级无效");
   if (["orbit_only", "assumed_sensor"].includes(String(task.simulationLevel)) && !["candidate", "reviewed"].includes(String(task.status))) errors.push("轨道粗筛或假设传感器结果不得直接排程或下发");
+  if (task.simulationLevel === "assumed_sensor" && task.opportunityId !== undefined) {
+    const instrumentId = String(task.instrumentId ?? "");
+    const orbitVersion = String(task.orbitVersion ?? "");
+    if (!/^ty-(?:c|x)sar-v\d+$/.test(instrumentId) || !orbitVersion.endsWith(`:payload:${instrumentId}`)) {
+      errors.push("试算机会的载荷参数版本缺失或不匹配，请重新计算卫星任务机会");
+    }
+  }
   if (task.satelliteNoradId !== undefined) boundedNumber(task.satelliteNoradId, 1, 69_999, "NORAD 编号", errors, true);
   if (task.closestApproachAt !== undefined && !Number.isFinite(Date.parse(String(task.closestApproachAt)))) errors.push("最近轨道近接时间无效");
   if (task.closestSubpointLatitude !== undefined) boundedNumber(task.closestSubpointLatitude, -90, 90, "最近子星点纬度", errors);

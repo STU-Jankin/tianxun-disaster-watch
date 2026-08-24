@@ -1,9 +1,12 @@
 import { operationalHealth } from "../../../db/operational";
+import { authorizeApiRequest } from "../../../lib/api-security";
 import { getIngestionHealth } from "../../../lib/runtime-health";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+export async function GET(request: Request) {
+  const unauthorized = await authorizeApiRequest(request);
+  if (unauthorized) return unauthorized;
   try {
     const [database, ingestion] = await Promise.all([operationalHealth(), Promise.resolve(getIngestionHealth())]);
     const stale = !ingestion.lastSuccessAt || Date.now() - Date.parse(ingestion.lastSuccessAt) > 15 * 60_000;

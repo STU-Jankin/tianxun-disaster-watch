@@ -1,7 +1,7 @@
 # 天巡 VPS 后台与 Hermes 飞书通知
 
-此部署只在 VPS 本机运行灾害采集引擎和通知队列，不部署或开放网页。引擎监听
-`127.0.0.1:3000`，Hermes Webhook 监听 `127.0.0.1:8644`；公网只需保留 SSH。
+默认部署只在 VPS 本机运行灾害采集引擎和通知队列；如需 Web 控制台，再按本文“公网登录控制台”章节配置 Nginx、HTTPS 与登录账号。引擎始终监听
+`127.0.0.1:3000`，Hermes Webhook 监听 `127.0.0.1:8644`，不得直接把这两个端口暴露到公网。
 
 运行链路：
 
@@ -154,16 +154,26 @@ sudo bash /opt/tianxun/current/vps/scripts/restore.sh notifier /var/backups/tian
 - Hermes：使用 WebSocket + `deliver_only`，没有模型推理常驻开销；
 - 建议保留现有 1 GB swap，并至少留出 8 GB 可用磁盘。
 
-此版本没有把后台 API 暴露给本地网页。将来如需让本地前端访问 VPS，应另行增加 HTTPS、认证、只读 API 和防火墙规则，不能直接开放 3000 端口。
+启用 Web 控制台时只允许通过 HTTPS Nginx 网关访问；不得直接开放 3000 端口。后台采集与 Hermes 继续走回环地址和独立服务凭据。
 
 ## 安全换钥
 
 任何曾出现在聊天、截图、Shell 历史或工单里的 VPS 密码、FIRMS key、飞书密钥和 Webhook 密钥都应视为已经泄露并立即轮换。VPS 应改用 SSH key，禁用 root 密码登录；应用密钥只保存在 `/etc/tianxun/*.env`，不要写入仓库或 URL。轮换 `TIANXUN_API_TOKEN` 时必须同时更新 `engine.env` 与 `notifier.env` 后重启两个服务。
 
-## 公网只读试用入口
+## 公网登录控制台
 
-`vps/nginx/tianxun-public-readonly.conf` 可把页面、事件、地点解析、逐小时天气和健康检查通过 Nginx 暴露到 80 端口，同时让 Node 引擎与 Hermes 继续只监听回环地址。天气接口只代理经过坐标校验、频率限制和30分钟缓存的只读查询；免密钥 MET Norway 是默认底座，QWeather 仅作可选增强且凭据不会返回浏览器。当前试用配置允许浏览器把本机任务草稿提交给无状态卫星可见性接口试算：Nginx 按来源 IP 覆盖操作员身份并实施请求体限制和双层限流，后端重新绑定权威主事件、AOI、观测期与载荷约束，但不会保存、读取、导出或删除服务器任务。道路现场上报、变更流、路由和地形筛查继续关闭。该模式仅适合无真实下发能力的临时试用；正式生产仍必须配置域名、HTTPS 和用户级认证。
+历史文件名 `vps/nginx/tianxun-public-readonly.conf` 为兼容既有部署保留，但配置已经改为登录保护模式，不再向匿名访问者注入代理角色。除 `/api/health/live` 和登录接口外，所有浏览器 API 都由应用逐请求校验服务端会话；后台采集器和通知器仍可使用各自的 Bearer Token，不受网页登录影响。
 
-`/api/satellites` 只读公开 6 颗已配置卫星的业务名称、NORAD 编号、TLE、轨道历元与缓存状态。服务器每天通过免认证 CelesTrak GP `CATNR` 接口刷新一次；公开入口不允许触发刷新。51832、56846、61231、64048、69100 的业务名称来自项目配置，58918 的“东方慧眼”身份保持待核验；CelesTrak 返回名称始终单独保存，不用名称字符串覆盖业务映射。
+会话 Cookie 为 `HttpOnly + SameSite=Strict`，生产环境使用 `Secure` 和 `__Host-` 前缀。服务器只在 SQLite 保存随机会话令牌的 SHA-256 摘要；默认闲置 30 分钟失效、最长 8 小时，每个账号最多保留 5 个会话。退出会删除服务端会话并要求浏览器清除缓存和站点存储；修改用户名、角色或密码哈希后旧会话自动失效，恢复数据库备份时也会清空历史会话，防止撤销过的会话复活。
 
-站点配置依赖两个运行时 snippet：`/etc/nginx/snippets/tianxun-proxy-common.conf` 使用仓库模板；`/etc/nginx/snippets/tianxun-proxy-secret.conf` 必须在服务器上生成，权限设为 `0600`，内容为 `proxy_set_header X-Tianxun-Proxy-Secret <64位随机值>;`。同一个随机值写入 `/etc/tianxun/engine.env` 的 `TIANXUN_TRUSTED_PROXY_SECRET` 后重启引擎。不要把实际密钥提交到仓库。
+首次安装或需要轮换密码时执行：
+
+```bash
+sudo bash /opt/tianxun/current/vps/scripts/configure-login.sh
+```
+
+该脚本使用无回显输入，保存 `PBKDF2-HMAC-SHA256` 600,000 次迭代的加盐哈希，不保存明文密码。登录失败同时受到 Nginx（每 IP）和应用层频率限制。
+
+生产模式会拒绝通过明文 HTTP 建立会话。上线前必须准备域名，在 Nginx 上配置有效 TLS 证书，并把 80 端口永久重定向到 HTTPS；完成后确认上游仍设置 `Host` 和 `X-Forwarded-Proto $scheme`。不要通过修改代码或伪造 `X-Forwarded-Proto` 来绕过 HTTPS 要求。
+
+`/api/satellites`、灾情、任务、路线和道路核验数据都不再匿名公开。CelesTrak 轨道仍由服务器定时刷新；51832、56846、61231、64048、69100 的业务名称来自项目配置，58918 的“东方慧眼”身份保持待核验。

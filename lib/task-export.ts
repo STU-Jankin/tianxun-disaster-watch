@@ -44,6 +44,7 @@ export function buildTaskExportArtifact(tasks: Record<string, unknown>[], format
       imaging_start_utc: task.imagingStart,
       imaging_end_utc: task.imagingEnd,
       sensors: Array.isArray(task.sensors) ? task.sensors.join("|") : "",
+      sar_imaging_modes: Array.isArray(task.sarImagingModes) ? task.sarImagingModes.join("|") : "",
       orbit_direction_preference: task.orbitDirectionPreference,
       reference_acquisition_required: task.referenceAcquisitionRequired,
       sar_analysis_mode: task.sarAnalysisMode,

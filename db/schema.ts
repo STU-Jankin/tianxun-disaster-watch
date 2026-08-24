@@ -143,3 +143,16 @@ export const operationalChanges = sqliteTable("operational_changes", {
   payloadJson: text("payload_json").notNull(),
   createdAt: text("created_at").notNull(),
 }, (table) => [index("operational_changes_created_idx").on(table.createdAt, table.id)]);
+
+export const webSessions = sqliteTable("web_sessions", {
+  sessionHash: text("session_hash").primaryKey(),
+  username: text("username").notNull(),
+  role: text("role").notNull(),
+  authVersion: text("auth_version").notNull().default(""),
+  createdAt: text("created_at").notNull(),
+  lastSeenAt: text("last_seen_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+}, (table) => [
+  index("web_sessions_expiry_idx").on(table.expiresAt),
+  index("web_sessions_user_seen_idx").on(table.username, table.lastSeenAt),
+]);

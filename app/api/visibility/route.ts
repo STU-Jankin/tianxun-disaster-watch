@@ -6,11 +6,12 @@ import { aoiFingerprint, eventRevisionFingerprint, geometryEquals } from "../../
 import { buildSatelliteOrbitSnapshot } from "../../../lib/satellite-orbits";
 import { screenTleOpportunities } from "../../../lib/tle-opportunities";
 import { screenConfiguredSarOpportunities } from "../../../lib/configured-sar-opportunities";
+import type { SarImagingModeId } from "../../../lib/satellite-payloads";
 
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
-  const unauthorized = authorizeApiRequest(request, "operator") ?? rejectCrossOriginBrowserWrite(request);
+  const unauthorized = (await authorizeApiRequest(request, "operator")) ?? rejectCrossOriginBrowserWrite(request);
   if (unauthorized) return unauthorized;
   const limited = enforceRateLimit(request, "visibility", 20);
   if (limited) return limited;
@@ -19,9 +20,11 @@ export async function POST(request: Request) {
   catch (error) { return Response.json({ state: "error", windows: [], message: error instanceof Error ? error.message : "请求无效" }, { status: error instanceof ApiInputError ? error.status : 400 }); }
   const taskId = typeof requestTask.taskId === "string" ? requestTask.taskId.trim() : "";
   if (!taskId) return Response.json({ state: "error", windows: [], message: "缺少 taskId" }, { status: 400 });
-  const statelessPublicTrial = request.headers.get("x-tianxun-stateless-visibility") === "1" && apiActor(request).startsWith("public-");
+  const actor = await apiActor(request);
+  const role = await apiRole(request);
+  const statelessPublicTrial = request.headers.get("x-tianxun-stateless-visibility") === "1" && actor.startsWith("public-");
   let storedTask;
-  try { storedTask = await getSatelliteTask(taskId, apiRole(request) === "admin" ? undefined : apiActor(request)); }
+  try { storedTask = await getSatelliteTask(taskId, role === "admin" ? undefined : actor); }
   catch (error) {
     console.error("visibility task lookup unavailable", error);
     return Response.json({ state: "error", windows: [], message: "任务数据库暂不可用" }, { status: 503 });
@@ -77,7 +80,7 @@ export async function POST(request: Request) {
       sourceGeometry,
       eventRevision: eventRevisionFingerprint(canonical.event),
       approvedAt: new Date().toISOString(),
-      approvedBy: apiActor(request),
+      approvedBy: actor,
     };
     const statelessAoi = buildTaskAoi(task);
     if (!statelessAoi) return Response.json({ state: "error", windows: [], message: "服务端无法重建任务 AOI" }, { status: 400 });
@@ -105,11 +108,12 @@ export async function POST(request: Request) {
   const endpoint = process.env.SATELLITE_VISIBILITY_API_URL;
   if (!endpoint) {
     if (!Array.isArray(task.sensors) || !task.sensors.includes("SAR")) {
-      return Response.json({ state: "error", mode: "orbit_only", windows: [], message: "本地 TLE 粗筛仅对应当前登记的 SAR 星座，请先选择 SAR 载荷" }, { status: 400 });
+      return Response.json({ state: "error", mode: "orbit_only", windows: [], message: "当前内置任务模型仅配置了 SAR 星座；光学卫星轨道、相机视场和机动参数尚未登记，暂不能计算光学机会" }, { status: 400 });
     }
     try {
       const satellites = buildSatelliteOrbitSnapshot(await listSatelliteOrbitCache());
       const now = new Date();
+      const opticalPendingNote = task.sensors.includes("光学") ? "；光学载荷尚无星表与相机参数，本次结果仅包含 SAR 机会。" : "。";
       const imagingStart = new Date(Math.max(now.getTime(), Date.parse(String(task.imagingStart))));
       const configured = satellites.some((satellite) => satellite.orbitStatus === "current" && satellite.payloadProfile && satellite.identityStatus === "configured");
       if (configured) {
@@ -122,6 +126,7 @@ export async function POST(request: Request) {
           incidenceAngleMaxDeg: Number(task.incidenceAngleMaxDeg),
           spatialResolutionMeters: Number(task.spatialResolutionMeters),
           minimumCoveragePercent: Number(task.minimumCoveragePercent),
+          sarImagingModeIds: Array.isArray(task.sarImagingModes) ? task.sarImagingModes as SarImagingModeId[] : undefined,
           orbitDirectionPreference: ["ascending", "descending"].includes(String(task.orbitDirectionPreference)) ? task.orbitDirectionPreference as "ascending" | "descending" : "either",
           now,
         });
@@ -131,8 +136,8 @@ export async function POST(request: Request) {
           state: "ready",
           mode: "assumed_sensor",
           message: result.windows.length
-            ? `已用 ${result.satelliteCount} 颗配置卫星生成 ${result.windows.length} 个假设传感器机会；可用于试排程，禁止自动下发。`
-            : `已完成 ${result.satelliteCount} 颗配置卫星的假设传感器计算；当前时间窗没有同时满足入射角、分辨率和覆盖率的机会。`,
+            ? `已用 ${result.satelliteCount} 颗配置卫星生成 ${result.windows.length} 个假设传感器机会；可用于试排程，禁止自动下发${opticalPendingNote}`
+            : `已完成 ${result.satelliteCount} 颗配置卫星的假设传感器计算；当前时间窗没有同时满足入射角、分辨率和覆盖率的机会${opticalPendingNote}`,
         }, { headers: { "Cache-Control": "no-store" } });
       }
       const result = screenTleOpportunities({

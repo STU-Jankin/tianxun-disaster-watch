@@ -8,11 +8,11 @@ import { cycloneTaskAoiSlices } from "../../../lib/cyclone-forecast";
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
-  const unauthorized = authorizeApiRequest(request, "operator");
+  const unauthorized = await authorizeApiRequest(request, "operator");
   if (unauthorized) return unauthorized;
   try {
-    const actor = apiActor(request);
-    const owner = apiRole(request) === "admin" ? undefined : actor;
+    const actor = await apiActor(request);
+    const owner = await apiRole(request) === "admin" ? undefined : actor;
     const [tasks, cancelledTaskIds] = await Promise.all([listSatelliteTasks(owner), listSatelliteTaskCancellationIds(owner)]);
     return Response.json({ tasks, cancelledTaskIds, storage: "operational-database" }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
@@ -22,7 +22,7 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
-  const unauthorized = authorizeApiRequest(request, "operator") ?? rejectCrossOriginBrowserWrite(request);
+  const unauthorized = (await authorizeApiRequest(request, "operator")) ?? rejectCrossOriginBrowserWrite(request);
   if (unauthorized) return unauthorized;
   const limited = enforceRateLimit(request, "task-write", 60);
   if (limited) return limited;
@@ -95,8 +95,8 @@ export async function POST(request: Request) {
     const rebuiltAoi = buildTaskAoi(draft);
     if (!rebuiltAoi) return Response.json({ error: "服务端无法重建任务 AOI" }, { status: 400 });
     const nextAoiHash = aoiFingerprint(rebuiltAoi);
-    const actor = apiActor(request);
-    const isAdmin = apiRole(request) === "admin";
+    const actor = await apiActor(request);
+    const isAdmin = await apiRole(request) === "admin";
     const existing = typeof task.taskId === "string" ? await getSatelliteTask(task.taskId, isAdmin ? undefined : actor) as Record<string, unknown> | null : null;
     const approvalUnchanged = task.aoiApproval === "operator_confirmed" && existing?.aoiApproval === "operator_confirmed" && existing.aoiHash === nextAoiHash;
     const approvedAt = task.aoiApproval === "operator_confirmed"
@@ -119,7 +119,7 @@ export async function POST(request: Request) {
 }
 
 export async function DELETE(request: Request) {
-  const unauthorized = authorizeApiRequest(request, "operator") ?? rejectCrossOriginBrowserWrite(request);
+  const unauthorized = (await authorizeApiRequest(request, "operator")) ?? rejectCrossOriginBrowserWrite(request);
   if (unauthorized) return unauthorized;
   const limited = enforceRateLimit(request, "task-delete", 30);
   if (limited) return limited;
@@ -130,7 +130,8 @@ export async function DELETE(request: Request) {
   if (!taskId || taskId.length > 220) return Response.json({ error: "缺少或无效 taskId" }, { status: 400 });
   if (revision !== undefined && (!Number.isInteger(revision) || revision < 0)) return Response.json({ error: "revision 必须是非负整数" }, { status: 400 });
   try {
-    const result = await deleteSatelliteTask(taskId, revision, apiActor(request), "操作员取消任务", apiRole(request) === "admin");
+    const actor = await apiActor(request);
+    const result = await deleteSatelliteTask(taskId, revision, actor, "操作员取消任务", await apiRole(request) === "admin");
     return Response.json({ deleted: taskId, ...result });
   } catch (error) {
     if (error instanceof Error && /任务不属于当前操作员/.test(error.message)) return Response.json({ error: "任务不存在或不属于当前操作员" }, { status: 404 });

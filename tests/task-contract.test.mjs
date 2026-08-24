@@ -40,6 +40,23 @@ test("requires payload for visibility/export and accepts a complete task", async
   assert.equal(validateSatelliteTask(task).ok, false, "reviewed tasks always require a payload");
 });
 
+test("validates the operator-selected SAR imaging modes independently of optical payloads", async () => {
+  const { validateSatelliteTask } = await contract();
+  const task = validTask();
+  task.sarImagingModes = ["spotlight", "tops_1"];
+  assert.equal(validateSatelliteTask(task).ok, true);
+  task.sarImagingModes = ["spotlight", "spotlight"];
+  assert.equal(validateSatelliteTask(task).ok, false);
+  task.sarImagingModes = ["unknown"];
+  assert.equal(validateSatelliteTask(task).ok, false);
+  task.sarImagingModes = [];
+  assert.equal(validateSatelliteTask(task).ok, false);
+  task.sensors = ["光学"];
+  assert.equal(validateSatelliteTask(task).ok, true);
+  task.sarImagingModes = ["stripmap"];
+  assert.equal(validateSatelliteTask(task).ok, false);
+});
+
 test("accepts bounded custom Polygon and MultiPolygon AOIs", async () => {
   const { validateSatelliteTask } = await contract();
   const task = validTask();
@@ -163,6 +180,14 @@ test("allows assumed sensor trials for review but forbids scheduling them", asyn
   assert.equal(validateSatelliteTask(task).ok, false);
   assert.match(validateSatelliteTask(task).errors.join(" "), /不得直接排程或下发/);
   task.status = "candidate";
+  task.opportunityId = "ASSUMED-51832-20260820000000-STRIPMAP";
+  task.instrumentId = "ty-csar-v2";
+  task.orbitVersion = "celestrak:51832:2026-08-20T00:00:00.000Z:payload:ty-csar-v2";
+  assert.equal(validateSatelliteTask(task).ok, true);
+  task.orbitVersion = "celestrak:51832:2026-08-20T00:00:00.000Z";
+  assert.equal(validateSatelliteTask(task).ok, false);
+  assert.match(validateSatelliteTask(task).errors.join(" "), /载荷参数版本缺失或不匹配/);
+  task.orbitVersion = "celestrak:51832:2026-08-20T00:00:00.000Z:payload:ty-csar-v2";
   task.opportunityFootprint = { type: "Polygon", coordinates: [[[120, 30], [121, 31]]] };
   assert.equal(validateSatelliteTask(task).ok, false);
 });

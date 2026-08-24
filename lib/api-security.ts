@@ -1,3 +1,5 @@
+import { authenticateWebRequest, hasWebSessionCookie, webAuthConfiguration, webSessionRateKey } from "./web-auth.ts";
+
 function timingSafeEqualText(left: string, right: string) {
   if (left.length !== right.length) return false;
   let mismatch = 0;
@@ -7,12 +9,18 @@ function timingSafeEqualText(left: string, right: string) {
 
 export type ApiRole = "viewer" | "operator" | "executor" | "admin";
 
-export function authorizeApiRequest(request: Request, requiredRole: ApiRole = "viewer") {
+export async function authorizeApiRequest(request: Request, requiredRole: ApiRole = "viewer") {
   const expectedToken = process.env.TIANXUN_API_TOKEN?.trim();
   const operatorToken = process.env.TIANXUN_OPERATOR_TOKEN?.trim();
   const executorToken = process.env.TIANXUN_EXECUTOR_TOKEN?.trim();
   const proxySecret = process.env.TIANXUN_TRUSTED_PROXY_SECRET?.trim();
-  const role = apiRole(request);
+  let role: ApiRole | null;
+  try {
+    role = await apiRole(request);
+  } catch (error) {
+    console.error("web session lookup unavailable", error);
+    return Response.json({ error: "登录会话服务暂不可用" }, { status: 503 });
+  }
   if (role) {
     if (roleAllows(role, requiredRole)) return null;
     return Response.json({ error: `当前身份缺少 ${requiredRole} 权限` }, { status: 403 });
@@ -21,13 +29,13 @@ export function authorizeApiRequest(request: Request, requiredRole: ApiRole = "v
   const url = new URL(request.url);
   const local = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "::1";
   if (process.env.NODE_ENV !== "production" && !expectedToken && !operatorToken && !executorToken && local) return null;
-  if (![expectedToken, operatorToken, executorToken, proxySecret].some(isStrongSecret)) {
+  if (![expectedToken, operatorToken, executorToken, proxySecret].some(isStrongSecret) && !webAuthConfiguration().configured) {
     return Response.json({ error: "服务端鉴权尚未安全配置" }, { status: 503 });
   }
   return Response.json({ error: "未授权访问；请使用站点身份或配置的 API Bearer Token" }, { status: 401 });
 }
 
-export function apiRole(request: Request): ApiRole | null {
+export async function apiRole(request: Request): Promise<ApiRole | null> {
   const bearer = request.headers.get("authorization")?.startsWith("Bearer ") ? request.headers.get("authorization")!.slice(7).trim() : "";
   if (isStrongSecret(process.env.TIANXUN_API_TOKEN?.trim()) && bearer && timingSafeEqualText(bearer, process.env.TIANXUN_API_TOKEN!.trim())) return "admin";
   if (isStrongSecret(process.env.TIANXUN_OPERATOR_TOKEN?.trim()) && bearer && timingSafeEqualText(bearer, process.env.TIANXUN_OPERATOR_TOKEN!.trim())) return "operator";
@@ -35,6 +43,8 @@ export function apiRole(request: Request): ApiRole | null {
   const proxySecret = process.env.TIANXUN_TRUSTED_PROXY_SECRET?.trim();
   const suppliedProxySecret = request.headers.get("x-tianxun-proxy-secret") ?? "";
   if (isStrongSecret(proxySecret) && suppliedProxySecret && timingSafeEqualText(suppliedProxySecret, proxySecret)) return normalizeRole(request.headers.get("x-tianxun-role")) ?? "viewer";
+  const webSession = await authenticateWebRequest(request);
+  if (webSession) return webSession.role;
   const url = new URL(request.url);
   const local = ["localhost", "127.0.0.1", "::1"].includes(url.hostname);
   if (process.env.NODE_ENV !== "production" && local && ![process.env.TIANXUN_API_TOKEN, process.env.TIANXUN_OPERATOR_TOKEN, process.env.TIANXUN_EXECUTOR_TOKEN].some(isStrongSecret)) return "admin";
@@ -46,16 +56,24 @@ export function rejectCrossOriginBrowserWrite(request: Request) {
   // browser origin. Keep same-origin enforcement for proxied browser writes.
   if (request.headers.get("authorization")?.startsWith("Bearer ")) return null;
   const origin = request.headers.get("origin");
-  if (!origin) return null;
+  if (!origin) {
+    if (request.headers.get("sec-fetch-site") && request.headers.get("sec-fetch-site") !== "same-origin") {
+      return Response.json({ error: "拒绝跨站写入请求" }, { status: 403 });
+    }
+    return hasWebSessionCookie(request) ? Response.json({ error: "浏览器会话写入缺少同源证明" }, { status: 403 }) : null;
+  }
   try {
-    if (new URL(origin).origin === new URL(request.url).origin) return null;
+    const requestUrl = new URL(request.url);
+    const forwardedProtocol = request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim().toLowerCase();
+    if (forwardedProtocol === "https" || forwardedProtocol === "http") requestUrl.protocol = `${forwardedProtocol}:`;
+    if (new URL(origin).origin === requestUrl.origin) return null;
   } catch {
     // fall through
   }
   return Response.json({ error: "拒绝跨站写入请求" }, { status: 403 });
 }
 
-export function apiActor(request: Request) {
+export async function apiActor(request: Request) {
   const expectedProxySecret = process.env.TIANXUN_TRUSTED_PROXY_SECRET?.trim();
   const suppliedProxySecret = request.headers.get("x-tianxun-proxy-secret") ?? "";
   if (isStrongSecret(expectedProxySecret) && suppliedProxySecret && timingSafeEqualText(suppliedProxySecret, expectedProxySecret)) {
@@ -64,6 +82,8 @@ export function apiActor(request: Request) {
   const bearer = request.headers.get("authorization")?.startsWith("Bearer ") ? request.headers.get("authorization")!.slice(7).trim() : "";
   if (isStrongSecret(process.env.TIANXUN_OPERATOR_TOKEN?.trim()) && timingSafeEqualText(bearer, process.env.TIANXUN_OPERATOR_TOKEN!.trim())) return "operator-token";
   if (isStrongSecret(process.env.TIANXUN_EXECUTOR_TOKEN?.trim()) && timingSafeEqualText(bearer, process.env.TIANXUN_EXECUTOR_TOKEN!.trim())) return "executor-token";
+  const session = await authenticateWebRequest(request);
+  if (session) return sanitizeActor(session.username) || "web-operator";
   return bearer ? "admin-token" : "local-developer";
 }
 
@@ -128,7 +148,7 @@ export function enforceRateLimit(request: Request, action: string, limit: number
   const store = rateState.__tianxunRateLimits ??= new Map();
   const now = Date.now();
   if (store.size > 2_000) for (const [key, value] of store) if (value.resetAt <= now) store.delete(key);
-  const actor = apiActor(request);
+  const actor = rateLimitActor(request);
   const key = `${actor}:${action}`;
   const current = store.get(key);
   if (!current || current.resetAt <= now) {
@@ -138,4 +158,15 @@ export function enforceRateLimit(request: Request, action: string, limit: number
   current.count += 1;
   if (current.count <= limit) return null;
   return Response.json({ error: "请求过于频繁，请稍后重试" }, { status: 429, headers: { "Retry-After": String(Math.max(1, Math.ceil((current.resetAt - now) / 1000))) } });
+}
+
+function rateLimitActor(request: Request) {
+  const proxySecret = process.env.TIANXUN_TRUSTED_PROXY_SECRET?.trim();
+  const suppliedProxySecret = request.headers.get("x-tianxun-proxy-secret") ?? "";
+  if (isStrongSecret(proxySecret) && suppliedProxySecret && timingSafeEqualText(suppliedProxySecret, proxySecret)) {
+    return sanitizeActor(request.headers.get("x-real-ip") ?? request.headers.get("x-forwarded-for")?.split(",")[0] ?? request.headers.get("x-tianxun-user")) || "trusted-proxy";
+  }
+  const bearer = request.headers.get("authorization")?.startsWith("Bearer ") ? request.headers.get("authorization")!.slice(7).trim() : "";
+  if (bearer) return `bearer-${bearer.slice(0, 12)}`;
+  return webSessionRateKey(request);
 }

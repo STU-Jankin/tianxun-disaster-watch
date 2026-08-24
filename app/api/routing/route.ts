@@ -21,7 +21,7 @@ const routingState = globalThis as typeof globalThis & { __tianxunAmapRoutingCac
 const strategies = [32, 33, 35] as const;
 
 export async function POST(request: Request) {
-  const unauthorized = authorizeApiRequest(request);
+  const unauthorized = await authorizeApiRequest(request);
   if (unauthorized) return unauthorized;
   const crossOrigin = rejectCrossOriginBrowserWrite(request);
   if (crossOrigin) return crossOrigin;

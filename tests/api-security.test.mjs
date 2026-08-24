@@ -8,6 +8,8 @@ test("enforces API roles and ignores forged proxy identity headers", async () =>
     TIANXUN_OPERATOR_TOKEN: process.env.TIANXUN_OPERATOR_TOKEN,
     TIANXUN_EXECUTOR_TOKEN: process.env.TIANXUN_EXECUTOR_TOKEN,
     TIANXUN_TRUSTED_PROXY_SECRET: process.env.TIANXUN_TRUSTED_PROXY_SECRET,
+    TIANXUN_LOGIN_USERNAME: process.env.TIANXUN_LOGIN_USERNAME,
+    TIANXUN_LOGIN_PASSWORD_HASH: process.env.TIANXUN_LOGIN_PASSWORD_HASH,
   };
   const admin = "a".repeat(64);
   const operator = "b".repeat(64);
@@ -19,23 +21,25 @@ test("enforces API roles and ignores forged proxy identity headers", async () =>
     TIANXUN_OPERATOR_TOKEN: operator,
     TIANXUN_EXECUTOR_TOKEN: executor,
     TIANXUN_TRUSTED_PROXY_SECRET: proxy,
+    TIANXUN_LOGIN_USERNAME: "",
+    TIANXUN_LOGIN_PASSWORD_HASH: "",
   });
   try {
     const { apiActor, apiRole, authorizeApiRequest } = await import(new URL("../lib/api-security.ts", import.meta.url));
     const request = (headers = {}) => new Request("https://example.test/api/tasks", { headers });
-    assert.equal(apiRole(request({ authorization: `Bearer ${operator}` })), "operator");
-    assert.equal(authorizeApiRequest(request({ authorization: `Bearer ${operator}` }), "operator"), null);
-    assert.equal(authorizeApiRequest(request({ authorization: `Bearer ${executor}` }), "operator")?.status, 403);
-    assert.equal(authorizeApiRequest(request({ authorization: `Bearer ${admin}` }), "admin"), null);
+    assert.equal(await apiRole(request({ authorization: `Bearer ${operator}` })), "operator");
+    assert.equal(await authorizeApiRequest(request({ authorization: `Bearer ${operator}` }), "operator"), null);
+    assert.equal((await authorizeApiRequest(request({ authorization: `Bearer ${executor}` }), "operator"))?.status, 403);
+    assert.equal(await authorizeApiRequest(request({ authorization: `Bearer ${admin}` }), "admin"), null);
 
     const forged = request({ "x-tianxun-user": "victim", "x-tianxun-role": "admin" });
-    assert.equal(apiRole(forged), null);
-    assert.equal(apiActor(forged), "local-developer");
+    assert.equal(await apiRole(forged), null);
+    assert.equal(await apiActor(forged), "local-developer");
 
     const viewer = request({ "x-tianxun-proxy-secret": proxy, "x-tianxun-user": "viewer@example.test", "x-tianxun-role": "viewer" });
-    assert.equal(apiRole(viewer), "viewer");
-    assert.equal(apiActor(viewer), "viewer@example.test");
-    assert.equal(authorizeApiRequest(viewer, "operator")?.status, 403);
+    assert.equal(await apiRole(viewer), "viewer");
+    assert.equal(await apiActor(viewer), "viewer@example.test");
+    assert.equal((await authorizeApiRequest(viewer, "operator"))?.status, 403);
   } finally {
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key];
@@ -73,5 +77,40 @@ test("trusted proxy authentication does not bypass browser same-origin checks", 
   } finally {
     if (previousProxySecret === undefined) delete process.env.TIANXUN_TRUSTED_PROXY_SECRET;
     else process.env.TIANXUN_TRUSTED_PROXY_SECRET = previousProxySecret;
+  }
+});
+
+test("treats configured web login as authentication and requires origin proof for cookie writes", async () => {
+  const previous = {
+    NODE_ENV: process.env.NODE_ENV,
+    TIANXUN_API_TOKEN: process.env.TIANXUN_API_TOKEN,
+    TIANXUN_OPERATOR_TOKEN: process.env.TIANXUN_OPERATOR_TOKEN,
+    TIANXUN_EXECUTOR_TOKEN: process.env.TIANXUN_EXECUTOR_TOKEN,
+    TIANXUN_TRUSTED_PROXY_SECRET: process.env.TIANXUN_TRUSTED_PROXY_SECRET,
+    TIANXUN_LOGIN_USERNAME: process.env.TIANXUN_LOGIN_USERNAME,
+    TIANXUN_LOGIN_PASSWORD_HASH: process.env.TIANXUN_LOGIN_PASSWORD_HASH,
+    TIANXUN_LOGIN_ROLE: process.env.TIANXUN_LOGIN_ROLE,
+  };
+  Object.assign(process.env, {
+    NODE_ENV: "production",
+    TIANXUN_API_TOKEN: "",
+    TIANXUN_OPERATOR_TOKEN: "",
+    TIANXUN_EXECUTOR_TOKEN: "",
+    TIANXUN_TRUSTED_PROXY_SECRET: "",
+    TIANXUN_LOGIN_USERNAME: "admin",
+    TIANXUN_LOGIN_PASSWORD_HASH: `pbkdf2-sha256$600000$${"a".repeat(32)}$${"b".repeat(64)}`,
+    TIANXUN_LOGIN_ROLE: "admin",
+  });
+  try {
+    const { authorizeApiRequest, rejectCrossOriginBrowserWrite } = await import(new URL(`../lib/api-security.ts?web=${Date.now()}`, import.meta.url));
+    const anonymous = new Request("https://watch.example/api/events");
+    assert.equal((await authorizeApiRequest(anonymous))?.status, 401);
+    const cookieWriteWithoutOrigin = new Request("https://watch.example/api/tasks", { method: "POST", headers: { cookie: `__Host-tianxun_session=${"a".repeat(43)}` } });
+    assert.equal(rejectCrossOriginBrowserWrite(cookieWriteWithoutOrigin)?.status, 403);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 });

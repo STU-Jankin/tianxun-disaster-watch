@@ -56,22 +56,32 @@ test("marks old elements stale while retaining their last valid TLE", () => {
   assert.equal(snapshot.find((item) => item.noradId === 58918)?.identityStatus, "unverified");
 });
 
-test("binds TY-50 to a provisional XSAR profile without changing its X-band geometry", () => {
+test("binds TY-50 to the user-provided XSAR profile and keeps CSAR parameters independent", () => {
   const ty50 = trackedSarSatellites.find((item) => item.noradId === 69100);
   assert.equal(ty50?.commonName, "TY-50");
   assert.equal(ty50?.commonCode, "电建一号");
-  assert.equal(ty50?.payloadProfileId, "ty-xsar-provisional-v1");
-  const xsar = sarPayloadProfiles["ty-xsar-provisional-v1"];
-  const csar = sarPayloadProfiles["ty-csar-v1"];
+  assert.equal(ty50?.payloadProfileId, "ty-xsar-v1");
+  const xsar = sarPayloadProfiles["ty-xsar-v1"];
+  const csar = sarPayloadProfiles["ty-csar-v2"];
   assert.equal(xsar.payloadType, "XSAR");
   assert.equal(xsar.frequencyBand, "X");
   assert.deepEqual(xsar.lookSides, ["left", "right"]);
   assert.deepEqual(xsar.incidenceAngleDeg, { min: 17, max: 50 });
-  assert.equal(xsar.parameterStatus, "provisional_assumption");
+  assert.equal(xsar.parameterStatus, "user_provided");
+  assert.deepEqual(xsar.polarizations, ["VV"]);
+  assert.deepEqual(xsar.productLevels, []);
   assert.deepEqual(
     xsar.imagingModes.map(({ id, resolutionM, nominalSceneCrossTrackKm, nominalSceneAlongTrackKm }) => ({ id, resolutionM, nominalSceneCrossTrackKm, nominalSceneAlongTrackKm })),
-    csar.imagingModes.map(({ id, resolutionM, nominalSceneCrossTrackKm, nominalSceneAlongTrackKm }) => ({ id, resolutionM, nominalSceneCrossTrackKm, nominalSceneAlongTrackKm })),
+    [
+      { id: "spotlight", resolutionM: 0.5, nominalSceneCrossTrackKm: 5, nominalSceneAlongTrackKm: 5 },
+      { id: "stripmap", resolutionM: 3, nominalSceneCrossTrackKm: 30, nominalSceneAlongTrackKm: 30 },
+      { id: "tops_1", resolutionM: 15, nominalSceneCrossTrackKm: 100, nominalSceneAlongTrackKm: 100 },
+      { id: "tops_2", resolutionM: 30, nominalSceneCrossTrackKm: 240, nominalSceneAlongTrackKm: 240 },
+    ],
   );
+  assert.equal(csar.imagingModes[0].resolutionLabel, "1×0.5 m");
+  assert.deepEqual(csar.imagingModes[0].resolutionDimensionsM, [1, 0.5]);
+  assert.deepEqual(csar.productLevels.map(({ level, code }) => ({ level, code })), [{ level: "L1", code: "SLC" }, { level: "L2", code: "ORG" }]);
   const snapshot = buildSatelliteOrbitSnapshot([], new Date("2026-08-19T00:00:00Z"));
-  assert.equal(snapshot.find((item) => item.noradId === 69100)?.payloadProfile?.id, "ty-xsar-provisional-v1");
+  assert.equal(snapshot.find((item) => item.noradId === 69100)?.payloadProfile?.id, "ty-xsar-v1");
 });

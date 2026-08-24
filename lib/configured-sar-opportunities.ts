@@ -32,6 +32,9 @@ export type AssumedSarOpportunity = {
   offNadirAngleDeg: number;
   coveragePercent: number;
   spatialResolutionM: number;
+  spatialResolutionLabel: string;
+  polarizations: string[];
+  productLevels: Array<{ level: string; code: string; name: string }>;
   nominalSceneCrossTrackKm: number;
   nominalSceneAlongTrackKm: number;
   footprintGeometry: GeoGeometry;
@@ -61,6 +64,7 @@ export function screenConfiguredSarOpportunities(input: {
   incidenceAngleMaxDeg: number;
   spatialResolutionMeters: number;
   minimumCoveragePercent: number;
+  sarImagingModeIds?: readonly SarImagingMode["id"][];
   orbitDirectionPreference?: "ascending" | "descending" | "either";
   now?: Date;
 }): AssumedSarResult {
@@ -88,19 +92,20 @@ export function screenConfiguredSarOpportunities(input: {
     const satellite = satellites.find((item) => item.noradId === candidate.satelliteNoradId);
     const profile = satellite?.payloadProfile;
     if (!satellite || !profile || !satellite.tleLine1 || !satellite.tleLine2) continue;
+    const requestedModes = new Set(input.sarImagingModeIds ?? []);
+    const enabledModes = requestedModes.size ? profile.imagingModes.filter((mode) => requestedModes.has(mode.id)) : profile.imagingModes;
     const geometry = sarLookGeometry(candidate.altitudeKm, candidate.minimumGroundTrackDistanceKm);
     const minimumIncidence = Math.max(profile.incidenceAngleDeg.min, input.incidenceAngleMinDeg);
     const maximumIncidence = Math.min(profile.incidenceAngleDeg.max, input.incidenceAngleMaxDeg);
     if (minimumIncidence > maximumIncidence || geometry.incidenceAngleDeg < minimumIncidence || geometry.incidenceAngleDeg > maximumIncidence) {
-      rejectedByIncidence += profile.imagingModes.length;
+      rejectedByIncidence += enabledModes.length;
       continue;
     }
     const track = trackGeometry(satellite.tleLine1, satellite.tleLine2, candidate.closestApproachAt, candidate.closestSubpoint, aoi.center);
     const extents = aoiExtents(coordinates, aoi.center, track.bearingDeg);
     const groundSpeedKmS = track.groundSpeedKmS > 0.1 ? track.groundSpeedKmS : 7.5;
     const maximumReachKm = groundReachForIncidence(candidate.altitudeKm, profile.incidenceAngleDeg.max);
-
-    for (const mode of profile.imagingModes) {
+    for (const mode of enabledModes) {
       if (mode.resolutionM > input.spatialResolutionMeters) { rejectedByResolution += 1; continue; }
       const coveragePercent = estimatedCoveragePercent(extents, mode);
       if (coveragePercent < input.minimumCoveragePercent) { rejectedByCoverage += 1; continue; }
@@ -123,7 +128,7 @@ export function screenConfiguredSarOpportunities(input: {
         simulationLevel: "assumed_sensor",
         confidence: "assumed_parameters",
         parameterStatus: profile.parameterStatus,
-        orbitVersion: candidate.orbitVersion,
+        orbitVersion: `${candidate.orbitVersion}:payload:${profile.id}`,
         computedAt,
         start: new Date(startMs).toISOString(),
         end: new Date(endMs).toISOString(),
@@ -137,6 +142,9 @@ export function screenConfiguredSarOpportunities(input: {
         offNadirAngleDeg: round(geometry.offNadirAngleDeg, 2),
         coveragePercent: round(coveragePercent, 1),
         spatialResolutionM: mode.resolutionM,
+        spatialResolutionLabel: mode.resolutionLabel,
+        polarizations: [...profile.polarizations],
+        productLevels: profile.productLevels.map((product) => ({ ...product })),
         nominalSceneCrossTrackKm: mode.nominalSceneCrossTrackKm,
         nominalSceneAlongTrackKm: mode.nominalSceneAlongTrackKm,
         footprintGeometry,
@@ -144,7 +152,7 @@ export function screenConfiguredSarOpportunities(input: {
         aoiRadiusKm: candidate.aoiRadiusKm,
         candidateThresholdKm: round(maximumReachKm + candidate.aoiRadiusKm, 1),
         constraintNotes: [
-          profile.parameterStatus === "provisional_assumption" ? profile.parameterNote : "使用当前登记的用户提供载荷参数。",
+          profile.parameterNote,
           "覆盖率按以AOI为中心、与轨向对齐的标称矩形场景包络估算，尚不是波束方向图仿真。",
           "已按球形地球换算地面入射角与卫星离轴角；尚未验证姿态角速度、角加速度、稳定时间、功耗、存储和热控。",
           "该结果属于假设传感器模型，只能用于试排程，不得自动下发。",

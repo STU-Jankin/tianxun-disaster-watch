@@ -8,7 +8,7 @@ import { validateSatelliteTask } from "../../../../lib/task-contract";
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
-  const unauthorized = authorizeApiRequest(request, "operator") ?? rejectCrossOriginBrowserWrite(request);
+  const unauthorized = (await authorizeApiRequest(request, "operator")) ?? rejectCrossOriginBrowserWrite(request);
   if (unauthorized) return unauthorized;
   const limited = enforceRateLimit(request, "task-export", 10);
   if (limited) return limited;
@@ -28,8 +28,8 @@ export async function POST(request: Request) {
       return taskId && taskId.length <= 220 && Number.isInteger(revision) && revision > 0 ? [{ taskId, revision, eventRevision, aoiHash }] : [];
     });
     if (requested.length !== expected.length || new Set(requested.map((item) => item.taskId)).size !== requested.length) return Response.json({ error: "导出任务引用无效或重复" }, { status: 400 });
-    const actor = apiActor(request);
-    const snapshot = await getTaskExportSnapshot(requested.map((item) => item.taskId), apiRole(request) === "admin" ? undefined : actor);
+    const actor = await apiActor(request);
+    const snapshot = await getTaskExportSnapshot(requested.map((item) => item.taskId), await apiRole(request) === "admin" ? undefined : actor);
     const rows = new Map(snapshot.map((row) => [row.taskId, row]));
     const verified: Record<string, unknown>[] = [];
     for (const reference of requested) {

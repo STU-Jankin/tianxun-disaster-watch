@@ -27,6 +27,15 @@ type TaskRecord = Record<string, unknown> & {
 
 type LifecycleTaskRow = { task_id: string; owner: string; status: string; revision: number; payload_json: string };
 
+export type WebSessionRecord = {
+  username: string;
+  role: "viewer" | "operator" | "admin";
+  authVersion: string;
+  createdAt: string;
+  lastSeenAt: string;
+  expiresAt: string;
+};
+
 let schemaReady: Promise<void> | null = null;
 let databaseReady: Promise<DatabaseLike> | null = null;
 
@@ -161,6 +170,9 @@ export function ensureOperationalSchema() {
     `CREATE INDEX IF NOT EXISTS road_disruptions_owner_idx ON road_disruptions (owner, updated_at)`,
     `CREATE TABLE IF NOT EXISTS road_disruption_history (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, disruption_id TEXT NOT NULL, revision INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, payload_json TEXT NOT NULL, changed_at TEXT NOT NULL)`,
     `CREATE UNIQUE INDEX IF NOT EXISTS road_disruption_history_revision_uidx ON road_disruption_history (disruption_id, revision)`,
+    `CREATE TABLE IF NOT EXISTS web_sessions (session_hash TEXT PRIMARY KEY NOT NULL, username TEXT NOT NULL, role TEXT NOT NULL, auth_version TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, expires_at TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS web_sessions_expiry_idx ON web_sessions (expires_at)`,
+    `CREATE INDEX IF NOT EXISTS web_sessions_user_seen_idx ON web_sessions (username, last_seen_at)`,
   ];
   schemaReady = database().then(async (db) => {
     await db.batch(statements.map((statement) => db.prepare(statement)));
@@ -174,6 +186,8 @@ export function ensureOperationalSchema() {
     if (migrations.length) await db.batch(migrations);
     const intentColumns = await db.prepare(`PRAGMA table_info(task_cancellation_intents)`).all<{ name: string }>();
     if (!intentColumns.results.some((column) => column.name === "owner")) await db.prepare(`ALTER TABLE task_cancellation_intents ADD COLUMN owner TEXT NOT NULL DEFAULT 'legacy'`).run();
+    const sessionColumns = await db.prepare(`PRAGMA table_info(web_sessions)`).all<{ name: string }>();
+    if (!sessionColumns.results.some((column) => column.name === "auth_version")) await db.prepare(`ALTER TABLE web_sessions ADD COLUMN auth_version TEXT NOT NULL DEFAULT ''`).run();
     await db.batch([
       db.prepare(`CREATE INDEX IF NOT EXISTS satellite_tasks_owner_status_idx ON satellite_tasks (owner, status)`),
       db.prepare(`CREATE INDEX IF NOT EXISTS task_cancellation_intents_owner_time_idx ON task_cancellation_intents (owner, cancelled_at)`),
@@ -782,6 +796,49 @@ export async function operationalHealth() {
   const db = await database();
   const row = await db.prepare(`SELECT (SELECT COUNT(*) FROM canonical_events) AS events, (SELECT COUNT(*) FROM satellite_tasks WHERE status != 'cancelled') AS tasks, (SELECT COUNT(*) FROM satellite_orbits WHERE last_success_at IS NOT NULL) AS orbits, (SELECT COUNT(*) FROM road_disruptions WHERE lifecycle_status='active') AS disruptions`).first<{ events: number; tasks: number; orbits: number; disruptions: number }>();
   return { database: "ok" as const, events: Number(row?.events ?? 0), tasks: Number(row?.tasks ?? 0), orbits: Number(row?.orbits ?? 0), disruptions: Number(row?.disruptions ?? 0) };
+}
+
+export async function createWebSessionRecord(record: WebSessionRecord & { sessionHash: string }, maximumSessions = 5) {
+  await ensureOperationalSchema();
+  const db = await database();
+  const now = new Date().toISOString();
+  await db.batch([
+    db.prepare(`DELETE FROM web_sessions WHERE expires_at <= ?`).bind(now),
+    db.prepare(`INSERT INTO web_sessions (session_hash, username, role, auth_version, created_at, last_seen_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .bind(record.sessionHash, record.username, record.role, record.authVersion, record.createdAt, record.lastSeenAt, record.expiresAt),
+  ]);
+  await db.prepare(`DELETE FROM web_sessions WHERE username = ? AND session_hash NOT IN (SELECT session_hash FROM web_sessions WHERE username = ? ORDER BY last_seen_at DESC LIMIT ?)`)
+    .bind(record.username, record.username, maximumSessions).run();
+}
+
+export async function getWebSessionRecord(sessionHash: string, idleCutoff: string): Promise<WebSessionRecord | null> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const now = new Date().toISOString();
+  const row = await db.prepare(`SELECT username, role, auth_version, created_at, last_seen_at, expires_at FROM web_sessions WHERE session_hash = ? AND expires_at > ? AND last_seen_at > ?`)
+    .bind(sessionHash, now, idleCutoff)
+    .first<{ username: string; role: string; auth_version: string; created_at: string; last_seen_at: string; expires_at: string }>();
+  if (!row || !["viewer", "operator", "admin"].includes(row.role)) {
+    await db.prepare(`DELETE FROM web_sessions WHERE session_hash = ?`).bind(sessionHash).run();
+    return null;
+  }
+  if (Date.now() - Date.parse(row.last_seen_at) > 60_000) {
+    await db.prepare(`UPDATE web_sessions SET last_seen_at = ? WHERE session_hash = ?`).bind(now, sessionHash).run();
+  }
+  return {
+    username: row.username,
+    role: row.role as WebSessionRecord["role"],
+    authVersion: row.auth_version,
+    createdAt: row.created_at,
+    lastSeenAt: row.last_seen_at,
+    expiresAt: row.expires_at,
+  };
+}
+
+export async function revokeWebSessionRecord(sessionHash: string) {
+  await ensureOperationalSchema();
+  const db = await database();
+  await db.prepare(`DELETE FROM web_sessions WHERE session_hash = ?`).bind(sessionHash).run();
 }
 
 export async function listSatelliteOrbitCache(): Promise<SatelliteOrbitCacheRecord[]> {

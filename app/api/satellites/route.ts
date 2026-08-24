@@ -5,7 +5,7 @@ import { buildSatelliteOrbitSnapshot, fetchTrackedSatelliteTles, trackedSarSatel
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
-  const unauthorized = authorizeApiRequest(request);
+  const unauthorized = await authorizeApiRequest(request);
   if (unauthorized) return unauthorized;
   try {
     return Response.json(satellitePayload(await listSatelliteOrbitCache()), { headers: { "Cache-Control": "no-store" } });
@@ -16,7 +16,7 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
-  const unauthorized = authorizeApiRequest(request, "admin") ?? rejectCrossOriginBrowserWrite(request);
+  const unauthorized = (await authorizeApiRequest(request, "admin")) ?? rejectCrossOriginBrowserWrite(request);
   if (unauthorized) return unauthorized;
   const limited = enforceRateLimit(request, "satellite-orbit-refresh", 2, 60 * 60_000);
   if (limited) return limited;

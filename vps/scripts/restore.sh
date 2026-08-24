@@ -26,6 +26,11 @@ rollback="${target}.pre-restore-$(date -u +%Y%m%dT%H%M%SZ)"
 if [[ -f "$target" ]]; then cp --preserve=mode,ownership,timestamps -- "$target" "$rollback"; fi
 rm -f -- "$target-wal" "$target-shm"
 sqlite3 "$target" ".restore '$backup'"
+if [[ "$database" == "operational" ]]; then
+  # A restored snapshot must never resurrect sessions that were revoked after
+  # the backup was taken. Operators sign in again after disaster recovery.
+  sqlite3 "$target" "DELETE FROM web_sessions;" 2>/dev/null || true
+fi
 chown "$owner" "$target"
 chmod 0600 "$target"
 [[ "$(sqlite3 "$target" 'PRAGMA quick_check;')" == "ok" ]] || { echo "Restored database is invalid; services remain stopped. Rollback: $rollback" >&2; exit 1; }

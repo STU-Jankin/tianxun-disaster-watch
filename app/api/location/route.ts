@@ -15,7 +15,7 @@ const CACHE_TTL = 30 * 24 * 60 * 60 * 1000;
 const CACHE_LIMIT = 500;
 
 export async function GET(request: Request) {
-  const unauthorized = authorizeApiRequest(request);
+  const unauthorized = await authorizeApiRequest(request);
   if (unauthorized) return unauthorized;
   const limited = enforceRateLimit(request, "location", 30);
   if (limited) return limited;

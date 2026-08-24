@@ -4,7 +4,7 @@ import { authorizeApiRequest } from "../../../lib/api-security";
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
-  const unauthorized = authorizeApiRequest(request);
+  const unauthorized = await authorizeApiRequest(request);
   if (unauthorized) return unauthorized;
   const url = new URL(request.url);
   const afterValue = url.searchParams.get("after") ?? "1970-01-01T00:00:00.000Z";

@@ -5,12 +5,12 @@ import { normalizeRoadDisruptionGeoJson } from "../../../lib/response-disruption
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
-  const unauthorized = authorizeApiRequest(request, "operator");
+  const unauthorized = await authorizeApiRequest(request, "operator");
   if (unauthorized) return unauthorized;
   try {
     const url = new URL(request.url);
     const activeAtValue = url.searchParams.get("activeAt")?.trim() ?? "";
-    const includeInactive = url.searchParams.get("includeInactive") === "1" && apiRole(request) === "admin";
+    const includeInactive = url.searchParams.get("includeInactive") === "1" && await apiRole(request) === "admin";
     const activeAt = activeAtValue ? validIso(activeAtValue, "activeAt") : includeInactive ? undefined : new Date().toISOString();
     return Response.json({
       disruptions: await listRoadDisruptions({ activeAt, includeInactive }),
@@ -25,7 +25,7 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
-  const unauthorized = authorizeApiRequest(request, "operator") ?? rejectCrossOriginBrowserWrite(request);
+  const unauthorized = (await authorizeApiRequest(request, "operator")) ?? rejectCrossOriginBrowserWrite(request);
   if (unauthorized) return unauthorized;
   const limited = enforceRateLimit(request, "road-disruption-report", 20);
   if (limited) return limited;
@@ -43,8 +43,8 @@ export async function POST(request: Request) {
       validityBasis: item.validTo ? "reported" as const : "default_24h" as const,
       source: item.source || "操作员 GeoJSON 上报",
     }));
-    const actor = apiActor(request);
-    const disruptions = await upsertRoadDisruptionReports(reports, actor, apiRole(request) === "admin");
+    const actor = await apiActor(request);
+    const disruptions = await upsertRoadDisruptionReports(reports, actor, await apiRole(request) === "admin");
     return Response.json({ disruptions, storage: "operational-database", warning: "所有新上报均为待核验状态；未提供有效结束时间时自动按 24 小时失效" }, { status: 201 });
   } catch (error) {
     if (error instanceof ApiInputError) return Response.json({ error: error.message }, { status: error.status });
@@ -55,7 +55,7 @@ export async function POST(request: Request) {
 }
 
 export async function PATCH(request: Request) {
-  const unauthorized = authorizeApiRequest(request, "admin") ?? rejectCrossOriginBrowserWrite(request);
+  const unauthorized = (await authorizeApiRequest(request, "admin")) ?? rejectCrossOriginBrowserWrite(request);
   if (unauthorized) return unauthorized;
   const limited = enforceRateLimit(request, "road-disruption-review", 40);
   if (limited) return limited;
@@ -67,7 +67,8 @@ export async function PATCH(request: Request) {
     if (!/^road-[0-9a-f-]{36}$/i.test(disruptionId)) throw new ApiInputError("道路中断 ID 无效", 400);
     if (!Number.isInteger(revision) || revision < 1) throw new ApiInputError("revision 必须是正整数", 400);
     if (!["verify", "resolve", "reject"].includes(action)) throw new ApiInputError("不支持的核验动作", 400);
-    const disruption = await transitionRoadDisruption(disruptionId, revision, action as "verify" | "resolve" | "reject", apiActor(request), apiRole(request) === "admin");
+    const actor = await apiActor(request);
+    const disruption = await transitionRoadDisruption(disruptionId, revision, action as "verify" | "resolve" | "reject", actor, await apiRole(request) === "admin");
     return Response.json({ disruption, storage: "operational-database" });
   } catch (error) {
     if (error instanceof ApiInputError) return Response.json({ error: error.message }, { status: error.status });

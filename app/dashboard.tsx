@@ -30,6 +30,7 @@ import { amapTravelModeLabels, type AmapRoadRoutingResponse, type AmapTravelMode
 import { isRoadDisruptionList, normalizeRoadDisruptionGeoJson, roadDisruptionFeatureCollection, roadDisruptionKindLabel, type RoadDisruption, type RoadDisruptionRegistryEntry } from "../lib/response-disruptions";
 import { infrastructureKindLabel, isInfrastructureAssessment, type InfrastructureAssessment } from "../lib/osm-infrastructure";
 import { deriveLandslideWorkflow, landslideSarTemplates, type LandslideSarTemplate, type LandslideTerrainResult, type LandslideTerrainScreening } from "../lib/landslide-planning";
+import { sarImagingModeOptions, sarPayloadProfiles, type SarImagingModeId } from "../lib/satellite-payloads";
 
 type ApiResponse = {
   events: DisasterEvent[];
@@ -110,6 +111,7 @@ type SatelliteTask = {
   imagingStart: string;
   imagingEnd: string;
   sensors: string[];
+  sarImagingModes: SarImagingModeId[];
   observationTargets: string[];
   observationPhase: DisasterEvent["observationPhase"];
   source: string;
@@ -172,6 +174,9 @@ type VisibilityWindow = {
   offNadirAngleDeg?: number;
   lookSide?: "left" | "right";
   spatialResolutionM?: number;
+  spatialResolutionLabel?: string;
+  polarizations?: string[];
+  productLevels?: Array<{ level: string; code: string; name: string }>;
   nominalSceneCrossTrackKm?: number;
   nominalSceneAlongTrackKm?: number;
   parameterStatus?: "user_provided" | "provisional_assumption";
@@ -210,7 +215,9 @@ type SatelliteOrbitView = {
     frequencyBand: "C" | "X";
     lookSides: Array<"left" | "right">;
     incidenceAngleDeg: { min: number; max: number };
-    imagingModes: Array<{ id: string; name: string; resolutionM: number; nominalSceneCrossTrackKm: number; nominalSceneAlongTrackKm: number }>;
+    polarizations: string[];
+    productLevels: Array<{ level: string; code: string; name: string }>;
+    imagingModes: Array<{ id: string; name: string; resolutionM: number; resolutionLabel: string; resolutionDimensionsM?: [number, number]; nominalSceneCrossTrackKm: number; nominalSceneAlongTrackKm: number }>;
     parameterStatus: "user_provided" | "provisional_assumption";
     parameterNote: string;
   };
@@ -240,7 +247,16 @@ type WeatherLoadState = {
 
 const taskStorageKey = "tianxun-satellite-task-candidates-v1";
 const responseStorageKey = "tianxun-response-scenarios-v1";
-const payloadOptions = ["高分辨率光学", "宽幅光学", "多光谱", "高光谱", "SAR", "热红外", "微波辐射计", "激光雷达"];
+const payloadOptions = ["光学", "SAR"];
+const legacyOpticalPayloads = new Set(["光学", "高分辨率光学", "宽幅光学", "高分光学", "多光谱", "高光谱"]);
+const sarModeChoices = sarImagingModeOptions.map((option) => {
+  const csar = sarPayloadProfiles["ty-csar-v2"].imagingModes.find((mode) => mode.id === option.id)!;
+  const xsar = sarPayloadProfiles["ty-xsar-v1"].imagingModes.find((mode) => mode.id === option.id)!;
+  return {
+    ...option,
+    summary: `CSAR ${csar.resolutionLabel} / ${csar.nominalSceneCrossTrackKm}×${csar.nominalSceneAlongTrackKm} km · XSAR ${xsar.resolutionLabel} / ${xsar.nominalSceneCrossTrackKm}×${xsar.nominalSceneAlongTrackKm} km`,
+  };
+});
 const aoiOptions: Array<{ id: AoiType; label: string }> = [
   { id: "source", label: "来源几何" },
   { id: "point", label: "点目标" },
@@ -263,7 +279,7 @@ const defaultAoiRadiusKm: Record<HazardType, number> = {
   ice: 100,
 };
 
-export function Dashboard() {
+export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { currentUser?: { username: string; role: "viewer" | "operator" | "admin" }; onLogout?: () => void; logoutBusy?: boolean }) {
   const [data, setData] = useState<ApiResponse | null>(null);
   const [scope, setScope] = useState<ScopeId>("global");
   const [hazard, setHazard] = useState<HazardType | "all">("all");
@@ -528,7 +544,7 @@ export function Dashboard() {
   const updateTask = useCallback((taskId: string, patch: Partial<SatelliteTask>) => {
     const aoiKeys = ["aoiType", "aoiRadiusKm", "aoiWidthKm", "aoiHeightKm", "aoiLengthKm", "aoiBearingDeg", "customGeometry"];
     const touchesAoi = Object.keys(patch).some((key) => aoiKeys.includes(key));
-    const opportunityInputKeys = [...aoiKeys, "imagingStart", "imagingEnd", "sensors", "minimumCoveragePercent", "spatialResolutionMeters", "incidenceAngleMinDeg", "incidenceAngleMaxDeg", "orbitDirectionPreference"];
+    const opportunityInputKeys = [...aoiKeys, "imagingStart", "imagingEnd", "sensors", "sarImagingModes", "minimumCoveragePercent", "spatialResolutionMeters", "incidenceAngleMinDeg", "incidenceAngleMaxDeg", "orbitDirectionPreference"];
     const invalidatesOpportunity = Object.keys(patch).some((key) => opportunityInputKeys.includes(key));
     const opportunityReset: Partial<SatelliteTask> = invalidatesOpportunity ? {
       satelliteId: undefined, instrumentId: undefined, imagingMode: undefined, opportunityId: undefined,
@@ -762,6 +778,7 @@ export function Dashboard() {
             任务候选 <b>{tasks.length}</b>
           </button>
           <div className="time-box"><strong>{chinaTime(clock)}</strong><small>UTC+08:00</small></div>
+          {currentUser && onLogout ? <div className="session-control"><span><strong>{currentUser.username}</strong><small>{roleLabel(currentUser.role)}</small></span><button onClick={onLogout} disabled={logoutBusy}>{logoutBusy ? "退出中…" : "安全退出"}</button></div> : null}
         </div>
       </header>
 
@@ -829,6 +846,10 @@ export function Dashboard() {
       </section>
     </main>
   );
+}
+
+function roleLabel(role: "viewer" | "operator" | "admin") {
+  return role === "admin" ? "系统管理员" : role === "operator" ? "任务操作员" : "只读观察员";
 }
 
 function SourceStatusPanel({ sources, forceClosed }: { sources: SourceStatus[]; forceClosed: boolean }) {
@@ -1981,6 +2002,7 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
     imagingStart: task.imagingStart,
     imagingEnd: task.imagingEnd,
     sensors: task.sensors,
+    sarImagingModes: task.sarImagingModes,
     minimumCoveragePercent: task.minimumCoveragePercent,
     spatialResolutionMeters: task.spatialResolutionMeters,
     incidenceAngleMinDeg: task.incidenceAngleMinDeg,
@@ -2066,8 +2088,9 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
           <div><b>{satellite.interfaceName || satellite.commonName}</b><span>NORAD {satellite.noradId}</span></div>
           <strong>{satellite.commonCode || satellite.interfaceCode || satellite.commonName}</strong>
           <small>{satellite.identityStatus === "unverified" ? "业务身份待核验" : "业务映射已配置"} · CelesTrak：{satellite.providerName || "尚无返回名称"}</small>
-          {satellite.payloadProfile ? <small>{satellite.payloadProfile.payloadType} · {satellite.payloadProfile.frequencyBand}频段 · 左右侧视 · 入射角 {satellite.payloadProfile.incidenceAngleDeg.min}°～{satellite.payloadProfile.incidenceAngleDeg.max}° · {satellite.payloadProfile.parameterStatus === "provisional_assumption" ? "临时假设参数" : "用户提供参数"}</small> : null}
-          {satellite.payloadProfile ? <small>{satellite.payloadProfile.imagingModes.map((mode) => `${mode.name} ${mode.resolutionM}m/${mode.nominalSceneCrossTrackKm}×${mode.nominalSceneAlongTrackKm}km`).join(" · ")}</small> : null}
+          {satellite.payloadProfile ? <small>{satellite.payloadProfile.payloadType} · {satellite.payloadProfile.frequencyBand}频段 · 左右侧视 · 入射角 {satellite.payloadProfile.incidenceAngleDeg.min}°～{satellite.payloadProfile.incidenceAngleDeg.max}° · 极化 {satellite.payloadProfile.polarizations.join("/") || "待提供"} · {satellite.payloadProfile.parameterStatus === "provisional_assumption" ? "临时假设参数" : "用户提供参数"}</small> : null}
+          {satellite.payloadProfile ? <small>{satellite.payloadProfile.imagingModes.map((mode) => `${mode.name} ${mode.resolutionLabel}/${mode.nominalSceneCrossTrackKm}×${mode.nominalSceneAlongTrackKm} km`).join(" · ")}</small> : null}
+          {satellite.payloadProfile?.productLevels.length ? <small>产品：{satellite.payloadProfile.productLevels.map((product) => `${product.level} ${product.name}（${product.code}）`).join(" · ")}</small> : satellite.payloadProfile ? <small>产品级别：尚未提供</small> : null}
           <time>{satellite.epoch ? `轨道历元 ${formatTimeWithYear(satellite.epoch)} UTC+08 · ${satellite.elementAgeHours ?? "--"}小时` : satellite.lastError || "尚未取得有效TLE"}</time>
         </article>)}
         <footer>每天自动刷新一次；失败保留上次有效TLE。业务名称与CelesTrak目录名称分开保存。 <a href="https://celestrak.org/NORAD/documentation/gp-data-formats.php" target="_blank" rel="noreferrer">接口说明 ↗</a></footer>
@@ -2111,6 +2134,21 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
           <span>{task.customGeometry ? `${task.customGeometry.type} · ${customAoiPartCount(task.customGeometry)} 块` : "尚未绘制或导入边界"}</span>
           {aoiImportError[task.taskId] ? <small role="alert">{aoiImportError[task.taskId]}</small> : null}
         </div> : null}
+        <div className="payload-planning">
+          <fieldset className="payload-options"><legend>载荷类型（可多选）</legend>{payloadOptions.map((payload) => {
+            const checked = task.sensors.includes(payload);
+            const inputId = `${task.taskId}-payload-${payload}`;
+            return <label key={payload} htmlFor={inputId}><input id={inputId} type="checkbox" checked={checked} onChange={() => onUpdate(task.taskId, {
+              sensors: toggleValue(task.sensors, payload),
+              ...(payload === "SAR" ? { sarImagingModes: checked ? [] : sarModeChoices.map((mode) => mode.id) } : {}),
+            })} /><span>{payload}<small>{payload === "光学" ? "云量约束参与窗口筛选；真实卫星与相机参数待配置" : "使用当前登记的 CSAR / XSAR 星座参数试算"}</small></span></label>;
+          })}</fieldset>
+          {task.sensors.includes("SAR") ? <fieldset className="sar-mode-options"><legend>SAR 成像方式（可多选）</legend>{sarModeChoices.map((mode) => {
+            const checked = task.sarImagingModes.includes(mode.id);
+            const inputId = `${task.taskId}-sar-mode-${mode.id}`;
+            return <label key={mode.id} htmlFor={inputId}><input id={inputId} type="checkbox" checked={checked} disabled={checked && task.sarImagingModes.length === 1} onChange={() => onUpdate(task.taskId, { sarImagingModes: toggleValue(task.sarImagingModes, mode.id) as SarImagingModeId[] })} /><span>{mode.label}<small>{mode.summary}</small></span></label>;
+          })}<p>至少保留一种模式；修改模式会清除已选机会并重新计算覆盖结果。</p></fieldset> : null}
+        </div>
         <div className="task-fields">
           {task.aoiType === "point" ? <label>点目标缓冲（公里，可为0）<input type="number" min="0" max="100" value={task.aoiRadiusKm} onChange={(event) => onUpdate(task.taskId, { aoiRadiusKm: clampNumber(event.target.value, 0, 100) })} /></label> : null}
           {task.aoiType === "circle" ? <label>圆形面半径（公里）<input type="number" min="1" max="1000" value={task.aoiRadiusKm} onChange={(event) => onUpdate(task.taskId, { aoiRadiusKm: clampNumber(event.target.value, 1, 1000) })} /></label> : null}
@@ -2120,15 +2158,13 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
           <label>最晚成像（Asia/Shanghai UTC+08）<input type="datetime-local" min={toLocalInput(task.imagingStart)} value={toLocalInput(task.imagingEnd)} onChange={(event) => onUpdate(task.taskId, { imagingEnd: fromLocalInput(event.target.value) })} /></label>
           <label>规划状态<select value={task.status} disabled={!['candidate', 'reviewed'].includes(task.status)} onChange={(event) => onUpdate(task.taskId, { status: event.target.value as SatelliteTask["status"] })}>{allowedOperatorTaskStatuses(task.status).map((status) => <option key={status} value={status}>{taskStatusLabel(status)}</option>)}</select><small>排程、下发、成像和完成状态只能由仿真或执行回执产生</small></label>
           <label>最低覆盖率（%）<input type="number" min="1" max="100" value={task.minimumCoveragePercent} onChange={(event) => onUpdate(task.taskId, { minimumCoveragePercent: clampNumber(event.target.value, 1, 100) })} /></label>
-          <label>最大云量（%）<input type="number" min="0" max="100" value={task.maximumCloudPercent} onChange={(event) => onUpdate(task.taskId, { maximumCloudPercent: clampNumber(event.target.value, 0, 100) })} /></label>
+          {task.sensors.includes("光学") ? <label>最大云量（%）<input type="number" min="0" max="100" value={task.maximumCloudPercent} onChange={(event) => onUpdate(task.taskId, { maximumCloudPercent: clampNumber(event.target.value, 0, 100) })} /></label> : null}
           <label>目标分辨率（米）<input type="number" min="0.1" max="10000" step="0.1" value={task.spatialResolutionMeters} onChange={(event) => onUpdate(task.taskId, { spatialResolutionMeters: clampNumber(event.target.value, 0.1, 10000) })} /></label>
-          <label>最小入射角（度）<input type="number" min="0" max="80" value={task.incidenceAngleMinDeg} onChange={(event) => onUpdate(task.taskId, { incidenceAngleMinDeg: clampNumber(event.target.value, 0, 80) })} /></label>
-          <label>最大入射角（度）<input type="number" min="0" max="80" value={task.incidenceAngleMaxDeg} onChange={(event) => onUpdate(task.taskId, { incidenceAngleMaxDeg: clampNumber(event.target.value, 0, 80) })} /></label>
+          {task.sensors.includes("SAR") ? <><label>最小入射角（度）<input type="number" min="0" max="80" value={task.incidenceAngleMinDeg} onChange={(event) => onUpdate(task.taskId, { incidenceAngleMinDeg: clampNumber(event.target.value, 0, 80) })} /></label><label>最大入射角（度）<input type="number" min="0" max="80" value={task.incidenceAngleMaxDeg} onChange={(event) => onUpdate(task.taskId, { incidenceAngleMaxDeg: clampNumber(event.target.value, 0, 80) })} /></label></> : null}
           <label>重访次数<input type="number" min="1" max="50" value={task.revisitCount} onChange={(event) => onUpdate(task.taskId, { revisitCount: clampNumber(event.target.value, 1, 50) })} /></label>
           <label>最迟交付（Asia/Shanghai UTC+08）<input type="datetime-local" min={toLocalInput(task.imagingEnd)} value={toLocalInput(task.deliveryDeadline)} onChange={(event) => onUpdate(task.taskId, { deliveryDeadline: fromLocalInput(event.target.value) })} /></label>
           {task.hazard === "landslide" ? <><label>SAR 轨向偏好<select value={task.orbitDirectionPreference ?? "either"} onChange={(event) => onUpdate(task.taskId, { orbitDirectionPreference: event.target.value as SatelliteTask["orbitDirectionPreference"] })}><option value="ascending">升轨</option><option value="descending">降轨</option><option value="either">任一轨向</option></select></label><label>SAR 分析模式<select value={task.sarAnalysisMode ?? "amplitude_change_and_insar_pair"} onChange={(event) => onUpdate(task.taskId, { sarAnalysisMode: event.target.value as SatelliteTask["sarAnalysisMode"] })}><option value="amplitude_change_and_insar_pair">幅度变化 + InSAR 对比</option><option value="amplitude_change">幅度变化</option><option value="insar_pair">InSAR 配对</option></select></label><label className="task-checkbox-field"><input type="checkbox" checked={Boolean(task.referenceAcquisitionRequired)} onChange={(event) => onUpdate(task.taskId, { referenceAcquisitionRequired: event.target.checked })} />要求灾前参考影像</label></> : null}
         </div>
-        <fieldset className="payload-options"><legend>载荷选项（可多选）</legend>{payloadOptions.map((payload) => <label key={payload}><input type="checkbox" checked={task.sensors.includes(payload)} onChange={() => onUpdate(task.taskId, { sensors: toggleValue(task.sensors, payload) })} />{payload}</label>)}</fieldset>
         <div className="task-targets">观测目标：{task.observationTargets.join(" · ")}</div>
         {(() => { const validation = validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requirePayload: true, requireProvenance: true }); return validation.ok ? null : <div className="task-validation" role="alert">{validation.errors.join("；")}</div>; })()}
         <div className={`visibility-box ${visibility[task.taskId]?.state ?? "idle"}`}>
@@ -2140,14 +2176,15 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
             <span>{formatTimeWithYear(window.start)} — {formatTimeWithYear(window.end)} UTC+08</span>
             {window.closestApproachAt ? <small>最近近接 {formatTimeWithYear(window.closestApproachAt)} UTC+08 · 地面轨迹距 AOI 中心 {window.minimumGroundTrackDistanceKm ?? "--"} km · 高度 {window.altitudeKm ?? "--"} km</small> : null}
             <small>{window.coveragePercent == null ? (window.simulationLevel === "orbit_only" ? "真实覆盖率未计算" : "覆盖率待仿真服务返回") : `覆盖 ${window.coveragePercent}%`}{window.incidenceAngleDeg == null ? (window.simulationLevel === "orbit_only" ? " · 地面入射角未计算" : " · 入射角待验证") : ` · 地面入射角 ${window.incidenceAngleDeg}°`}{window.offNadirAngleDeg == null ? "" : ` · 离轴 ${window.offNadirAngleDeg}°`}{window.lookSide ? ` · ${window.lookSide === "left" ? "左视" : "右视"}` : ""}{window.orbitDirection ? ` · ${window.orbitDirection === "ascending" ? "升轨" : "降轨"}` : ""}</small>
-            {window.spatialResolutionM != null ? <small>标称分辨率 {window.spatialResolutionM} m · 标称场景 {window.nominalSceneCrossTrackKm}×{window.nominalSceneAlongTrackKm} km · {window.parameterStatus === "provisional_assumption" ? "临时假设参数" : "当前登记参数"}</small> : null}
+            {window.spatialResolutionM != null ? <small>标称分辨率 {window.spatialResolutionLabel ?? `${window.spatialResolutionM} m`} · 标称场景 {window.nominalSceneCrossTrackKm}×{window.nominalSceneAlongTrackKm} km · 极化 {window.polarizations?.join("/") || "待提供"} · {window.parameterStatus === "provisional_assumption" ? "临时假设参数" : "用户提供参数"}</small> : null}
+            {window.productLevels?.length ? <small>可选产品：{window.productLevels.map((product) => `${product.level} ${product.code}`).join(" / ")}</small> : null}
             {window.constraintNotes?.map((note) => <small className="constraint-note" key={note}>{note}</small>)}
             <button className="choose-opportunity" onClick={() => onUpdate(task.taskId, { satelliteId: window.satelliteId, instrumentId: window.instrumentId, imagingMode: window.imagingMode, opportunityId: window.opportunityId, orbitVersion: window.orbitVersion, visibilityComputedAt: window.computedAt, incidenceAngleDeg: window.incidenceAngleDeg, offNadirAngleDeg: window.offNadirAngleDeg, opportunityLookSide: window.lookSide, opportunityCoveragePercent: window.coveragePercent, opportunitySpatialResolutionM: window.spatialResolutionM, opportunitySceneCrossTrackKm: window.nominalSceneCrossTrackKm, opportunitySceneAlongTrackKm: window.nominalSceneAlongTrackKm, sensorParameterStatus: window.parameterStatus, opportunityFootprint: window.footprintGeometry, simulationLevel: window.simulationLevel ?? "sensor_model", satelliteNoradId: window.satelliteNoradId, closestApproachAt: window.closestApproachAt, closestSubpointLatitude: window.closestSubpoint?.latitude, closestSubpointLongitude: window.closestSubpoint?.longitude, minimumGroundTrackDistanceKm: window.minimumGroundTrackDistanceKm, orbitSearchRadiusKm: window.searchRadiusKm, opportunityOrbitDirection: window.orbitDirection })}>{task.opportunityId === window.opportunityId ? "已选择" : window.simulationLevel === "orbit_only" ? "选择为轨道粗筛候选" : window.simulationLevel === "assumed_sensor" ? "选择为试算候选" : "选择此仿真机会"}</button>
           </div>)}
         </div>
       </article>)}
     </div>
-    <footer>导出字段包括灾害发生时间、任务时间窗、WGS 84坐标、多类型AOI、台风官方路径/风圈、载荷、目标、优先级与权威来源。</footer>
+    <footer>导出字段包括灾害发生时间、任务时间窗、WGS 84坐标、多类型AOI、台风官方路径/风圈、载荷与 SAR 成像方式、目标、优先级与权威来源。</footer>
   </aside>;
 }
 
@@ -2272,6 +2309,7 @@ function createSatelliteTask(event: DisasterEvent, operatorConfirmed: boolean): 
     imagingEnd: new Date(preferredEnd).toISOString(),
     deliveryDeadline: new Date(Math.max(requestedStart + 7_200_000, preferredEnd + 24 * 3_600_000)).toISOString(),
     sensors: [],
+    sarImagingModes: [],
     observationTargets: event.observationTargets,
     observationPhase: event.observationPhase,
     source: event.source,
@@ -2313,6 +2351,7 @@ function createLandslideSarTask(event: DisasterEvent, terrain: LandslideTerrainS
     aoiType: "multi",
     customGeometry: terrain.geometry,
     sensors: [...template.sensors],
+    sarImagingModes: sarModeChoices.map((mode) => mode.id),
     observationTargets: [...template.observationTargets],
     minimumCoveragePercent: 90,
     maximumCloudPercent: 100,
@@ -2348,6 +2387,8 @@ function migrateSatelliteTask(task: Partial<SatelliteTask>): SatelliteTask {
   const hazard = task.hazard ?? "earthquake";
   const radius = task.aoiRadiusKm ?? defaultAoiRadiusKm[hazard];
   const now = new Date().toISOString();
+  const sensors = normalizeTaskSensors(task.sensors);
+  const sarImagingModes = sensors.includes("SAR") ? normalizeSarImagingModes(task.sarImagingModes) : [];
   return {
     taskId: task.taskId ?? `TASK-MIGRATED-${Date.now()}`,
     eventId: task.eventId ?? "unknown-event",
@@ -2386,7 +2427,8 @@ function migrateSatelliteTask(task: Partial<SatelliteTask>): SatelliteTask {
     imagingStart: task.imagingStart ?? now,
     imagingEnd: task.imagingEnd ?? new Date(Date.now() + 24 * 3_600_000).toISOString(),
     deliveryDeadline: task.deliveryDeadline ?? new Date(Date.now() + 48 * 3_600_000).toISOString(),
-    sensors: (task.sensors ?? []).filter((sensor) => payloadOptions.includes(sensor)),
+    sensors,
+    sarImagingModes,
     observationTargets: task.observationTargets ?? [],
     observationPhase: task.observationPhase ?? "golden",
     source: task.source ?? "未知来源",
@@ -2466,6 +2508,7 @@ function rebaseUnsyncedDraft(task: SatelliteTask, event: DisasterEvent): Satelli
     incidenceAngleMaxDeg: task.incidenceAngleMaxDeg,
     revisitCount: task.revisitCount,
     sensors: task.sensors,
+    sarImagingModes: task.sarImagingModes,
     imagingStart: preservedStart,
     imagingEnd,
     deliveryDeadline,
@@ -2565,6 +2608,20 @@ function unwrapLongitudeNear(longitude: number, reference: number) {
 
 function toggleValue(values: string[], value: string) {
   return values.includes(value) ? values.filter((item) => item !== value) : [...values, value];
+}
+
+function normalizeTaskSensors(values: string[] | undefined) {
+  const source = Array.isArray(values) ? values.filter((value): value is string => typeof value === "string") : [];
+  const normalized: string[] = [];
+  if (source.some((value) => legacyOpticalPayloads.has(value))) normalized.push("光学");
+  if (source.includes("SAR")) normalized.push("SAR");
+  return normalized;
+}
+
+function normalizeSarImagingModes(values: SarImagingModeId[] | undefined): SarImagingModeId[] {
+  const allowed = new Set<SarImagingModeId>(sarImagingModeOptions.map((mode) => mode.id));
+  const normalized = Array.isArray(values) ? [...new Set(values.filter((value) => allowed.has(value)))] : [];
+  return normalized.length ? normalized : sarImagingModeOptions.map((mode) => mode.id);
 }
 
 function asMultiPolygon(geometry: CustomAoiGeometry): CustomAoiGeometry {

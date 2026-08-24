@@ -11,6 +11,9 @@ const nextConfig: NextConfig = {
         { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=(), payment=(), usb=()" },
         { key: "X-Frame-Options", value: "DENY" },
       ],
+    }, {
+      source: "/",
+      headers: [{ key: "Cache-Control", value: "no-store" }],
     }];
   },
 };

@@ -64,8 +64,8 @@ test("creates mode-level assumed sensor opportunities from a current TLE and CSA
     commonName: "TY-39",
     commonCode: "巢湖一号",
     identityStatus: "configured",
-    payloadProfileId: "ty-csar-v1",
-    payloadProfile: sarPayloadProfiles["ty-csar-v1"],
+    payloadProfileId: "ty-csar-v2",
+    payloadProfile: sarPayloadProfiles["ty-csar-v2"],
     tleLine1: lines.line1,
     tleLine2: lines.line2,
     epoch: centerAt.toISOString(),
@@ -83,16 +83,20 @@ test("creates mode-level assumed sensor opportunities from a current TLE and CSA
     incidenceAngleMaxDeg: 45,
     spatialResolutionMeters: 20,
     minimumCoveragePercent: 80,
+    sarImagingModeIds: ["spotlight", "tops_1"],
     now: centerAt,
   });
   assert.equal(result.simulationLevel, "assumed_sensor");
-  assert.equal(result.windows.length, 4);
-  assert.deepEqual(new Set(result.windows.map((window) => window.imagingMode)), new Set(["聚束模式", "条带模式", "TOPSAR", "扫描模式ES"]));
+  assert.equal(result.windows.length, 2);
+  assert.deepEqual(new Set(result.windows.map((window) => window.imagingMode)), new Set(["聚束模式", "TOPS 1"]));
   for (const window of result.windows) {
     assert.equal(window.parameterStatus, "user_provided");
+    assert.match(window.orbitVersion, /:payload:ty-csar-v2$/);
     assert.equal(window.lookSide, "right");
     assert.ok(window.incidenceAngleDeg >= 15 && window.incidenceAngleDeg <= 45);
     assert.equal(window.coveragePercent, 100);
+    assert.deepEqual(window.polarizations, ["VV"]);
+    assert.deepEqual(window.productLevels.map(({ level, code }) => ({ level, code })), [{ level: "L1", code: "SLC" }, { level: "L2", code: "ORG" }]);
     assert.equal(window.footprintGeometry.type, "Polygon");
     assert.match(window.constraintNotes.join(" "), /不得自动下发/);
   }

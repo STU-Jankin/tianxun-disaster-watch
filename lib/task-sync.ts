@@ -1,7 +1,7 @@
 const taskDraftFields = [
   "taskId", "eventId", "masterEventId", "entityKey", "hazard", "aoiType", "aoiRadiusKm", "aoiWidthKm", "aoiHeightKm", "aoiLengthKm", "aoiBearingDeg",
   "customGeometry", "minimumCoveragePercent", "maximumCloudPercent", "spatialResolutionMeters", "incidenceAngleMinDeg",
-  "incidenceAngleMaxDeg", "revisitCount", "deliveryDeadline", "imagingStart", "imagingEnd", "sensors", "observationTargets",
+  "incidenceAngleMaxDeg", "revisitCount", "deliveryDeadline", "imagingStart", "imagingEnd", "sensors", "sarImagingModes", "observationTargets",
   "aoiApproval", "approvalReason", "createdAt", "updatedAt", "status", "revision", "eventRevision",
   "satelliteId", "instrumentId", "imagingMode", "opportunityId", "orbitVersion", "visibilityComputedAt", "incidenceAngleDeg", "offNadirAngleDeg",
   "opportunityLookSide", "opportunityCoveragePercent", "opportunitySpatialResolutionM", "opportunitySceneCrossTrackKm", "opportunitySceneAlongTrackKm", "sensorParameterStatus", "opportunityFootprint",

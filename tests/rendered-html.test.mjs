@@ -1,16 +1,47 @@
 import assert from "node:assert/strict";
+import { pbkdf2Sync } from "node:crypto";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
-async function render(path = "/") {
+const loginPassword = "Tianxun-Render-Test-2026";
+const loginSalt = "12".repeat(16);
+process.env.TIANXUN_SQLITE_PATH = join(await mkdtemp(join(tmpdir(), "tianxun-render-")), "operational.sqlite");
+process.env.TIANXUN_LOGIN_USERNAME = "render-admin";
+process.env.TIANXUN_LOGIN_PASSWORD_HASH = `pbkdf2-sha256$600000$${loginSalt}$${pbkdf2Sync(loginPassword, Buffer.from(loginSalt, "hex"), 600_000, 32, "sha256").toString("hex")}`;
+process.env.TIANXUN_LOGIN_ROLE = "admin";
+
+async function render(path = "/", authenticated = true) {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
   const { default: worker } = await import(workerUrl.href);
+  const context = { waitUntil() {}, passThroughOnException() {} };
+  let cookie = "";
+  if (authenticated) {
+    const login = await worker.fetch(
+      new Request("https://localhost/api/auth/login", { method: "POST", headers: { accept: "application/json", "content-type": "application/json", origin: "https://localhost" }, body: JSON.stringify({ username: "render-admin", password: loginPassword }) }),
+      { ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) } },
+      context,
+    );
+    assert.equal(login.status, 200);
+    cookie = (login.headers.get("set-cookie") ?? "").split(";")[0];
+  }
   return worker.fetch(
-    new Request(`http://localhost${path}`, { headers: { accept: "text/html" } }),
+    new Request(`https://localhost${path}`, { headers: { accept: "text/html", ...(cookie ? { cookie } : {}) } }),
     { ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) } },
-    { waitUntil() {}, passThroughOnException() {} },
+    context,
   );
 }
+
+test("requires a server-side login before rendering the operations dashboard", async () => {
+  const response = await render("/", false);
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /登录灾情预报系统/);
+  assert.match(html, /SECURE OPERATIONS CONSOLE/);
+  assert.doesNotMatch(html, /个可观测事件/);
+});
 
 test("server-renders the disaster watch dashboard", async () => {
   const response = await render();
@@ -40,7 +71,9 @@ test("includes satellite task planning and export controls", async () => {
 test("includes typed AOI, payload options, and expanded source connectors", async () => {
   const dashboard = await import("node:fs/promises").then(({ readFile }) => readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8"));
   const route = await import("node:fs/promises").then(({ readFile }) => readFile(new URL("../app/api/events/route.ts", import.meta.url), "utf8"));
-  for (const text of ["点目标", "圆形面", "矩形面", "线状走廊", "发生时间", "载荷选项（可多选）"]) assert.ok(dashboard.includes(text));
+  for (const text of ["点目标", "圆形面", "矩形面", "线状走廊", "发生时间", "载荷类型（可多选）", "SAR 成像方式（可多选）"]) assert.ok(dashboard.includes(text));
+  assert.match(dashboard, /const payloadOptions = \["光学", "SAR"\]/);
+  assert.match(dashboard, /sarImagingModes/);
   for (const source of ["NASA FIRMS", "WMO SWIC/CAP", "Copernicus GloFAS", "USGS HANS", "Smithsonian GVP", "NASA LHASA", "OCHA ReliefWeb"]) assert.ok(route.includes(source));
   assert.match(route, /needs_config/);
 });
@@ -155,7 +188,8 @@ test("adds a daily cached CelesTrak orbit catalog without exposing refresh write
   assert.match(dashboard, /SAR仿真轨道/);
   assert.match(dashboard, /显示卫星轨道/);
   assert.match(dashboard, /TLE\/SGP4 外推/);
-  assert.match(nginx, /location = \/api\/satellites[\s\S]*limit_except GET \{ deny all; \}/);
+  assert.match(nginx, /application validates the HttpOnly session cookie/);
+  assert.match(nginx, /location \/api\/[\s\S]*proxy_pass http:\/\/127\.0\.0\.1:3000/);
   assert.match(timer, /OnCalendar=\*-\*-\* 02:35:00 UTC/);
   assert.match(timer, /Persistent=true/);
 });
@@ -259,20 +293,35 @@ test("adds a bounded phase-three response simulation, disruption review and infr
   assert.match(operational, /road_disruption_history/);
 });
 
-test("keeps the public Nginx trial bounded and leaves internal services unexposed", async () => {
+test("keeps the authenticated Nginx gateway bounded without synthetic browser roles", async () => {
   const { readFile } = await import("node:fs/promises");
   const nginx = await readFile(new URL("../vps/nginx/tianxun-public-readonly.conf", import.meta.url), "utf8");
   const visibilityRoute = await readFile(new URL("../app/api/visibility/route.ts", import.meta.url), "utf8");
   assert.match(nginx, /listen 80 default_server/);
-  assert.equal(nginx.match(/tianxun-proxy-secret\.conf/g)?.length, 6);
-  assert.match(nginx, /location = \/api\/weather[\s\S]*limit_req[\s\S]*tianxun-proxy-secret\.conf/);
-  assert.match(nginx, /location = \/api\/tasks[\s\S]*public-read-only[\s\S]*return 403/);
-  assert.match(nginx, /location = \/api\/road-disruptions[\s\S]*public-read-only[\s\S]*return 403/);
-  assert.match(nginx, /location = \/api\/tasks[\s\S]*storage":"public-read-only/);
-  assert.match(nginx, /location = \/api\/visibility[\s\S]*limit_except POST[\s\S]*X-Tianxun-Role "operator"[\s\S]*X-Tianxun-Stateless-Visibility "1"/);
-  assert.match(nginx, /location ~ \^\/api\/\(changes\|routing\|infrastructure\|landslide-terrain\)[\s\S]*return 403/);
+  assert.match(nginx, /tianxun_login:10m rate=5r\/m/);
+  assert.match(nginx, /location = \/api\/auth\/login[\s\S]*client_max_body_size 8k[\s\S]*limit_req zone=tianxun_login/);
+  assert.match(nginx, /location = \/api\/health\/live/);
+  assert.match(nginx, /location \/api\/[\s\S]*proxy_pass http:\/\/127\.0\.0\.1:3000/);
+  assert.doesNotMatch(nginx, /tianxun-proxy-secret\.conf|X-Tianxun-Role|X-Tianxun-Stateless-Visibility|public-read-only/);
   assert.match(visibilityRoute, /statelessPublicTrial/);
   assert.doesNotMatch(nginx, /listen\s+(?:127\.0\.0\.1:)?(?:3000|8644)/);
+});
+
+test("implements a server-side login, revocable sessions and password-hash configuration", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const auth = await readFile(new URL("../lib/web-auth.ts", import.meta.url), "utf8");
+  const operational = await readFile(new URL("../db/operational.ts", import.meta.url), "utf8");
+  const login = await readFile(new URL("../app/authenticated-app.tsx", import.meta.url), "utf8");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  const loginRoute = await readFile(new URL("../app/api/auth/login/route.ts", import.meta.url), "utf8");
+  assert.match(auth, /pbkdf2-sha256/);
+  assert.match(auth, /HttpOnly; SameSite=Strict/);
+  assert.match(auth, /secureLoginTransportRequired/);
+  assert.match(operational, /CREATE TABLE IF NOT EXISTS web_sessions/);
+  assert.match(operational, /DELETE FROM web_sessions WHERE session_hash/);
+  assert.match(login, /登录灾情预报系统/);
+  assert.match(dashboard, /安全退出/);
+  assert.match(loginRoute, /enforceRateLimit\(request, "web-login", 5, 15 \* 60_000\)/);
 });
 
 test("includes every Vinext build dependency in the hardened VPS release allow-list", async () => {
