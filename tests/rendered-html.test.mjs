@@ -297,6 +297,7 @@ test("keeps the authenticated Nginx gateway bounded without synthetic browser ro
   const { readFile } = await import("node:fs/promises");
   const nginx = await readFile(new URL("../vps/nginx/tianxun-public-readonly.conf", import.meta.url), "utf8");
   const proxyCommon = await readFile(new URL("../vps/nginx/tianxun-proxy-common.conf", import.meta.url), "utf8");
+  const ipHttpsInstaller = await readFile(new URL("../vps/scripts/configure-ip-https.sh", import.meta.url), "utf8");
   const visibilityRoute = await readFile(new URL("../app/api/visibility/route.ts", import.meta.url), "utf8");
   assert.match(nginx, /listen 80 default_server/);
   assert.match(nginx, /tianxun_login:10m rate=5r\/m/);
@@ -307,6 +308,8 @@ test("keeps the authenticated Nginx gateway bounded without synthetic browser ro
   assert.match(proxyCommon, /proxy_set_header Host \$host:\$server_port/);
   assert.match(proxyCommon, /proxy_set_header X-Forwarded-Host \$host:\$server_port/);
   assert.match(proxyCommon, /proxy_set_header X-Forwarded-Port \$server_port/);
+  assert.match(ipHttpsInstaller, /proxy_common_source=.*tianxun-proxy-common\.conf/);
+  assert.match(ipHttpsInstaller, /install -o root -g root -m 0644 "\$proxy_common_source" "\$proxy_common_target"/);
   assert.match(visibilityRoute, /statelessPublicTrial/);
   assert.doesNotMatch(nginx, /listen\s+(?:127\.0\.0\.1:)?(?:3000|8644)/);
 });
