@@ -215,6 +215,10 @@ test("computes cyclone visibility against the forecast slice valid at each satel
   const tracking = await readFile(new URL("../lib/cyclone-tracking-opportunities.ts", import.meta.url), "utf8");
   assert.match(dashboard, /台风动态跟踪目标/);
   assert.match(dashboard, /计算台风动态跟踪机会/);
+  assert.match(dashboard, /拍摄时刻台风/);
+  assert.match(dashboard, /选择并在地图查看/);
+  assert.match(dashboard, /cycloneTrackingSliceAt\(activeTask\.timeIndexedAoi, activeTask\.closestApproachAt\)/);
+  assert.match(dashboard, /onActivate\(task\.taskId\)/);
   assert.match(visibilityRoute, /screenCycloneConfiguredSarOpportunities/);
   assert.match(visibilityRoute, /screenCycloneTleOpportunities/);
   assert.match(tracking, /按卫星过境时刻匹配台风/);
