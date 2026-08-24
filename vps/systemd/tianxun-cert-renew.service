@@ -1,0 +1,12 @@
+[Unit]
+Description=Renew Tianxun short-lived IP TLS certificate
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/tianxun-certbot/bin/certbot renew --quiet
+ExecStartPost=/usr/sbin/nginx -s reload
+
+[Install]
+WantedBy=multi-user.target

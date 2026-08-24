@@ -1,0 +1,21 @@
+limit_req_zone $binary_remote_addr zone=tianxun_login:10m rate=5r/m;
+limit_req_zone $binary_remote_addr zone=tianxun_api:10m rate=8r/s;
+limit_req_zone $binary_remote_addr zone=tianxun_web:10m rate=30r/s;
+limit_conn_zone $binary_remote_addr zone=tianxun_conn:10m;
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name __PUBLIC_IP__;
+    server_tokens off;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type text/plain;
+        try_files $uri =404;
+    }
+
+    location / {
+        return 308 https://__PUBLIC_IP__:__HTTPS_PORT__$request_uri;
+    }
+}

@@ -174,6 +174,15 @@ sudo bash /opt/tianxun/current/vps/scripts/configure-login.sh
 
 该脚本使用无回显输入，保存 `PBKDF2-HMAC-SHA256` 600,000 次迭代的加盐哈希，不保存明文密码。登录失败同时受到 Nginx（每 IP）和应用层频率限制。
 
-生产模式会拒绝通过明文 HTTP 建立会话。上线前必须准备域名，在 Nginx 上配置有效 TLS 证书，并把 80 端口永久重定向到 HTTPS；完成后确认上游仍设置 `Host` 和 `X-Forwarded-Proto $scheme`。不要通过修改代码或伪造 `X-Forwarded-Proto` 来绕过 HTTPS 要求。
+生产模式会拒绝通过明文 HTTP 建立会话。上线前必须准备域名证书或受信任的 IP 证书，在 Nginx 上配置 TLS，并把 80 端口永久重定向到 HTTPS；完成后确认上游仍设置 `Host` 和 `X-Forwarded-Proto $scheme`。不要通过修改代码或伪造 `X-Forwarded-Proto` 来绕过 HTTPS 要求。
+
+如果没有域名且 443 已被其他服务占用，可使用 Let’s Encrypt 的短期 IP 证书把控制台部署到独立端口。Ubuntu 22.04 需先安装虚拟环境支持，然后执行：
+
+```bash
+sudo apt-get install -y python3-venv
+sudo bash /opt/tianxun/current/vps/scripts/configure-ip-https.sh 67.230.184.51 8443
+```
+
+脚本不会改动 443 端口；它会把 HTTP 80 重定向到 8443、安装 Certbot 5.4+、申请受信任的六天期 IP 证书，并启用每天两次的自动续期检查。失败时会恢复部署前的 Nginx 站点配置。
 
 `/api/satellites`、灾情、任务、路线和道路核验数据都不再匿名公开。CelesTrak 轨道仍由服务器定时刷新；51832、56846、61231、64048、69100 的业务名称来自项目配置，58918 的“东方慧眼”身份保持待核验。

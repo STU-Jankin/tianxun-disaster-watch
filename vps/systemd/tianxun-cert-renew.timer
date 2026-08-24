@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Tianxun IP TLS certificate twice daily
+
+[Timer]
+OnCalendar=*-*-* 03,15:17:00
+RandomizedDelaySec=45m
+Persistent=true
+Unit=tianxun-cert-renew.service
+
+[Install]
+WantedBy=timers.target
