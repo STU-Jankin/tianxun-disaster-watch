@@ -63,14 +63,40 @@ export function rejectCrossOriginBrowserWrite(request: Request) {
     return hasWebSessionCookie(request) ? Response.json({ error: "浏览器会话写入缺少同源证明" }, { status: 403 }) : null;
   }
   try {
-    const requestUrl = new URL(request.url);
-    const forwardedProtocol = request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim().toLowerCase();
-    if (forwardedProtocol === "https" || forwardedProtocol === "http") requestUrl.protocol = `${forwardedProtocol}:`;
-    if (new URL(origin).origin === requestUrl.origin) return null;
+    if (new URL(origin).origin === browserVisibleOrigin(request)) return null;
   } catch {
     // fall through
   }
   return Response.json({ error: "拒绝跨站写入请求" }, { status: 403 });
+}
+
+function browserVisibleOrigin(request: Request) {
+  const requestUrl = new URL(request.url);
+  const forwardedProtocol = firstForwardedValue(request.headers.get("x-forwarded-proto"))?.toLowerCase();
+  if (forwardedProtocol === "https" || forwardedProtocol === "http") requestUrl.protocol = `${forwardedProtocol}:`;
+  const forwardedHost = validForwardedHost(firstForwardedValue(request.headers.get("x-forwarded-host")));
+  if (forwardedHost) requestUrl.host = forwardedHost;
+  const forwardedPort = firstForwardedValue(request.headers.get("x-forwarded-port"));
+  if (forwardedPort && /^\d{1,5}$/.test(forwardedPort)) {
+    const port = Number(forwardedPort);
+    if (port >= 1 && port <= 65_535) requestUrl.port = forwardedPort;
+  }
+  return requestUrl.origin;
+}
+
+function firstForwardedValue(value: string | null) {
+  return value?.split(",", 1)[0]?.trim() || null;
+}
+
+function validForwardedHost(value: string | null) {
+  if (!value || value.length > 255 || /[\s/@?#\\]/.test(value)) return null;
+  try {
+    const parsed = new URL(`http://${value}`);
+    if (parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) return null;
+    return parsed.host;
+  } catch {
+    return null;
+  }
 }
 
 export async function apiActor(request: Request) {

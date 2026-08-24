@@ -74,6 +74,28 @@ test("trusted proxy authentication does not bypass browser same-origin checks", 
       },
     });
     assert.equal(rejectCrossOriginBrowserWrite(sameOrigin), null);
+
+    const nonStandardHttpsPort = new Request("http://127.0.0.1:3000/api/tasks", {
+      method: "POST",
+      headers: {
+        Origin: "https://67.230.184.51:8443",
+        "X-Forwarded-Proto": "https",
+        "X-Forwarded-Host": "67.230.184.51:8443",
+        "X-Forwarded-Port": "8443",
+      },
+    });
+    assert.equal(rejectCrossOriginBrowserWrite(nonStandardHttpsPort), null);
+
+    const wrongExternalPort = new Request("http://127.0.0.1:3000/api/tasks", {
+      method: "POST",
+      headers: {
+        Origin: "https://67.230.184.51:9443",
+        "X-Forwarded-Proto": "https",
+        "X-Forwarded-Host": "67.230.184.51:8443",
+        "X-Forwarded-Port": "8443",
+      },
+    });
+    assert.equal(rejectCrossOriginBrowserWrite(wrongExternalPort)?.status, 403);
   } finally {
     if (previousProxySecret === undefined) delete process.env.TIANXUN_TRUSTED_PROXY_SECRET;
     else process.env.TIANXUN_TRUSTED_PROXY_SECRET = previousProxySecret;
