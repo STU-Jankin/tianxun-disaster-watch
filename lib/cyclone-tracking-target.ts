@@ -1,4 +1,5 @@
 import type { CycloneTaskAoiSlice } from "./cyclone-forecast.ts";
+import type { CycloneImpactFrame } from "./disasters.ts";
 import type { GeoGeometry } from "./task-aoi.ts";
 
 export const cycloneTrackingTargets = ["center", "wind_field", "uncertainty_area"] as const;
@@ -18,4 +19,10 @@ export function cycloneTrackingSliceAt(slices: CycloneTaskAoiSlice[], at: string
     const end = Date.parse(slice.validTo);
     return timestamp >= start && (timestamp < end || index === slices.length - 1 && timestamp <= end);
   });
+}
+
+export function nearestCycloneFrameIndex(frames: CycloneImpactFrame[], at?: string) {
+  if (!frames.length || !at || !Number.isFinite(Date.parse(at))) return 0;
+  const target = Date.parse(at);
+  return frames.reduce((bestIndex, frame, index) => Math.abs(Date.parse(frame.forecastAt) - target) < Math.abs(Date.parse(frames[bestIndex].forecastAt) - target) ? index : bestIndex, 0);
 }

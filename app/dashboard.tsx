@@ -31,7 +31,7 @@ import { isRoadDisruptionList, normalizeRoadDisruptionGeoJson, roadDisruptionFea
 import { infrastructureKindLabel, isInfrastructureAssessment, type InfrastructureAssessment } from "../lib/osm-infrastructure";
 import { deriveLandslideWorkflow, landslideSarTemplates, type LandslideSarTemplate, type LandslideTerrainResult, type LandslideTerrainScreening } from "../lib/landslide-planning";
 import { sarImagingModeOptions, sarPayloadProfiles, type SarImagingModeId } from "../lib/satellite-payloads";
-import { cycloneTrackingGeometry, cycloneTrackingSliceAt, type CycloneTrackingTarget } from "../lib/cyclone-tracking-target";
+import { cycloneTrackingGeometry, cycloneTrackingSliceAt, nearestCycloneFrameIndex, type CycloneTrackingTarget } from "../lib/cyclone-tracking-target";
 
 type ApiResponse = {
   events: DisasterEvent[];
@@ -854,7 +854,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
           <span><i className="red" />红色</span><span><i className="orange" />橙色</span><span><i className="yellow" />黄色</span><span><i className="blue" />蓝色</span>
           <em />
           <span className="priority-ring">◎</span><span>重点范围加权</span>
-          {selected?.cycloneForecast ? <><em /><span><i className="forecast-track-key" />官方路径</span><span><i className="forecast-impact-key" />风圈范围</span><span><i className="forecast-uncertainty-key" />路径不确定区</span></> : null}
+          {selected?.cycloneForecast || activeTask?.cycloneForecast ? <><em /><span><i className="forecast-track-key" />官方路径</span><span><i className="forecast-impact-key" />风圈范围</span><span><i className="forecast-uncertainty-key" />路径不确定区</span></> : null}
           {selected && landslideTerrain[selected.masterEventId] ? <><em /><span><i className="landslide-terrain-key" />DEM 地形筛查 AOI</span></> : null}
           {activeResponseScenario ? <><em /><span><i className="response-route-clear-key" />未检出相交</span><span><i className="response-route-limited-key" />影响区内撤离</span><span><i className="response-route-blocked-key" />禁用/未核验</span>{activeResponseScenario.infrastructureFeatures?.length ? <span><i className="infrastructure-exposure-key" />OSM 设施暴露</span> : null}</> : null}
         </div>
@@ -956,6 +956,7 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
   const mapRef = useRef<import("leaflet").Map | null>(null);
   const markerLayerRef = useRef<import("leaflet").LayerGroup | null>(null);
   const selectedLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
+  const taskForecastLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const aoiLayerRef = useRef<import("leaflet").GeoJSON | null>(null);
   const opportunityLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const responseLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
@@ -982,6 +983,15 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
   const activeTrackingGeometry = useMemo(() => activeTrackingSlice
     ? cycloneTrackingGeometry(activeTrackingSlice, activeTrackingTarget)
     : null, [activeTrackingSlice, activeTrackingTarget]);
+  const displayedCycloneForecast = activeTask?.hazard === "cyclone" ? activeTask.cycloneForecast : selected?.cycloneForecast;
+  const forecastOwnerId = activeTask?.hazard === "cyclone" ? activeTask.taskId : selected?.id ?? "";
+  const forecastFrames = displayedCycloneForecast?.impactField?.frames ?? [];
+  const acquisitionForecastFrameIndex = nearestCycloneFrameIndex(forecastFrames, activeTask?.closestApproachAt);
+  const forecastFrameIndex = forecastSelection.eventId === forecastOwnerId
+    ? Math.min(forecastSelection.index, Math.max(0, forecastFrames.length - 1))
+    : acquisitionForecastFrameIndex;
+  const activeForecastFrame = forecastFrames[forecastFrameIndex];
+  const browsingTaskForecast = Boolean(activeTask?.hazard === "cyclone" && activeForecastFrame && forecastFrameIndex !== acquisitionForecastFrameIndex);
   const detailOffset = useCallback(() => detailOpen && window.innerWidth > 720 ? Math.min(338, Math.max(0, (containerRef.current?.clientWidth ?? 0) - 180)) : 0, [detailOpen]);
   const fitWithOverlay = useCallback((map: import("leaflet").Map, bounds: import("leaflet").LatLngBoundsExpression, maxZoom: number) => {
     const overlay = detailOffset();
@@ -1023,6 +1033,7 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
       L.control.zoom({ position: "topright" }).addTo(map);
       markerLayerRef.current = L.layerGroup().addTo(map);
       selectedLayerRef.current = L.featureGroup().addTo(map);
+      taskForecastLayerRef.current = L.featureGroup().addTo(map);
       opportunityLayerRef.current = L.featureGroup().addTo(map);
       responseLayerRef.current = L.featureGroup().addTo(map);
       drawPreviewLayerRef.current = L.featureGroup().addTo(map);
@@ -1048,6 +1059,7 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
       mapRef.current = null;
       markerLayerRef.current = null;
       selectedLayerRef.current = null;
+      taskForecastLayerRef.current = null;
       opportunityLayerRef.current = null;
       responseLayerRef.current = null;
       drawPreviewLayerRef.current = null;
@@ -1095,7 +1107,6 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
     map.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], { padding: [24, 24], animate: true, duration: 0.45 });
   }, [bbox, mapReady, scope]);
 
-  const forecastFrameIndex = forecastSelection.eventId === selected?.id ? forecastSelection.index : 0;
   const activeDrawing = drawing && drawingTaskId === activeTask?.taskId;
   const activeDraftVertices = useMemo(() => drawingTaskId === activeTask?.taskId ? draftVertices : [], [activeTask?.taskId, draftVertices, drawingTaskId]);
 
@@ -1360,6 +1371,71 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
 
   useEffect(() => {
     const map = mapRef.current;
+    const layer = taskForecastLayerRef.current;
+    if (!mapReady || !map || !layer) return;
+    layer.clearLayers();
+    if (activeTask?.hazard !== "cyclone" || !displayedCycloneForecast || !activeForecastFrame) return;
+    let cancelled = false;
+    void import("leaflet").then((L) => {
+      if (cancelled) return;
+      const referenceLongitude = activeForecastFrame.longitude;
+      const focusBounds = L.latLngBounds([]);
+      const addArea = (geometry: DisasterEvent["geometry"], style: L.PathOptions) => {
+        const unwrapped = unwrapForecastGeometry(geometry, referenceLongitude) as GeoJSON.GeoJsonObject;
+        const outline = antimeridianOutlineGeometry(geometry, referenceLongitude);
+        const areaLayer = L.geoJSON(unwrapped, { style: outline ? { ...style, stroke: false } : style, interactive: true });
+        areaLayer.bindTooltip(`任务 4D 预报片 · +${activeForecastFrame.leadHours}小时 · ${formatTimeWithYear(activeForecastFrame.forecastAt)} UTC+08`, { sticky: true });
+        areaLayer.addTo(layer);
+        if (outline) L.geoJSON(outline as GeoJSON.GeoJsonObject, { style: { ...style, fill: false }, interactive: false }).addTo(layer);
+        const bounds = areaLayer.getBounds();
+        if (bounds.isValid()) focusBounds.extend(bounds);
+      };
+      if (displayedCycloneForecast.uncertaintyGeometry) {
+        L.geoJSON(unwrapForecastGeometry(displayedCycloneForecast.uncertaintyGeometry, referenceLongitude) as GeoJSON.GeoJsonObject, {
+          style: { color: "#7565aa", weight: 1, fillColor: "#9587bd", fillOpacity: 0.05, dashArray: "7 6", className: "task-cyclone-advisory-uncertainty" },
+          interactive: false,
+        }).addTo(layer);
+      }
+      const frameUncertainty = cycloneUncertaintyGeometry(activeForecastFrame);
+      if (frameUncertainty) addArea(frameUncertainty, { color: "#6b5aa6", weight: 2, fillColor: "#8c79bd", fillOpacity: 0.16, dashArray: "4 3", className: "task-cyclone-frame-uncertainty" });
+      [...activeForecastFrame.windFields].sort((left, right) => left.thresholdKnots - right.thresholdKnots).forEach((field) => {
+        const color = field.thresholdKnots >= 64 ? "#a72222" : field.thresholdKnots >= 50 ? "#cf552f" : "#e58a42";
+        addArea(cycloneWindGeometry(activeForecastFrame, field), { color, weight: 1.8, fillColor: color, fillOpacity: field.thresholdKnots >= 64 ? 0.22 : 0.12, className: `task-cyclone-wind-${field.thresholdKnots}` });
+      });
+      L.geoJSON(unwrapForecastGeometry(displayedCycloneForecast.trackGeometry, referenceLongitude) as GeoJSON.GeoJsonObject, {
+        style: { color: "#075fa8", weight: 3, opacity: 0.9, dashArray: "8 5", className: "task-cyclone-forecast-track" },
+        interactive: false,
+      }).addTo(layer);
+      displayedCycloneForecast.track.forEach((point) => {
+        const marker = L.circleMarker([point.latitude, unwrapLongitudeNear(point.longitude, referenceLongitude)], {
+          radius: point.leadHours === 0 ? 6 : 4,
+          color: "#075fa8",
+          weight: 2,
+          fillColor: "#ffffff",
+          fillOpacity: 1,
+          className: "task-cyclone-forecast-point",
+        });
+        marker.bindTooltip(`${point.leadHours === 0 ? "实况" : `+${point.leadHours}小时`} · ${formatTimeWithYear(point.forecastAt)} UTC+08`, { direction: "top" });
+        marker.addTo(layer);
+      });
+      const frameCenter = L.circleMarker([activeForecastFrame.latitude, unwrapLongitudeNear(activeForecastFrame.longitude, referenceLongitude)], {
+        radius: 7,
+        color: browsingTaskForecast ? "#c15624" : "#075fa8",
+        weight: 3,
+        fillColor: "#ffffff",
+        fillOpacity: 1,
+        className: browsingTaskForecast ? "task-cyclone-browsed-center" : "task-cyclone-acquisition-frame",
+      });
+      frameCenter.bindTooltip(`${browsingTaskForecast ? "正在浏览预测片" : "拍摄时刻最近预测片"} · +${activeForecastFrame.leadHours}小时 · ${formatTimeWithYear(activeForecastFrame.forecastAt)} UTC+08`, { direction: "top" });
+      frameCenter.addTo(layer);
+      focusBounds.extend(frameCenter.getLatLng());
+      if (focusBounds.isValid()) fitWithOverlay(map, focusBounds, activeForecastFrame.windFields.length || frameUncertainty ? 8 : 9);
+    }).catch(() => setMapError("任务 4D 台风路径无法绘制；已选卫星机会仍可继续使用。"));
+    return () => { cancelled = true; layer.clearLayers(); };
+  }, [activeForecastFrame, activeTask, browsingTaskForecast, displayedCycloneForecast, fitWithOverlay, mapReady]);
+
+  useEffect(() => {
+    const map = mapRef.current;
     if (!mapReady || !map) return;
     let cancelled = false;
     void import("leaflet").then((L) => {
@@ -1512,8 +1588,6 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
     setDrawingError("");
   }, [activeDraftVertices, activeTask, onCustomAoiChange]);
 
-  const forecastFrames = selected?.cycloneForecast?.impactField?.frames ?? [];
-  const activeForecastFrame = forecastFrames[Math.min(forecastFrameIndex, Math.max(0, forecastFrames.length - 1))];
   const activeResponseRoute = activeResponseScenario?.routes.find((route) => route.routeId === activeResponseScenario.selectedRouteId) ?? activeResponseScenario?.routes[0];
 
   return <div className="map-stage" inert={obscured ? true : undefined} aria-hidden={obscured || undefined}>
@@ -1522,10 +1596,10 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
     <div className="map-title"><span>观测视图</span><strong>{scopes[scope].label}</strong><small>{events.length} 个事件 · 行政范围为快速筛选近似边界</small><button className="orbit-toggle" aria-pressed={orbitsVisible} disabled={!fleet.current} onClick={() => setOrbitsVisible((visible) => !visible)}><i />{orbitsVisible ? "隐藏卫星轨道" : "显示卫星轨道"}<b>{fleet.state === "loading" ? "…" : fleet.current}</b></button>{orbitsVisible ? <small className="orbit-disclaimer">TLE/SGP4 外推 · 非星上遥测</small> : null}</div>
     <div className="coordinates">WGS 84 · {viewLabel || "地图初始化中"}</div>
     {forecastFrames.length > 0 && activeForecastFrame ? <div className="cyclone-timeline" role="group" aria-label="台风四维影响场时间轴">
-      <div><strong>4D 影响场</strong><span>{activeForecastFrame.centerBasis === "official_node" ? "官方节点" : "逐时插值"} · +{activeForecastFrame.leadHours}h</span></div>
-      <time>{formatTimeWithYear(activeForecastFrame.forecastAt)} UTC+08</time>
-      <input type="range" min="0" max={forecastFrames.length - 1} value={Math.min(forecastFrameIndex, forecastFrames.length - 1)} onChange={(event) => setForecastSelection({ eventId: selected?.id ?? "", index: Number(event.target.value) })} aria-label="选择台风预报小时" />
-      <small>{activeForecastFrame.windFields.length ? activeForecastFrame.windFields.map((field) => `≥${field.thresholdKnots} kt 象限风圈`).join(" · ") : "本时次无可用官方风圈"} · {activeForecastFrame.uncertaintyRadiusKm || activeForecastFrame.uncertaintyGeometry ? "含分时不确定区" : selected?.cycloneForecast?.uncertaintyGeometry ? "显示本报次总体不确定区" : "无不确定区数据"}</small>
+      <div><strong>{activeTask?.hazard === "cyclone" ? "任务 4D 预测路径" : "4D 影响场"}</strong><span>{browsingTaskForecast ? "浏览模式" : activeTask?.hazard === "cyclone" ? "拍摄时刻" : activeForecastFrame.centerBasis === "official_node" ? "官方节点" : "逐时插值"} · +{activeForecastFrame.leadHours}h</span></div>
+      <div className="cyclone-timeline-meta"><time>{formatTimeWithYear(activeForecastFrame.forecastAt)} UTC+08</time>{activeTask?.hazard === "cyclone" && activeTask.closestApproachAt ? <button disabled={!browsingTaskForecast} onClick={() => setForecastSelection({ eventId: forecastOwnerId, index: acquisitionForecastFrameIndex })}>回到拍摄时刻</button> : null}</div>
+      <input type="range" min="0" max={forecastFrames.length - 1} value={Math.min(forecastFrameIndex, forecastFrames.length - 1)} onChange={(event) => setForecastSelection({ eventId: forecastOwnerId, index: Number(event.target.value) })} aria-label="选择台风预报小时" />
+      <small>{activeForecastFrame.windFields.length ? activeForecastFrame.windFields.map((field) => `≥${field.thresholdKnots} kt 象限风圈`).join(" · ") : "本时次无可用官方风圈"} · {activeForecastFrame.uncertaintyRadiusKm || activeForecastFrame.uncertaintyGeometry ? "含分时不确定区" : displayedCycloneForecast?.uncertaintyGeometry ? "显示本报次总体不确定区" : "无不确定区数据"}{activeTask?.hazard === "cyclone" ? " · 拖动仅浏览预测，不改变已选卫星机会" : ""}</small>
     </div> : null}
     {activeTask ? <div className="map-review-toolbar" role="group" aria-label="任务AOI地图复核">
       <div><strong>{activeTask.title}</strong><span>{activeTrackingSlice ? `拍摄时刻台风${activeTrackingTarget === "center" ? "预测中心" : activeTrackingTarget === "wind_field" ? "风圈" : "路径不确定区"} · +${activeTrackingSlice.leadHours}h · ${formatTimeWithYear(activeTask.closestApproachAt!)} UTC+08 · ${activeTrackingSlice.center[1].toFixed(3)}°, ${activeTrackingSlice.center[0].toFixed(3)}°` : ["polygon", "multi"].includes(activeTask.aoiType) ? `${customAoiPartCount(activeTask.customGeometry)} 块自定义 AOI` : "正在显示任务 AOI"}{activeTask.simulationLevel === "orbit_only" ? ` · TLE 轨道粗筛 · 最近约 ${activeTask.minimumGroundTrackDistanceKm ?? "--"} km` : activeTask.simulationLevel === "assumed_sensor" ? ` · 假设传感器试算 · ${activeTask.imagingMode ?? "模式待选"}` : ""}</span></div>

@@ -219,6 +219,10 @@ test("computes cyclone visibility against the forecast slice valid at each satel
   assert.match(dashboard, /选择并在地图查看/);
   assert.match(dashboard, /cycloneTrackingSliceAt\(activeTask\.timeIndexedAoi, activeTask\.closestApproachAt\)/);
   assert.match(dashboard, /onActivate\(task\.taskId\)/);
+  assert.match(dashboard, /任务 4D 预测路径/);
+  assert.match(dashboard, /回到拍摄时刻/);
+  assert.match(dashboard, /拖动仅浏览预测，不改变已选卫星机会/);
+  assert.match(dashboard, /taskForecastLayerRef/);
   assert.match(visibilityRoute, /screenCycloneConfiguredSarOpportunities/);
   assert.match(visibilityRoute, /screenCycloneTleOpportunities/);
   assert.match(tracking, /按卫星过境时刻匹配台风/);

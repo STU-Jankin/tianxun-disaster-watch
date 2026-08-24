@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   cycloneTrackingGeometry,
   cycloneTrackingSliceAt,
+  nearestCycloneFrameIndex,
 } from "../lib/cyclone-tracking-target.ts";
 
 const slices = [
@@ -42,4 +43,11 @@ test("an exact hourly boundary belongs only to the new forecast slice", () => {
 
 test("tracking geometry does not silently fall back to a different target type", () => {
   assert.equal(cycloneTrackingGeometry(slices[1], "wind_field"), null);
+});
+
+test("task 4D timeline defaults to the forecast frame nearest the acquisition time", () => {
+  const frames = [0, 1, 2, 3].map((hour) => ({ forecastAt: `2026-08-24T0${hour}:00:00.000Z` }));
+  assert.equal(nearestCycloneFrameIndex(frames, "2026-08-24T02:26:00.000Z"), 2);
+  assert.equal(nearestCycloneFrameIndex(frames, "2026-08-24T02:31:00.000Z"), 3);
+  assert.equal(nearestCycloneFrameIndex(frames), 0);
 });
