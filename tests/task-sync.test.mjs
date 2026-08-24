@@ -12,13 +12,15 @@ test("task sync omits canonical cyclone products and source geometry", () => {
     cycloneForecast: { impactField: { frames: Array.from({ length: 361 }, () => repeatedGeometry) } },
     timeIndexedAoi: Array.from({ length: 361 }, () => ({ windGeometry: repeatedGeometry })),
     forecastAdvisoryId: "canonical", forecastIssuedAt: "canonical", forecastValidUntil: "canonical", aoiHash: "canonical",
+    cycloneTrackingTarget: "center", trackingValidFrom: "canonical", trackingCenterLatitude: 20,
   };
   const compact = compactSatelliteTaskForSync(task);
   assert.equal(compact.taskId, "task-1");
   assert.equal(compact.revision, 2);
   assert.equal(compact.entityKey, "cyclone:2026:cp:1");
   assert.deepEqual(compact.sarImagingModes, ["spotlight", "tops_1"]);
-  for (const field of ["sourceGeometry", "cycloneForecast", "timeIndexedAoi", "forecastAdvisoryId", "forecastIssuedAt", "forecastValidUntil", "aoiHash"]) assert.equal(field in compact, false);
+  assert.equal(compact.cycloneTrackingTarget, "center");
+  for (const field of ["sourceGeometry", "cycloneForecast", "timeIndexedAoi", "forecastAdvisoryId", "forecastIssuedAt", "forecastValidUntil", "aoiHash", "trackingValidFrom", "trackingCenterLatitude"]) assert.equal(field in compact, false);
   assert.ok(JSON.stringify(compact).length < 2_000);
 });
 

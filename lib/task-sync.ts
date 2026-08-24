@@ -7,7 +7,7 @@ const taskDraftFields = [
   "opportunityLookSide", "opportunityCoveragePercent", "opportunitySpatialResolutionM", "opportunitySceneCrossTrackKm", "opportunitySceneAlongTrackKm", "sensorParameterStatus", "opportunityFootprint",
   "simulationLevel", "satelliteNoradId", "closestApproachAt", "closestSubpointLatitude", "closestSubpointLongitude",
   "minimumGroundTrackDistanceKm", "orbitSearchRadiusKm", "opportunityOrbitDirection",
-  "orbitDirectionPreference", "referenceAcquisitionRequired", "sarAnalysisMode",
+  "orbitDirectionPreference", "referenceAcquisitionRequired", "sarAnalysisMode", "cycloneTrackingTarget",
 ] as const;
 
 /**

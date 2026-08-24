@@ -36,6 +36,7 @@ const allowedTaskFields = new Set([
   "locationQuality", "locationAccuracyKm", "evidenceCount", "aoiApproval", "approvedAt", "approvedBy",
   "approvalReason", "createdAt", "updatedAt", "status", "revision", "eventRevision", "aoiHash",
   "timeIndexedAoi", "forecastAdvisoryId", "forecastIssuedAt", "forecastValidUntil",
+  "cycloneTrackingTarget", "trackingValidFrom", "trackingValidTo", "trackingLeadHours", "trackingCenterLatitude", "trackingCenterLongitude", "trackingCenterBasis", "trackingThresholdKnots",
   "satelliteId", "instrumentId", "imagingMode", "opportunityId", "orbitVersion", "visibilityComputedAt",
   "opportunityLookSide", "opportunityCoveragePercent", "opportunitySpatialResolutionM", "opportunitySceneCrossTrackKm", "opportunitySceneAlongTrackKm", "sensorParameterStatus", "opportunityFootprint",
   "simulationLevel", "satelliteNoradId", "closestApproachAt", "closestSubpointLatitude", "closestSubpointLongitude",
@@ -128,6 +129,8 @@ export function validateSatelliteTask(task: Record<string, unknown>, options: { 
   if (!isValidAoi(task)) errors.push("AOI 参数无效或超出安全范围");
   if (task.cycloneForecast !== undefined && !isValidCycloneForecast(task.cycloneForecast)) errors.push("台风官方预报字段无效或超出安全范围");
   if (task.timeIndexedAoi !== undefined && !isValidTimeIndexedAoi(task.timeIndexedAoi, start, end)) errors.push("逐时台风 AOI 字段无效或超出任务时间窗");
+  if (task.cycloneTrackingTarget !== undefined && !["center", "wind_field", "uncertainty_area"].includes(String(task.cycloneTrackingTarget))) errors.push("台风动态跟踪目标无效");
+  validateCycloneTrackingSelection(task, start, end, errors);
   if (!isValidApproval(task.aoiApproval)) errors.push("AOI 审批状态无效");
   if (options.requireApproved && task.aoiApproval !== "source_verified" && task.aoiApproval !== "operator_confirmed") errors.push("任务尚未通过 AOI 审批");
   if (options.requireApproved && task.aoiApproval === "source_verified" && task.aoiType !== "source") errors.push("来源核验任务必须使用不可修改的来源几何");
@@ -142,6 +145,42 @@ export function validateSatelliteTask(task: Record<string, unknown>, options: { 
   }
   if (task.source === "演示数据") errors.push("演示事件禁止进入任务流");
   return errors.length ? { ok: false, errors } : { ok: true };
+}
+
+function validateCycloneTrackingSelection(task: Record<string, unknown>, taskStart: number, taskEnd: number, errors: string[]) {
+  const slices = Array.isArray(task.timeIndexedAoi) ? task.timeIndexedAoi : [];
+  const dynamicTask = task.hazard === "cyclone" && task.aoiType === "source" && slices.length > 0;
+  const fields = ["trackingValidFrom", "trackingValidTo", "trackingLeadHours", "trackingCenterLatitude", "trackingCenterLongitude", "trackingCenterBasis", "trackingThresholdKnots"];
+  const hasSelection = fields.some((field) => task[field] !== undefined);
+  if (dynamicTask && task.opportunityId !== undefined && !hasSelection) {
+    errors.push("已选台风机会未绑定逐时预测片，请重新计算动态跟踪机会");
+    return;
+  }
+  if (!hasSelection) return;
+  if (!dynamicTask) { errors.push("逐时跟踪字段只能用于台风来源 AOI 任务"); return; }
+  const validFrom = Date.parse(String(task.trackingValidFrom ?? ""));
+  const validTo = Date.parse(String(task.trackingValidTo ?? ""));
+  const leadHours = Number(task.trackingLeadHours);
+  const latitude = Number(task.trackingCenterLatitude);
+  const longitude = Number(task.trackingCenterLongitude);
+  const threshold = task.trackingThresholdKnots === undefined ? undefined : Number(task.trackingThresholdKnots);
+  if (!Number.isFinite(validFrom) || !Number.isFinite(validTo) || validTo <= validFrom || validFrom < taskStart || validTo > taskEnd) errors.push("台风跟踪预测片时间无效");
+  if (!Number.isInteger(leadHours) || leadHours < 0 || leadHours > 360) errors.push("台风跟踪提前时效无效");
+  if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) errors.push("台风跟踪中心坐标无效");
+  if (!["official_node", "interpolated_official_track"].includes(String(task.trackingCenterBasis))) errors.push("台风跟踪中心依据无效");
+  if (threshold !== undefined && (!Number.isFinite(threshold) || threshold <= 0 || threshold > 250)) errors.push("台风跟踪风圈阈值无效");
+  const selected = slices.find((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+    const slice = candidate as Record<string, unknown>;
+    const center = slice.center;
+    return slice.validFrom === task.trackingValidFrom && slice.validTo === task.trackingValidTo && Number(slice.leadHours) === leadHours
+      && Array.isArray(center) && Number(center[0]) === longitude && Number(center[1]) === latitude && slice.centerBasis === task.trackingCenterBasis;
+  }) as Record<string, unknown> | undefined;
+  if (!selected) errors.push("台风跟踪机会与当前官方逐时预测片不匹配");
+  const closest = Date.parse(String(task.closestApproachAt ?? ""));
+  if (Number.isFinite(closest) && Number.isFinite(validFrom) && Number.isFinite(validTo) && (closest < validFrom || closest > validTo)) errors.push("卫星最近过境时刻不在所选台风预测片内");
+  if (task.cycloneTrackingTarget === "wind_field" && selected?.windGeometry === undefined) errors.push("所选预测片没有风圈几何");
+  if (task.cycloneTrackingTarget === "uncertainty_area" && selected?.uncertaintyGeometry === undefined) errors.push("所选预测片没有不确定区几何");
 }
 
 export function canTransitionTask(from: string | null, to: string) {

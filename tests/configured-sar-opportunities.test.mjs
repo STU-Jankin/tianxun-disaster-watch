@@ -3,6 +3,7 @@ import test from "node:test";
 import { groundReachForIncidence, sarLookGeometry, screenConfiguredSarOpportunities } from "../lib/configured-sar-opportunities.ts";
 import { propagateTle } from "../lib/orbit-simulation.ts";
 import { sarPayloadProfiles } from "../lib/satellite-payloads.ts";
+import { cycloneTrackingSliceAt, screenCycloneConfiguredSarOpportunities } from "../lib/cyclone-tracking-opportunities.ts";
 
 const EARTH_RADIUS_KM = 6371.0088;
 
@@ -100,4 +101,44 @@ test("creates mode-level assumed sensor opportunities from a current TLE and CSA
     assert.equal(window.footprintGeometry.type, "Polygon");
     assert.match(window.constraintNotes.join(" "), /不得自动下发/);
   }
+});
+
+test("matches each SAR pass to the cyclone forecast slice valid at acquisition time", () => {
+  const centerAt = new Date("2026-08-18T12:00:00.000Z");
+  const lines = tle(51832);
+  const center = propagateTle(lines.line1, lines.line2, centerAt);
+  const before = propagateTle(lines.line1, lines.line2, new Date(centerAt.getTime() - 10_000));
+  const after = propagateTle(lines.line1, lines.line2, new Date(centerAt.getTime() + 10_000));
+  assert.ok(center && before && after);
+  const target = destination(center.latitude, center.longitude, bearing(before.latitude, before.longitude, after.latitude, after.longitude) + 90, 300);
+  const slice = {
+    validFrom: new Date(centerAt.getTime() - 600_000).toISOString(),
+    validTo: new Date(centerAt.getTime() + 600_000).toISOString(),
+    leadHours: 18,
+    center: [target.longitude, target.latitude],
+    centerBasis: "interpolated_official_track",
+    thresholdKnots: 34,
+    windGeometry: { type: "Polygon", coordinates: [[[target.longitude - 0.1, target.latitude - 0.1], [target.longitude + 0.1, target.latitude - 0.1], [target.longitude, target.latitude + 0.1], [target.longitude - 0.1, target.latitude - 0.1]]] },
+  };
+  const satellite = {
+    noradId: 51832, interfaceName: "TY-CSAR-2", commonName: "TY-39", commonCode: "巢湖一号",
+    identityStatus: "configured", payloadProfileId: "ty-csar-v2", payloadProfile: sarPayloadProfiles["ty-csar-v2"],
+    tleLine1: lines.line1, tleLine2: lines.line2, epoch: centerAt.toISOString(), fetchedAt: centerAt.toISOString(),
+    orbitStatus: "current", source: "CelesTrak GP", sourceUrl: "https://example.test/tle",
+  };
+  const result = screenCycloneConfiguredSarOpportunities({
+    slices: [slice], target: "center", forecastAdvisoryId: "JMA:2617",
+    imagingStart: slice.validFrom, imagingEnd: slice.validTo, satellites: [satellite],
+    incidenceAngleMinDeg: 15, incidenceAngleMaxDeg: 45, spatialResolutionMeters: 20,
+    minimumCoveragePercent: 80, sarImagingModeIds: ["tops_1"], now: centerAt,
+  });
+  assert.equal(result.trackingMode, "forecast_time_indexed");
+  assert.equal(result.trackingSliceCount, 1);
+  assert.equal(result.windows.length, 1);
+  assert.equal(result.windows[0].trackingLeadHours, 18);
+  assert.equal(result.windows[0].trackingTarget, "center");
+  assert.deepEqual(result.windows[0].trackingCenter, { latitude: target.latitude, longitude: target.longitude });
+  assert.equal(result.windows[0].forecastAdvisoryId, "JMA:2617");
+  assert.match(result.windows[0].constraintNotes.join(" "), /卫星过境时刻|新报次/);
+  assert.equal(cycloneTrackingSliceAt([slice], result.windows[0].closestApproachAt), slice);
 });

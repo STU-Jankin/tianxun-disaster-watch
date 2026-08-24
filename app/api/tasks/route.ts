@@ -4,6 +4,7 @@ import { unknownTaskFields, validateSatelliteTask } from "../../../lib/task-cont
 import { aoiFingerprint, eventRevisionFingerprint } from "../../../lib/event-integrity";
 import { buildTaskAoi } from "../../../lib/task-aoi";
 import { cycloneTaskAoiSlices } from "../../../lib/cyclone-forecast";
+import { cycloneTrackingSliceAt, cycloneTrackingTargets, type CycloneTrackingTarget } from "../../../lib/cyclone-tracking-opportunities";
 
 export const dynamic = "force-dynamic";
 
@@ -61,6 +62,21 @@ export async function POST(request: Request) {
       if (task.aoiType !== "source") return Response.json({ error: "来源核验任务必须使用当前主事件的来源几何" }, { status: 409 });
     }
     const timeIndexedAoi = cycloneTaskAoiSlices(cycloneForecast, String(task.imagingStart), String(task.imagingEnd));
+    const cycloneTrackingTarget = cycloneTrackingTargets.includes(task.cycloneTrackingTarget as CycloneTrackingTarget)
+      ? task.cycloneTrackingTarget as CycloneTrackingTarget
+      : cycloneForecast?.impactField && task.aoiType === "source" ? "center" : undefined;
+    const selectedTrackingSlice = task.opportunityId && task.closestApproachAt && timeIndexedAoi.length
+      ? cycloneTrackingSliceAt(timeIndexedAoi, String(task.closestApproachAt))
+      : undefined;
+    if (task.opportunityId && timeIndexedAoi.length && !selectedTrackingSlice) {
+      return Response.json({ error: "所选卫星机会不在当前官方台风逐时预测范围内，请重新计算" }, { status: 409 });
+    }
+    if (selectedTrackingSlice && cycloneTrackingTarget === "wind_field" && !selectedTrackingSlice.windGeometry) {
+      return Response.json({ error: "所选时次没有官方风圈几何，请改为跟踪预测中心或重新计算" }, { status: 409 });
+    }
+    if (selectedTrackingSlice && cycloneTrackingTarget === "uncertainty_area" && !selectedTrackingSlice.uncertaintyGeometry) {
+      return Response.json({ error: "所选时次没有路径不确定区几何，请改为跟踪预测中心或重新计算" }, { status: 409 });
+    }
     const canonicalFields = {
       eventId: canonical.event.id,
       masterEventId: canonical.event.masterEventId,
@@ -87,6 +103,14 @@ export async function POST(request: Request) {
       forecastIssuedAt: cycloneForecast?.issuedAt,
       forecastValidUntil: cycloneForecast?.forecastValidUntil,
       timeIndexedAoi: timeIndexedAoi.length ? timeIndexedAoi : undefined,
+      cycloneTrackingTarget,
+      trackingValidFrom: selectedTrackingSlice?.validFrom,
+      trackingValidTo: selectedTrackingSlice?.validTo,
+      trackingLeadHours: selectedTrackingSlice?.leadHours,
+      trackingCenterLatitude: selectedTrackingSlice?.center[1],
+      trackingCenterLongitude: selectedTrackingSlice?.center[0],
+      trackingCenterBasis: selectedTrackingSlice?.centerBasis,
+      trackingThresholdKnots: cycloneTrackingTarget === "wind_field" ? selectedTrackingSlice?.thresholdKnots : undefined,
       sourceGeometry,
     };
     const draft = { ...task, ...canonicalFields, eventRevision: currentEventRevision };

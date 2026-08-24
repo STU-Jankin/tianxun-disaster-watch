@@ -31,6 +31,7 @@ import { isRoadDisruptionList, normalizeRoadDisruptionGeoJson, roadDisruptionFea
 import { infrastructureKindLabel, isInfrastructureAssessment, type InfrastructureAssessment } from "../lib/osm-infrastructure";
 import { deriveLandslideWorkflow, landslideSarTemplates, type LandslideSarTemplate, type LandslideTerrainResult, type LandslideTerrainScreening } from "../lib/landslide-planning";
 import { sarImagingModeOptions, sarPayloadProfiles, type SarImagingModeId } from "../lib/satellite-payloads";
+import type { CycloneTrackingTarget } from "../lib/cyclone-tracking-opportunities";
 
 type ApiResponse = {
   events: DisasterEvent[];
@@ -101,6 +102,14 @@ type SatelliteTask = {
   forecastAdvisoryId?: string;
   forecastIssuedAt?: string;
   forecastValidUntil?: string;
+  cycloneTrackingTarget?: CycloneTrackingTarget;
+  trackingValidFrom?: string;
+  trackingValidTo?: string;
+  trackingLeadHours?: number;
+  trackingCenterLatitude?: number;
+  trackingCenterLongitude?: number;
+  trackingCenterBasis?: CycloneTaskAoiSlice["centerBasis"];
+  trackingThresholdKnots?: number;
   minimumCoveragePercent: number;
   maximumCloudPercent: number;
   spatialResolutionMeters: number;
@@ -193,6 +202,15 @@ type VisibilityWindow = {
   aoiRadiusKm?: number;
   candidateThresholdKm?: number;
   constraintNotes?: string[];
+  trackingMode?: "forecast_time_indexed";
+  trackingTarget?: CycloneTrackingTarget;
+  trackingValidFrom?: string;
+  trackingValidTo?: string;
+  trackingLeadHours?: number;
+  trackingCenter?: { latitude: number; longitude: number };
+  trackingCenterBasis?: CycloneTaskAoiSlice["centerBasis"];
+  trackingThresholdKnots?: number;
+  forecastAdvisoryId?: string;
 };
 
 type VisibilityState = {
@@ -544,7 +562,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
   const updateTask = useCallback((taskId: string, patch: Partial<SatelliteTask>) => {
     const aoiKeys = ["aoiType", "aoiRadiusKm", "aoiWidthKm", "aoiHeightKm", "aoiLengthKm", "aoiBearingDeg", "customGeometry"];
     const touchesAoi = Object.keys(patch).some((key) => aoiKeys.includes(key));
-    const opportunityInputKeys = [...aoiKeys, "imagingStart", "imagingEnd", "sensors", "sarImagingModes", "minimumCoveragePercent", "spatialResolutionMeters", "incidenceAngleMinDeg", "incidenceAngleMaxDeg", "orbitDirectionPreference"];
+    const opportunityInputKeys = [...aoiKeys, "imagingStart", "imagingEnd", "sensors", "sarImagingModes", "minimumCoveragePercent", "spatialResolutionMeters", "incidenceAngleMinDeg", "incidenceAngleMaxDeg", "orbitDirectionPreference", "cycloneTrackingTarget"];
     const invalidatesOpportunity = Object.keys(patch).some((key) => opportunityInputKeys.includes(key));
     const opportunityReset: Partial<SatelliteTask> = invalidatesOpportunity ? {
       satelliteId: undefined, instrumentId: undefined, imagingMode: undefined, opportunityId: undefined,
@@ -554,6 +572,8 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
       simulationLevel: undefined, satelliteNoradId: undefined, closestApproachAt: undefined,
       closestSubpointLatitude: undefined, closestSubpointLongitude: undefined, minimumGroundTrackDistanceKm: undefined,
       orbitSearchRadiusKm: undefined, opportunityOrbitDirection: undefined,
+      trackingValidFrom: undefined, trackingValidTo: undefined, trackingLeadHours: undefined,
+      trackingCenterLatitude: undefined, trackingCenterLongitude: undefined, trackingCenterBasis: undefined, trackingThresholdKnots: undefined,
     } : {};
     taskMutationGeneration.current.set(taskId, (taskMutationGeneration.current.get(taskId) ?? 0) + 1);
     taskSaveControllers.current.get(taskId)?.abort();
@@ -2106,7 +2126,7 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
         <div className="task-coordinates"><span>中心坐标</span><code>{task.latitude.toFixed(6)}, {task.longitude.toFixed(6)}</code><button onClick={() => void copyCoordinates(task).then((copied) => { if (copied) { setCopiedTaskId(task.taskId); window.setTimeout(() => setCopiedTaskId((current) => current === task.taskId ? null : current), 1800); } })}>{copiedTaskId === task.taskId ? "已复制" : "复制"}</button></div>
         <div className={`task-quality ${task.aoiApproval}`}><span>{locationQualityLabels[task.locationQuality]} · ±{task.locationAccuracyKm} km</span><b>{task.aoiApproval === "source_verified" ? "来源可下发" : "已人工核对"}</b><small>{task.evidenceCount} 条证据 · {task.masterEventId}</small></div>
         <WeatherForecastCard latitude={task.latitude} longitude={task.longitude} maximumCloudPercent={task.maximumCloudPercent} compact enabled={weatherTaskId === task.taskId} onRequest={() => setWeatherTaskId(task.taskId)} />
-        {task.cycloneForecast ? <div className="task-forecast-summary"><strong>官方预报已随任务保存</strong><span>{task.cycloneForecast.track.length} 个官方中心节点{task.cycloneForecast.impactField ? ` · ${task.cycloneForecast.impactField.frames.length} 个逐时时间片` : ""} · 至 {formatTimeWithYear(task.cycloneForecast.forecastValidUntil)} UTC+08</span><small>{task.cycloneForecast.impactGeometry ? `${task.cycloneForecast.impactThreshold || "官方风圈"}已作为默认来源 AOI` : "本报次没有官方风圈；默认 AOI 仍以当前中心设置"}</small></div> : null}
+        {task.cycloneForecast ? <div className="task-forecast-summary"><strong>官方预报已随任务保存 · 动态跟踪</strong><span>{task.cycloneForecast.track.length} 个官方中心节点{task.cycloneForecast.impactField ? ` · ${task.cycloneForecast.impactField.frames.length} 个逐时时间片` : ""} · 至 {formatTimeWithYear(task.cycloneForecast.forecastValidUntil)} UTC+08</span><small>计算时按每次卫星过境时刻匹配对应预测片；官方新报次到达后必须重新计算机会。</small></div> : null}
         {task.hazard === "landslide" && task.orbitDirectionPreference ? <div className="task-landslide-summary"><strong>{task.orbitDirectionPreference === "ascending" ? "升轨" : task.orbitDirectionPreference === "descending" ? "降轨" : "任一轨向"} SAR 滑坡模板</strong><span>{task.referenceAcquisitionRequired ? "要求灾前参考影像" : "未要求灾前参考影像"} · {task.revisitCount} 次重访</span><small>地形格网是操作员确认的筛查 AOI，不是滑坡实况边界；成像机会仍需验证轨向、入射角及地形阴影/叠掩。</small></div> : null}
         <div className={`task-sync ${syncState[task.taskId]?.state ?? "local"}`} role="status">{syncState[task.taskId]?.state === "saving" ? "正在同步…" : syncState[task.taskId]?.state === "synced" ? (syncState[task.taskId]?.message ?? "已同步到业务数据库") : syncState[task.taskId]?.state === "error" ? <>同步失败：{syncState[task.taskId]?.message ?? "请重试"} <button onClick={() => onRetry(task)}>重试同步</button></> : "仅保存在本机"}</div>
     <div className="aoi-type-selector" aria-label="AOI目标类型">
@@ -2146,6 +2166,7 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
           })}<p>至少保留一种模式；修改模式会清除已选机会并重新计算覆盖结果。</p></fieldset> : null}
         </div>
         <div className="task-fields">
+          {task.hazard === "cyclone" && task.timeIndexedAoi?.length ? <label>台风动态跟踪目标<select value={task.cycloneTrackingTarget ?? "center"} onChange={(event) => onUpdate(task.taskId, { cycloneTrackingTarget: event.target.value as CycloneTrackingTarget })}><option value="center">预测中心（推荐）</option><option value="wind_field">逐时风圈范围</option><option value="uncertainty_area">逐时路径不确定区</option></select><small>预测中心适合连续路径跟踪；风圈和不确定区可能大于单景幅宽。</small></label> : null}
           {task.aoiType === "point" ? <label>点目标缓冲（公里，可为0）<input type="number" min="0" max="100" value={task.aoiRadiusKm} onChange={(event) => onUpdate(task.taskId, { aoiRadiusKm: clampNumber(event.target.value, 0, 100) })} /></label> : null}
           {task.aoiType === "circle" ? <label>圆形面半径（公里）<input type="number" min="1" max="1000" value={task.aoiRadiusKm} onChange={(event) => onUpdate(task.taskId, { aoiRadiusKm: clampNumber(event.target.value, 1, 1000) })} /></label> : null}
           {task.aoiType === "rectangle" ? <><label>矩形宽度（公里）<input type="number" min="1" max="2000" value={task.aoiWidthKm} onChange={(event) => onUpdate(task.taskId, { aoiWidthKm: clampNumber(event.target.value, 1, 2000) })} /></label><label>矩形高度（公里）<input type="number" min="1" max="2000" value={task.aoiHeightKm} onChange={(event) => onUpdate(task.taskId, { aoiHeightKm: clampNumber(event.target.value, 1, 2000) })} /></label></> : null}
@@ -2164,18 +2185,34 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
         <div className="task-targets">观测目标：{task.observationTargets.join(" · ")}</div>
         {(() => { const validation = validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requirePayload: true, requireProvenance: true }); return validation.ok ? null : <div className="task-validation" role="alert">{validation.errors.join("；")}</div>; })()}
         <div className={`visibility-box ${visibility[task.taskId]?.state ?? "idle"}`}>
-          <button onClick={() => void calculateVisibility(task)} disabled={visibility[task.taskId]?.state === "loading"}>{visibility[task.taskId]?.state === "loading" ? "正在计算轨道机会…" : "计算卫星任务机会"}</button>
+          <button onClick={() => void calculateVisibility(task)} disabled={visibility[task.taskId]?.state === "loading"}>{visibility[task.taskId]?.state === "loading" ? "正在计算轨道机会…" : task.hazard === "cyclone" && task.timeIndexedAoi?.length ? "计算台风动态跟踪机会" : "计算卫星任务机会"}</button>
           {visibility[task.taskId]?.message ? <p>{visibility[task.taskId].message}</p> : null}
           {task.opportunityId ? <p className="selected-opportunity">已选机会：{task.satelliteId} · {task.opportunityId} · {task.simulationLevel === "orbit_only" ? `轨道级粗筛${task.minimumGroundTrackDistanceKm == null ? "" : ` · 最近 ${task.minimumGroundTrackDistanceKm} km`}` : task.simulationLevel === "assumed_sensor" ? "假设传感器试算" : "传感器级仿真"}</p> : null}
           {visibility[task.taskId]?.windows.map((window, windowIndex) => <div key={window.opportunityId || `${window.start}-${windowIndex}`}>
             <strong>{window.satelliteLabel || window.satelliteId || `窗口 ${windowIndex + 1}`}{window.simulationLevel === "orbit_only" ? " · 轨道近接候选" : window.simulationLevel === "assumed_sensor" ? ` · ${window.imagingMode ?? "假设传感器"}` : ""}</strong>
             <span>{formatTimeWithYear(window.start)} — {formatTimeWithYear(window.end)} UTC+08</span>
+            {window.trackingMode === "forecast_time_indexed" ? <small className="cyclone-opportunity-time">台风 +{window.trackingLeadHours}h · {window.trackingTarget === "center" ? "预测中心" : window.trackingTarget === "wind_field" ? `${window.trackingThresholdKnots ?? "最低阈值"} kt 风圈` : "路径不确定区"} · 预测片 {formatTimeWithYear(window.trackingValidFrom!)}—{formatTimeWithYear(window.trackingValidTo!)} UTC+08 · 中心 {window.trackingCenter?.latitude.toFixed(3)}°, {window.trackingCenter?.longitude.toFixed(3)}°</small> : null}
             {window.closestApproachAt ? <small>最近近接 {formatTimeWithYear(window.closestApproachAt)} UTC+08 · 地面轨迹距 AOI 中心 {window.minimumGroundTrackDistanceKm ?? "--"} km · 高度 {window.altitudeKm ?? "--"} km</small> : null}
             <small>{window.coveragePercent == null ? (window.simulationLevel === "orbit_only" ? "真实覆盖率未计算" : "覆盖率待仿真服务返回") : `覆盖 ${window.coveragePercent}%`}{window.incidenceAngleDeg == null ? (window.simulationLevel === "orbit_only" ? " · 地面入射角未计算" : " · 入射角待验证") : ` · 地面入射角 ${window.incidenceAngleDeg}°`}{window.offNadirAngleDeg == null ? "" : ` · 离轴 ${window.offNadirAngleDeg}°`}{window.lookSide ? ` · ${window.lookSide === "left" ? "左视" : "右视"}` : ""}{window.orbitDirection ? ` · ${window.orbitDirection === "ascending" ? "升轨" : "降轨"}` : ""}</small>
             {window.spatialResolutionM != null ? <small>标称分辨率 {window.spatialResolutionLabel ?? `${window.spatialResolutionM} m`} · 标称场景 {window.nominalSceneCrossTrackKm}×{window.nominalSceneAlongTrackKm} km · 极化 {window.polarizations?.join("/") || "待提供"} · {window.parameterStatus === "provisional_assumption" ? "临时假设参数" : "用户提供参数"}</small> : null}
             {window.productLevels?.length ? <small>可选产品：{window.productLevels.map((product) => `${product.level} ${product.code}`).join(" / ")}</small> : null}
             {window.constraintNotes?.map((note) => <small className="constraint-note" key={note}>{note}</small>)}
-            <button className="choose-opportunity" onClick={() => onUpdate(task.taskId, { satelliteId: window.satelliteId, instrumentId: window.instrumentId, imagingMode: window.imagingMode, opportunityId: window.opportunityId, orbitVersion: window.orbitVersion, visibilityComputedAt: window.computedAt, incidenceAngleDeg: window.incidenceAngleDeg, offNadirAngleDeg: window.offNadirAngleDeg, opportunityLookSide: window.lookSide, opportunityCoveragePercent: window.coveragePercent, opportunitySpatialResolutionM: window.spatialResolutionM, opportunitySceneCrossTrackKm: window.nominalSceneCrossTrackKm, opportunitySceneAlongTrackKm: window.nominalSceneAlongTrackKm, sensorParameterStatus: window.parameterStatus, opportunityFootprint: window.footprintGeometry, simulationLevel: window.simulationLevel ?? "sensor_model", satelliteNoradId: window.satelliteNoradId, closestApproachAt: window.closestApproachAt, closestSubpointLatitude: window.closestSubpoint?.latitude, closestSubpointLongitude: window.closestSubpoint?.longitude, minimumGroundTrackDistanceKm: window.minimumGroundTrackDistanceKm, orbitSearchRadiusKm: window.searchRadiusKm, opportunityOrbitDirection: window.orbitDirection })}>{task.opportunityId === window.opportunityId ? "已选择" : window.simulationLevel === "orbit_only" ? "选择为轨道粗筛候选" : window.simulationLevel === "assumed_sensor" ? "选择为试算候选" : "选择此仿真机会"}</button>
+            <button className="choose-opportunity" onClick={() => onUpdate(task.taskId, {
+              satelliteId: window.satelliteId, instrumentId: window.instrumentId, imagingMode: window.imagingMode,
+              opportunityId: window.opportunityId, orbitVersion: window.orbitVersion, visibilityComputedAt: window.computedAt,
+              incidenceAngleDeg: window.incidenceAngleDeg, offNadirAngleDeg: window.offNadirAngleDeg,
+              opportunityLookSide: window.lookSide, opportunityCoveragePercent: window.coveragePercent,
+              opportunitySpatialResolutionM: window.spatialResolutionM, opportunitySceneCrossTrackKm: window.nominalSceneCrossTrackKm,
+              opportunitySceneAlongTrackKm: window.nominalSceneAlongTrackKm, sensorParameterStatus: window.parameterStatus,
+              opportunityFootprint: window.footprintGeometry, simulationLevel: window.simulationLevel ?? "sensor_model",
+              satelliteNoradId: window.satelliteNoradId, closestApproachAt: window.closestApproachAt,
+              closestSubpointLatitude: window.closestSubpoint?.latitude, closestSubpointLongitude: window.closestSubpoint?.longitude,
+              minimumGroundTrackDistanceKm: window.minimumGroundTrackDistanceKm, orbitSearchRadiusKm: window.searchRadiusKm,
+              opportunityOrbitDirection: window.orbitDirection, trackingValidFrom: window.trackingValidFrom,
+              trackingValidTo: window.trackingValidTo, trackingLeadHours: window.trackingLeadHours,
+              trackingCenterLatitude: window.trackingCenter?.latitude, trackingCenterLongitude: window.trackingCenter?.longitude,
+              trackingCenterBasis: window.trackingCenterBasis, trackingThresholdKnots: window.trackingThresholdKnots,
+            })}>{task.opportunityId === window.opportunityId ? "已选择" : window.simulationLevel === "orbit_only" ? "选择为轨道粗筛候选" : window.simulationLevel === "assumed_sensor" ? "选择为试算候选" : "选择此仿真机会"}</button>
           </div>)}
         </div>
       </article>)}
@@ -2295,6 +2332,7 @@ function createSatelliteTask(event: DisasterEvent, operatorConfirmed: boolean): 
     aoiBearingDeg: 0,
     sourceGeometry,
     cycloneForecast: event.cycloneForecast,
+    cycloneTrackingTarget: event.cycloneForecast?.impactField ? "center" : undefined,
     minimumCoveragePercent: 80,
     maximumCloudPercent: 30,
     spatialResolutionMeters: 10,
@@ -2414,6 +2452,14 @@ function migrateSatelliteTask(task: Partial<SatelliteTask>): SatelliteTask {
     forecastAdvisoryId: task.forecastAdvisoryId,
     forecastIssuedAt: task.forecastIssuedAt,
     forecastValidUntil: task.forecastValidUntil,
+    cycloneTrackingTarget: task.cycloneTrackingTarget ?? (hazard === "cyclone" && task.cycloneForecast?.impactField ? "center" : undefined),
+    trackingValidFrom: task.trackingValidFrom,
+    trackingValidTo: task.trackingValidTo,
+    trackingLeadHours: task.trackingLeadHours,
+    trackingCenterLatitude: task.trackingCenterLatitude,
+    trackingCenterLongitude: task.trackingCenterLongitude,
+    trackingCenterBasis: task.trackingCenterBasis,
+    trackingThresholdKnots: task.trackingThresholdKnots,
     minimumCoveragePercent: task.minimumCoveragePercent ?? 80,
     maximumCloudPercent: task.maximumCloudPercent ?? 30,
     spatialResolutionMeters: task.spatialResolutionMeters ?? 10,
@@ -2515,6 +2561,7 @@ function rebaseUnsyncedDraft(task: SatelliteTask, event: DisasterEvent): Satelli
     orbitDirectionPreference: task.orbitDirectionPreference,
     referenceAcquisitionRequired: task.referenceAcquisitionRequired,
     sarAnalysisMode: task.sarAnalysisMode,
+    cycloneTrackingTarget: task.cycloneTrackingTarget,
     status: "candidate",
     revision: 0,
     updatedAt: new Date().toISOString(),

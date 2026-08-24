@@ -103,6 +103,35 @@ test("accepts bounded official cyclone forecasts and rejects malformed forecast 
   assert.equal(validateSatelliteTask(task).ok, false);
 });
 
+test("requires a selected cyclone opportunity to match its canonical hourly forecast slice", async () => {
+  const { validateSatelliteTask } = await contract();
+  const task = validTask();
+  task.hazard = "cyclone";
+  task.cycloneTrackingTarget = "center";
+  task.opportunityId = "ASSUMED-TRACKING";
+  task.closestApproachAt = new Date(Date.parse(task.imagingStart) + 1_800_000).toISOString();
+  task.timeIndexedAoi = [{
+    validFrom: task.imagingStart,
+    validTo: task.imagingEnd,
+    leadHours: 12,
+    center: [130, 20],
+    centerBasis: "official_node",
+    windGeometry: { type: "Polygon", coordinates: [[[129.9, 19.9], [130.1, 19.9], [130, 20.1], [129.9, 19.9]]] },
+  }];
+  assert.match(validateSatelliteTask(task).errors.join(" "), /未绑定逐时预测片/);
+  Object.assign(task, {
+    trackingValidFrom: task.imagingStart,
+    trackingValidTo: task.imagingEnd,
+    trackingLeadHours: 12,
+    trackingCenterLatitude: 20,
+    trackingCenterLongitude: 130,
+    trackingCenterBasis: "official_node",
+  });
+  assert.equal(validateSatelliteTask(task).ok, true);
+  task.trackingCenterLongitude = 131;
+  assert.match(validateSatelliteTask(task).errors.join(" "), /不匹配/);
+});
+
 test("enforces auditable task state transitions", async () => {
   const { canTransitionTask } = await contract();
   assert.equal(canTransitionTask(null, "candidate"), true);

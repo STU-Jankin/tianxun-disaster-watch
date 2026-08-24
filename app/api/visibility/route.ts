@@ -7,6 +7,13 @@ import { buildSatelliteOrbitSnapshot } from "../../../lib/satellite-orbits";
 import { screenTleOpportunities } from "../../../lib/tle-opportunities";
 import { screenConfiguredSarOpportunities } from "../../../lib/configured-sar-opportunities";
 import type { SarImagingModeId } from "../../../lib/satellite-payloads";
+import { cycloneTaskAoiSlices, type CycloneTaskAoiSlice } from "../../../lib/cyclone-forecast";
+import {
+  cycloneTrackingTargets,
+  screenCycloneConfiguredSarOpportunities,
+  screenCycloneTleOpportunities,
+  type CycloneTrackingTarget,
+} from "../../../lib/cyclone-tracking-opportunities";
 
 export const dynamic = "force-dynamic";
 
@@ -54,6 +61,7 @@ export async function POST(request: Request) {
     if (requestTask.aoiApproval === "source_verified" && (canonical.event.dispatchEligibility !== "ready" || requestTask.aoiType !== "source")) {
       return Response.json({ state: "error", windows: [], message: "来源坐标不具备直接试算资格，请先人工核对 AOI" }, { status: 409 });
     }
+    const statelessTimeIndexedAoi = cycloneTaskAoiSlices(canonical.event.cycloneForecast, String(requestTask.imagingStart), String(requestTask.imagingEnd));
     task = {
       ...requestTask,
       eventId: canonical.event.id,
@@ -77,6 +85,10 @@ export async function POST(request: Request) {
       locationAccuracyKm: canonical.event.locationAccuracyKm,
       evidenceCount: canonical.event.evidenceCount,
       cycloneForecast: canonical.event.cycloneForecast,
+      timeIndexedAoi: statelessTimeIndexedAoi.length ? statelessTimeIndexedAoi : undefined,
+      forecastAdvisoryId: canonical.event.cycloneForecast ? `${canonical.event.cycloneForecast.source}:${canonical.event.cycloneForecast.advisory ?? canonical.event.cycloneForecast.issuedAt}` : undefined,
+      forecastIssuedAt: canonical.event.cycloneForecast?.issuedAt,
+      forecastValidUntil: canonical.event.cycloneForecast?.forecastValidUntil,
       sourceGeometry,
       eventRevision: eventRevisionFingerprint(canonical.event),
       approvedAt: new Date().toISOString(),
@@ -105,6 +117,11 @@ export async function POST(request: Request) {
     return Response.json({ state: "error", windows: [], message: "来源几何已变化，请重新建立任务" }, { status: 409 });
   }
   if (task.aoiHash !== aoiFingerprint(aoi)) return Response.json({ state: "error", windows: [], message: "AOI 指纹不一致，请重新保存任务" }, { status: 409 });
+  const trackingSlices = task.hazard === "cyclone" && task.aoiType === "source" && Array.isArray(task.timeIndexedAoi)
+    ? task.timeIndexedAoi as CycloneTaskAoiSlice[]
+    : [];
+  const trackingTarget = cycloneTrackingTarget(task.cycloneTrackingTarget);
+  const dynamicCycloneTracking = trackingSlices.length > 0;
   const endpoint = process.env.SATELLITE_VISIBILITY_API_URL;
   if (!endpoint) {
     if (!Array.isArray(task.sensors) || !task.sensors.includes("SAR")) {
@@ -117,8 +134,7 @@ export async function POST(request: Request) {
       const imagingStart = new Date(Math.max(now.getTime(), Date.parse(String(task.imagingStart))));
       const configured = satellites.some((satellite) => satellite.orbitStatus === "current" && satellite.payloadProfile && satellite.identityStatus === "configured");
       if (configured) {
-        const result = screenConfiguredSarOpportunities({
-          geometry: aoi,
+        const common = {
           imagingStart,
           imagingEnd: String(task.imagingEnd),
           satellites,
@@ -127,40 +143,56 @@ export async function POST(request: Request) {
           spatialResolutionMeters: Number(task.spatialResolutionMeters),
           minimumCoveragePercent: Number(task.minimumCoveragePercent),
           sarImagingModeIds: Array.isArray(task.sarImagingModes) ? task.sarImagingModes as SarImagingModeId[] : undefined,
-          orbitDirectionPreference: ["ascending", "descending"].includes(String(task.orbitDirectionPreference)) ? task.orbitDirectionPreference as "ascending" | "descending" : "either",
+          orbitDirectionPreference: ["ascending", "descending"].includes(String(task.orbitDirectionPreference)) ? task.orbitDirectionPreference as "ascending" | "descending" : "either" as const,
           now,
-        });
+        };
+        const result = dynamicCycloneTracking
+          ? screenCycloneConfiguredSarOpportunities({ ...common, slices: trackingSlices, target: trackingTarget, forecastAdvisoryId: String(task.forecastAdvisoryId ?? "") || undefined })
+          : screenConfiguredSarOpportunities({ ...common, geometry: aoi });
         return Response.json({
           ...result,
           schemaVersion: "tianxun.visibility.v3",
           state: "ready",
           mode: "assumed_sensor",
           message: result.windows.length
-            ? `已用 ${result.satelliteCount} 颗配置卫星生成 ${result.windows.length} 个假设传感器机会；可用于试排程，禁止自动下发${opticalPendingNote}`
-            : `已完成 ${result.satelliteCount} 颗配置卫星的假设传感器计算；当前时间窗没有同时满足入射角、分辨率和覆盖率的机会${opticalPendingNote}`,
+            ? dynamicCycloneTracking
+              ? `已按 ${"trackingSliceCount" in result ? result.trackingSliceCount : trackingSlices.length} 个逐时预测 AOI 匹配卫星过境，生成 ${result.windows.length} 个${trackingTargetLabel(trackingTarget)}跟踪机会；新报次到达后必须重算，禁止自动下发${opticalPendingNote}`
+              : `已用 ${result.satelliteCount} 颗配置卫星生成 ${result.windows.length} 个假设传感器机会；可用于试排程，禁止自动下发${opticalPendingNote}`
+            : dynamicCycloneTracking
+              ? `已完成 ${trackingSlices.length} 个逐时预测 AOI 的动态匹配；当前没有同时满足轨道、入射角、分辨率和覆盖率的${trackingTargetLabel(trackingTarget)}跟踪机会${opticalPendingNote}`
+              : `已完成 ${result.satelliteCount} 颗配置卫星的假设传感器计算；当前时间窗没有同时满足入射角、分辨率和覆盖率的机会${opticalPendingNote}`,
         }, { headers: { "Cache-Control": "no-store" } });
       }
-      const result = screenTleOpportunities({
-        geometry: aoi,
+      const common = {
         imagingStart,
         imagingEnd: String(task.imagingEnd),
         satellites,
-        orbitDirectionPreference: ["ascending", "descending"].includes(String(task.orbitDirectionPreference)) ? task.orbitDirectionPreference as "ascending" | "descending" : "either",
+        orbitDirectionPreference: ["ascending", "descending"].includes(String(task.orbitDirectionPreference)) ? task.orbitDirectionPreference as "ascending" | "descending" : "either" as const,
         searchRadiusKm: Number(process.env.TLE_ORBIT_SEARCH_RADIUS_KM ?? 350),
         now,
-      });
+      };
+      const result = dynamicCycloneTracking
+        ? screenCycloneTleOpportunities({ ...common, slices: trackingSlices, target: trackingTarget, forecastAdvisoryId: String(task.forecastAdvisoryId ?? "") || undefined })
+        : screenTleOpportunities({ ...common, geometry: aoi });
       return Response.json({
         ...result,
         schemaVersion: "tianxun.visibility.v3",
         state: "ready",
         mode: "orbit_only",
         message: result.windows.length
-          ? `已用 ${result.satelliteCount} 颗当前 TLE 生成 ${result.windows.length} 个轨道近接候选；仅供排程粗筛，不代表 SAR 可成像。`
-          : `已完成 ${result.satelliteCount} 颗卫星的 TLE 轨道粗筛，当前时间窗内未发现满足搜索半径的近接候选。`,
+          ? dynamicCycloneTracking
+            ? `已按逐时台风${trackingTargetLabel(trackingTarget)}生成 ${result.windows.length} 个动态轨道近接候选；仅供排程粗筛，不代表 SAR 可成像。`
+            : `已用 ${result.satelliteCount} 颗当前 TLE 生成 ${result.windows.length} 个轨道近接候选；仅供排程粗筛，不代表 SAR 可成像。`
+          : dynamicCycloneTracking
+            ? `已完成逐时台风${trackingTargetLabel(trackingTarget)}轨道匹配，当前时间窗内未发现近接候选。`
+            : `已完成 ${result.satelliteCount} 颗卫星的 TLE 轨道粗筛，当前时间窗内未发现满足搜索半径的近接候选。`,
       }, { headers: { "Cache-Control": "no-store" } });
     } catch (error) {
       return Response.json({ state: "error", mode: "orbit_only", windows: [], message: error instanceof Error ? error.message : "本地 TLE 轨道粗筛失败" }, { status: 503 });
     }
+  }
+  if (dynamicCycloneTracking) {
+    return Response.json({ state: "error", windows: [], message: "已配置的外部仿真接口尚未声明支持逐时移动 AOI；为防止把静态风圈误当成台风跟踪结果，本次计算已停止" }, { status: 501 });
   }
   try {
     const serviceUrl = validateSimulationEndpoint(endpoint);
@@ -185,6 +217,14 @@ export async function POST(request: Request) {
   } catch (error) {
     return Response.json({ state: "error", windows: [], message: error instanceof Error ? error.message : "可见性计算失败" }, { status: 502 });
   }
+}
+
+function cycloneTrackingTarget(value: unknown): CycloneTrackingTarget {
+  return cycloneTrackingTargets.includes(value as CycloneTrackingTarget) ? value as CycloneTrackingTarget : "center";
+}
+
+function trackingTargetLabel(value: CycloneTrackingTarget) {
+  return value === "center" ? "预测中心" : value === "wind_field" ? "风圈" : "不确定区";
 }
 
 function normalizeWindow(window: Record<string, unknown>, task: Record<string, unknown>, orbitVersion: string, computedAt: string) {

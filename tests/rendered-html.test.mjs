@@ -202,10 +202,23 @@ test("syncs a compact task draft and lets the server rebuild canonical 4D produc
   assert.match(dashboard, /compactSatelliteTaskForSync/);
   assert.doesNotMatch(dashboard, /JSON\.stringify\(\{ \.\.\.task, aoi:/);
   const draftAllowlist = sync.match(/taskDraftFields\s*=\s*\[([\s\S]*?)\]\s*as const/)?.[1] ?? "";
-  for (const canonical of ["sourceGeometry", "cycloneForecast", "timeIndexedAoi"]) assert.doesNotMatch(draftAllowlist, new RegExp(`"${canonical}"`));
+  for (const canonical of ["sourceGeometry", "cycloneForecast", "timeIndexedAoi", "trackingValidFrom", "trackingCenterLatitude"]) assert.doesNotMatch(draftAllowlist, new RegExp(`"${canonical}"`));
   assert.match(route, /readJsonObject\(request, 256 \* 1024\)/);
   assert.match(route, /const timeIndexedAoi = cycloneTaskAoiSlices/);
   assert.match(route, /timeIndexedAoi: timeIndexedAoi\.length \? timeIndexedAoi : undefined/);
+});
+
+test("computes cyclone visibility against the forecast slice valid at each satellite pass", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  const visibilityRoute = await readFile(new URL("../app/api/visibility/route.ts", import.meta.url), "utf8");
+  const tracking = await readFile(new URL("../lib/cyclone-tracking-opportunities.ts", import.meta.url), "utf8");
+  assert.match(dashboard, /台风动态跟踪目标/);
+  assert.match(dashboard, /计算台风动态跟踪机会/);
+  assert.match(visibilityRoute, /screenCycloneConfiguredSarOpportunities/);
+  assert.match(visibilityRoute, /screenCycloneTleOpportunities/);
+  assert.match(tracking, /按卫星过境时刻匹配台风/);
+  assert.match(tracking, /cycloneTrackingSliceAt/);
 });
 
 test("returns persisted canonical identities and heals stale local draft references conservatively", async () => {

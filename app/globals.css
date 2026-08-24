@@ -391,6 +391,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .task-fields label { color: #6f7c77; font-size: 8px; }
 .task-fields input, .task-fields select { display: block; width: 100%; height: 30px; margin-top: 4px; padding: 0 7px; border: 1px solid #ccd4cd; background: #fff; color: #304b44; font-size: 9px; outline: 0; }
 .task-fields input:focus, .task-fields select:focus { border-color: var(--teal); box-shadow: 0 0 0 2px #006d6318; }
+.task-fields label > small { display: block; margin-top: 4px; color: #758a9a; font-size: 7px; line-height: 1.4; }
 .payload-planning { margin: 11px 0 3px; display: grid; gap: 8px; }
 .payload-options, .sar-mode-options { margin: 0; padding: 9px; border: 1px solid #d8ded9; background: #f8faf7; }
 .payload-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
@@ -412,6 +413,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .visibility-box > button { width: 100%; padding: 7px; border: 1px solid #a9c3ba; background: #e9f2ed; color: var(--teal-dark); font-size: 8px; font-weight: 700; cursor: pointer; }.visibility-box > button:disabled { opacity: .65; cursor: wait; }
 .visibility-box > p { margin: 6px 0 0; color: #916725; font-size: 8px; line-height: 1.45; }.visibility-box > div { display: grid; grid-template-columns: auto 1fr; gap: 3px 8px; padding: 7px 2px 2px; border-top: 1px solid #dce2dd; margin-top: 6px; }.visibility-box > div strong { color: #2c534a; font-size: 8px; }.visibility-box > div span { color: #66756f; font-size: 7px; text-align: right; }.visibility-box > div small { grid-column: 1 / -1; color: #84908b; font-size: 7px; }
 .visibility-box .constraint-note { color: #8d6023; }
+.visibility-box .cyclone-opportunity-time { padding: 5px 6px; border-left: 2px solid #0874c9; background: #edf7fe; color: #155b8d; font-weight: 700; line-height: 1.5; }
 .choose-opportunity { grid-column: 1 / -1; min-height: 28px; border: 1px solid #9cc7e6; background: #edf7fe; color: #075fa8; font-size: 8px; cursor: pointer; }
 .task-undo-toast { position: fixed; left: 50%; bottom: 22px; z-index: 2000; max-width: min(520px, calc(100vw - 28px)); transform: translateX(-50%); display: flex; align-items: center; gap: 14px; padding: 10px 12px; border: 1px solid #77acd4; border-radius: 3px; background: #f8fcff; color: #244d6f; box-shadow: 0 10px 30px #07376042; font-size: 10px; }
 .task-undo-toast button { min-height: 30px; padding: 0 11px; border: 1px solid #0874c9; background: #0874c9; color: #fff; cursor: pointer; }
