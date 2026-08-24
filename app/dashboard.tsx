@@ -1679,7 +1679,7 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
   const [destinationLongitude, setDestinationLongitude] = useState("");
   const [destinationLatitude, setDestinationLatitude] = useState("");
   const [departureAt, setDepartureAt] = useState(() => toLocalInput(new Date(Math.ceil(Date.now() / 60_000) * 60_000).toISOString()));
-  const [travelSpeed, setTravelSpeed] = useState("35");
+  const [fallbackSpeed, setFallbackSpeed] = useState("35");
   const [travelMode, setTravelMode] = useState<AmapTravelMode>("driving");
   const [roadDisruptions, setRoadDisruptions] = useState<RoadDisruption[]>([]);
   const [registryDisruptions, setRegistryDisruptions] = useState<RoadDisruptionRegistryEntry[]>([]);
@@ -1765,7 +1765,7 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
       const scenario = planResponseScenario(event, {
         eventRevision: eventRevisionFingerprint(event),
         ...inputs,
-        travelSpeedKph: Number(travelSpeed),
+        travelSpeedKph: Number(fallbackSpeed),
         travelMode,
       });
       onSave(scenario);
@@ -1782,13 +1782,6 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
     setInfrastructureQueryState("idle");
     try {
       const inputs = routeInputs();
-      const validation = planResponseScenario(event, {
-        eventRevision: eventRevisionFingerprint(event),
-        ...inputs,
-        travelSpeedKph: Number(travelSpeed),
-        travelMode,
-      });
-      void validation;
       const response = await fetch("/api/routing", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1823,7 +1816,7 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
     } catch (error) {
       setRoadRoutingState("idle");
       setInfrastructureQueryState("idle");
-      setPlanError(`${error instanceof Error ? error.message : "真实道路请求失败"}；可使用下方几何降级模式继续推演。`);
+      setPlanError(`${error instanceof Error ? error.message : "真实道路请求失败"}；真实路网暂不可用时，可展开下方“直线敏感性估算”。`);
     }
   };
 
@@ -1915,13 +1908,12 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
         {event ? <>
           <div className={`response-source-quality ${event.dispatchEligibility}`}><strong>{event.dispatchEligibility === "ready" ? "事件来源已核验" : "事件需要人工复核"}</strong><span>{event.cycloneForecast?.impactField ? `${event.cycloneForecast.impactField.frames.length} 个台风逐时影响场时间片` : `${event.geometry.type} 来源几何`} · 更新 {formatTimeWithYear(event.updatedAt)} UTC+08</span></div>
           <div className="response-fields">
-            <label>出行方式<select value={travelMode} onChange={(change) => { const mode = change.target.value as AmapTravelMode; setTravelMode(mode); setTravelSpeed(mode === "walking" ? "5" : mode === "bicycling" ? "15" : mode === "electrobike" ? "25" : "35"); setRoadRoutingState("idle"); }}>{Object.entries(amapTravelModeLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+            <label>出行方式<select value={travelMode} onChange={(change) => { const mode = change.target.value as AmapTravelMode; setTravelMode(mode); setFallbackSpeed(mode === "walking" ? "5" : mode === "bicycling" ? "15" : mode === "electrobike" ? "25" : "35"); setRoadRoutingState("idle"); }}>{Object.entries(amapTravelModeLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
             <label>起点经度<input inputMode="decimal" value={originLongitude} onChange={(change) => setOriginLongitude(change.target.value)} /></label>
             <label>起点纬度<input inputMode="decimal" value={originLatitude} onChange={(change) => setOriginLatitude(change.target.value)} /></label>
             <label>目的地经度<input inputMode="decimal" value={destinationLongitude} onChange={(change) => setDestinationLongitude(change.target.value)} /></label>
             <label>目的地纬度<input inputMode="decimal" value={destinationLatitude} onChange={(change) => setDestinationLatitude(change.target.value)} /></label>
             <label>出发时间（UTC+08）<input type="datetime-local" value={departureAt} onChange={(change) => setDepartureAt(change.target.value)} /></label>
-            <label>几何降级速度（km/h）<input type="number" min="5" max="160" value={travelSpeed} onChange={(change) => setTravelSpeed(change.target.value)} /></label>
           </div>
           <div className="response-disruption-import">
             <div><strong>道路毁损与封闭</strong><span>{registryState === "loading" ? "正在读取中断台账…" : registryState === "public-read-only" ? "公网只读入口不展示内部现场上报" : registryState === "unavailable" ? "台账不可用；本次只能使用临时导入" : `有效台账 ${registryDisruptions.length} 条 · 本次临时导入 ${roadDisruptions.length} 条`}</span></div>
@@ -1941,9 +1933,13 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
           {planError ? <div className="response-plan-error" role="alert">{planError}</div> : null}
           <div className="response-generate-actions">
             <button className="response-generate" onClick={() => void generateRoad()} disabled={roadRoutingState === "loading"}>{roadRoutingState === "loading" ? "正在连接路网与基础设施…" : "生成真实道路候选"}</button>
-            <button className="response-generate-fallback" onClick={generateGeometric}>使用几何降级模式</button>
           </div>
-          {roadRoutingState === "ready" ? <div className={`response-routing-ready ${infrastructureQueryState === "ready" ? "" : "partial"}`} role="status">高德{amapTravelModeLabels[travelMode]}路线已接通；已完成灾害与 {effectiveRoadDisruptions.length} 条有效/临时道路中断复核。{infrastructureQueryState === "ready" ? "OSM 基础设施暴露查询已完成，设施结构状态仍须核验。" : infrastructureQueryState === "too_large" ? "路线范围过大，未向公共 Overpass 发起重查询，基础设施覆盖未知。" : infrastructureQueryState === "unsupported" ? "当前路线不支持公共 Overpass 查询，基础设施覆盖未知。" : "Overpass 暂不可用，路线仍已保存但基础设施覆盖未知。"}</div> : roadRoutingState === "fallback" ? <div className="response-routing-fallback" role="status">当前保存的是{amapTravelModeLabels[travelMode]}几何降级场景，不代表真实道路可通行。</div> : null}
+          <details className="response-fallback-options">
+            <summary>真实路网不可用时：直线敏感性估算</summary>
+            <p>这不是道路规划。假设速度只用于估算沿直线移动的到达时刻，以检查路线与灾害 4D 影响场的时间相交；不使用高德路况，也不能判断道路、桥梁或隧道可通行。</p>
+            <div><label>假设平均速度（km/h）<input type="number" min="5" max="160" value={fallbackSpeed} onChange={(change) => setFallbackSpeed(change.target.value)} /></label><button className="response-generate-fallback" onClick={generateGeometric}>生成直线估算</button></div>
+          </details>
+          {roadRoutingState === "ready" ? <div className={`response-routing-ready ${infrastructureQueryState === "ready" ? "" : "partial"}`} role="status">高德{amapTravelModeLabels[travelMode]}路线已接通；耗时采用高德返回值，不读取直线估算速度。已完成灾害与 {effectiveRoadDisruptions.length} 条有效/临时道路中断复核。{infrastructureQueryState === "ready" ? "OSM 基础设施暴露查询已完成，设施结构状态仍须核验。" : infrastructureQueryState === "too_large" ? "路线范围过大，未向公共 Overpass 发起重查询，基础设施覆盖未知。" : infrastructureQueryState === "unsupported" ? "当前路线不支持公共 Overpass 查询，基础设施覆盖未知。" : "Overpass 暂不可用，路线仍已保存但基础设施覆盖未知。"}</div> : roadRoutingState === "fallback" ? <div className="response-routing-fallback" role="status">当前保存的是{amapTravelModeLabels[travelMode]}直线敏感性估算，不代表真实道路可通行。</div> : null}
         </> : <p className="response-select-hint">从当前监测事件中选择一个主事件，或在灾害详情中点击“建立处置推演场景”。</p>}
       </section>
       <section className="response-scenarios">
@@ -1954,7 +1950,7 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
           const stale = !currentEvent || eventRevisionFingerprint(currentEvent) !== scenario.eventRevision;
           const selectedRoute = scenario.routes.find((route) => route.routeId === scenario.selectedRouteId) ?? scenario.routes[0];
           return <article key={scenario.scenarioId} className={`response-scenario ${activeScenarioId === scenario.scenarioId ? "active" : ""}`}>
-            <div className="response-scenario-title"><div><span>{hazardMeta[scenario.hazard]?.label ?? scenario.hazard} · {amapTravelModeLabels[scenario.travelMode ?? "driving"]}</span><strong>{scenario.title}</strong><small>出发 {formatTimeWithYear(scenario.departureAt)} UTC+08 · {scenario.router === "geometric_preview_v1" ? "几何预览 v1" : "高德多方式真实道路 v1"}</small></div><button onClick={() => onRemove(scenario.scenarioId)} aria-label={`删除处置推演 ${scenario.title}`}>删除</button></div>
+            <div className="response-scenario-title"><div><span>{hazardMeta[scenario.hazard]?.label ?? scenario.hazard} · {amapTravelModeLabels[scenario.travelMode ?? "driving"]}</span><strong>{scenario.title}</strong><small>出发 {formatTimeWithYear(scenario.departureAt)} UTC+08 · {scenario.router === "geometric_preview_v1" ? "直线敏感性估算 v1" : "高德多方式真实道路 v1"}</small></div><button onClick={() => onRemove(scenario.scenarioId)} aria-label={`删除处置推演 ${scenario.title}`}>删除</button></div>
             {stale ? <div className="response-stale" role="status">事件版本已变化；旧路线仅供回放，必须按当前影响场重新生成。</div> : null}
             <div className="response-route-options" role="group" aria-label="候选路线">
               {scenario.routes.map((route) => <button key={route.routeId} className={`${route.status} ${route.routeId === scenario.selectedRouteId ? "active" : ""}`} onClick={() => onSelectRoute(scenario.scenarioId, route.routeId)} aria-pressed={route.routeId === scenario.selectedRouteId}>

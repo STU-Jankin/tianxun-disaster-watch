@@ -272,6 +272,11 @@ test("adds a bounded phase-three response simulation, disruption review and infr
   assert.match(dashboard, /建立处置推演场景/);
   assert.match(dashboard, /真实道路、毁损台账与基础设施暴露第三阶段/);
   assert.match(dashboard, /生成真实道路候选/);
+  assert.match(dashboard, /真实路网不可用时：直线敏感性估算/);
+  assert.match(dashboard, /耗时采用高德返回值，不读取直线估算速度/);
+  assert.doesNotMatch(dashboard, /几何降级速度/);
+  const realRoadBlock = dashboard.match(/const generateRoad = async[\s\S]*?const importRoadDisruptions/)?.[0] ?? "";
+  assert.doesNotMatch(realRoadBlock, /fallbackSpeed|planResponseScenario/);
   assert.match(dashboard, /设施结构状态：未核验/);
   assert.match(dashboard, /OSM 设施暴露/);
   assert.match(dashboard, /道路毁损与封闭/);

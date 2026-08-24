@@ -73,7 +73,7 @@ sudoedit /etc/tianxun/notifier.env
 sudo systemctl restart tianxun-engine
 ```
 
-把已申请的 FIRMS key 放入 `engine.env`。`notifier.env` 默认阈值为 65；红色/橙色事件即使分数略低也会进入通知。
+把已申请的 FIRMS key 和高德 Web 服务 Key（`AMAP_WEB_SERVICE_KEY`）放入 `engine.env`。高德 JavaScript Key 不能替代 Web 服务 Key；该值只保存在服务器端，浏览器通过 `/api/routing` 受控调用。`notifier.env` 默认阈值为 65；红色/橙色事件即使分数略低也会进入通知。
 
 首次成功采集只建立基线并发送一条汇总，不会把现有数百条事件逐条轰炸飞书。之后仅推送：
 

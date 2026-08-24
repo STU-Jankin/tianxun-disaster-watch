@@ -34,7 +34,7 @@ export async function POST(request: Request) {
     const destination = parseCoordinate(body.destination, "目的地");
     const mode = parseMode(body.mode);
     if (!isAmapDomesticRoutingCoordinate(origin) || !isAmapDomesticRoutingCoordinate(destination)) {
-      return Response.json({ state: "unsupported", provider: "高德地图", message: "当前高德国内 Web 服务只用于中国境内道路；境外继续使用几何降级模式" } satisfies AmapRoadRoutingResponse, { status: 422 });
+      return Response.json({ state: "unsupported", provider: "高德地图", message: "当前高德国内 Web 服务只用于中国境内道路；境外只能使用明确标注为非道路规划的直线敏感性估算" } satisfies AmapRoadRoutingResponse, { status: 422 });
     }
     if (haversineKm(origin, destination) < 0.2) throw new ApiInputError("起点与目的地至少相距 0.2 km", 400);
     const directDistanceKm = haversineKm(origin, destination);

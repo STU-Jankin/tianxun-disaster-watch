@@ -121,7 +121,7 @@ export function planResponseScenario(event: DisasterEvent, options: {
   const departure = Date.parse(options.departureAt);
   if (!Number.isFinite(departure)) throw new Error("出发时间无效");
   const speed = Number(options.travelSpeedKph ?? 35);
-  if (!Number.isFinite(speed) || speed < 5 || speed > 160) throw new Error("仿真速度必须在 5–160 km/h 之间");
+  if (!Number.isFinite(speed) || speed < 5 || speed > 160) throw new Error("直线估算速度必须在 5–160 km/h 之间");
   if (haversineKm(origin, destination) < 0.5) throw new Error("起点与目的地至少相距 0.5 km");
 
   const slices = eventHazardSlices(event);
@@ -160,7 +160,7 @@ export function planResponseScenario(event: DisasterEvent, options: {
     selectedRouteId: selected.routeId,
     routes,
     sourceStatus: event.dispatchEligibility === "ready" ? "verified" : "review_required",
-    disclaimer: "几何避险仿真，不代表真实道路可通行性；正式处置前必须接入权威路网、交通管制与现场核验。",
+    disclaimer: "直线几何敏感性估算，不代表真实道路或预计耗时；正式处置前必须使用权威路网、交通管制与现场核验。",
   };
 }
 
