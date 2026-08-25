@@ -32,6 +32,9 @@ import { infrastructureKindLabel, isInfrastructureAssessment, type Infrastructur
 import { deriveLandslideWorkflow, landslideSarTemplates, type LandslideSarTemplate, type LandslideTerrainResult, type LandslideTerrainScreening } from "../lib/landslide-planning";
 import { sarImagingModeOptions, sarPayloadProfiles, type SarImagingModeId } from "../lib/satellite-payloads";
 import { cycloneTrackingGeometry, cycloneTrackingSliceAt, nearestCycloneFrameIndex, type CycloneTrackingTarget } from "../lib/cyclone-tracking-target";
+import type { MissionPlanningProblem, MissionPlanningSummary, PlanningConstraintAssessment } from "../lib/mission-planning";
+import { emptySchedulingManualRules, schedulingOpportunityRef, type MultiTaskSchedule, type SchedulingComparison, type SchedulingManualRules } from "../lib/mission-scheduler";
+import { planningScenarioMatchesProblems, planningScenarioSummary, type PlanningScenarioRecord, type PlanningScenarioSummary } from "../lib/planning-scenarios";
 
 type ApiResponse = {
   events: DisasterEvent[];
@@ -203,6 +206,7 @@ type VisibilityWindow = {
   aoiRadiusKm?: number;
   candidateThresholdKm?: number;
   constraintNotes?: string[];
+  constraintAssessment?: PlanningConstraintAssessment;
   trackingMode?: "forecast_time_indexed";
   trackingTarget?: CycloneTrackingTarget;
   trackingValidFrom?: string;
@@ -219,6 +223,22 @@ type VisibilityState = {
   mode?: "orbit_only" | "assumed_sensor" | "sensor_model";
   message?: string;
   windows: VisibilityWindow[];
+  planningSummary?: MissionPlanningSummary;
+  planningProblem?: MissionPlanningProblem;
+};
+
+type JointSchedulingState = {
+  state: "idle" | "loading" | "ready" | "error";
+  comparison?: SchedulingComparison;
+  message?: string;
+};
+
+type PlanningScenarioLibraryState = {
+  state: "loading" | "ready" | "saving" | "error";
+  summaries: PlanningScenarioSummary[];
+  active?: PlanningScenarioRecord;
+  message?: string;
+  comparison?: { left: PlanningScenarioRecord; right: PlanningScenarioRecord };
 };
 
 type SatelliteOrbitView = {
@@ -2137,6 +2157,12 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
 
 function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActivate, onUpdate, onRemove, onClose, onRetry }: { tasks: SatelliteTask[]; syncState: Record<string, TaskSyncState>; storageMode: TaskStorageMode; fleet: SatelliteFleetState; activeTaskId: string | null; onActivate: (taskId: string) => void; onUpdate: (taskId: string, patch: Partial<SatelliteTask>) => void; onRemove: (taskId: string) => void; onClose: () => void; onRetry: (task: SatelliteTask) => void }) {
   const [visibility, setVisibility] = useState<Record<string, VisibilityState>>({});
+  const [scheduling, setScheduling] = useState<JointSchedulingState>({ state: "idle" });
+  const [manualRules, setManualRules] = useState<SchedulingManualRules>(() => emptySchedulingManualRules());
+  const [scenarioName, setScenarioName] = useState("联合试排方案");
+  const [scenarioLibrary, setScenarioLibrary] = useState<PlanningScenarioLibraryState>({ state: "loading", summaries: [] });
+  const [compareLeftId, setCompareLeftId] = useState("");
+  const [compareRightId, setCompareRightId] = useState("");
   const [copiedTaskId, setCopiedTaskId] = useState<string | null>(null);
   const [exportError, setExportError] = useState("");
   const [aoiImportError, setAoiImportError] = useState<Record<string, string>>({});
@@ -2163,6 +2189,9 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
     incidenceAngleMaxDeg: task.incidenceAngleMaxDeg,
     orbitDirectionPreference: task.orbitDirectionPreference,
     cycloneTrackingTarget: task.cycloneTrackingTarget,
+    priority: task.priority,
+    revisitCount: task.revisitCount,
+    deliveryDeadline: task.deliveryDeadline,
   })])), [tasks]);
   const previousVisibilityInputKeys = useRef(visibilityInputKeys);
   useEffect(() => {
@@ -2172,9 +2201,23 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
     if (changed.size || removed) {
       changed.forEach((taskId) => visibilityRequestGeneration.current.set(taskId, (visibilityRequestGeneration.current.get(taskId) ?? 0) + 1));
       setVisibility((current) => Object.fromEntries(Object.entries(current).filter(([taskId]) => taskId in visibilityInputKeys && !changed.has(taskId))));
+      setScheduling({ state: "idle" });
+      setManualRules(emptySchedulingManualRules());
+      setScenarioLibrary((current) => ({ ...current, active: undefined, comparison: undefined, message: undefined }));
     }
     previousVisibilityInputKeys.current = visibilityInputKeys;
   }, [visibilityInputKeys]);
+  useEffect(() => {
+    let stopped = false;
+    void fetch("/api/planning/scenarios", { cache: "no-store" }).then(async (response) => {
+      const result = await response.json() as { scenarios?: PlanningScenarioSummary[]; error?: string };
+      if (!response.ok) throw new Error(result.error || `方案库读取失败（HTTP ${response.status}）`);
+      if (!stopped) setScenarioLibrary({ state: "ready", summaries: result.scenarios ?? [] });
+    }).catch((error) => {
+      if (!stopped) setScenarioLibrary({ state: "error", summaries: [], message: error instanceof Error ? error.message : "方案库暂不可用" });
+    });
+    return () => { stopped = true; };
+  }, []);
   useEffect(() => {
     closeRef.current?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
@@ -2191,6 +2234,11 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
   const exportableTasks = tasks.filter((task) => validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requirePayload: true, requireProvenance: true }).ok && syncState[task.taskId]?.state === "synced" && ["candidate", "reviewed"].includes(task.status));
+  const planningProblems = useMemo(() => tasks
+    .map((task) => visibility[task.taskId]?.planningProblem)
+    .filter((problem): problem is MissionPlanningProblem => Boolean(problem)), [tasks, visibility]);
+  const recommendedSchedule = scheduling.comparison?.recommendedAlgorithm === "priority_greedy_v1" ? scheduling.comparison.greedy : scheduling.comparison?.optimized;
+  const manualRuleCount = manualRules.lockedOpportunityRefs.length + manualRules.excludedOpportunityRefs.length + Object.keys(manualRules.forcedSatelliteByTask).length + Object.keys(manualRules.forcedImagingModeByTask).length;
   const exportableCount = exportableTasks.length;
   const exportable = exportableCount > 0;
   const exportValidated = async (format: ExportFormat) => {
@@ -2216,20 +2264,136 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
   const calculateVisibility = async (task: SatelliteTask) => {
     const requestGeneration = (visibilityRequestGeneration.current.get(task.taskId) ?? 0) + 1;
     visibilityRequestGeneration.current.set(task.taskId, requestGeneration);
+    setScheduling({ state: "idle" });
+    setManualRules(emptySchedulingManualRules());
+    setScenarioLibrary((current) => ({ ...current, active: undefined, comparison: undefined, message: undefined }));
     setVisibility((current) => ({ ...current, [task.taskId]: { state: "loading", windows: [] } }));
     try {
       const requestBody = storageMode === "public-read-only"
         ? compactSatelliteTaskForSync(task as unknown as Record<string, unknown>)
         : { taskId: task.taskId, revision: task.revision };
       const response = await fetch("/api/visibility", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody) });
-      const result = await response.json() as { state?: VisibilityState["state"]; mode?: VisibilityState["mode"]; message?: string; windows?: VisibilityWindow[]; orbitVersion?: string; computedAt?: string };
+      const result = await response.json() as { state?: VisibilityState["state"]; mode?: VisibilityState["mode"]; message?: string; windows?: VisibilityWindow[]; orbitVersion?: string; computedAt?: string; planningSummary?: MissionPlanningSummary; planningProblem?: MissionPlanningProblem };
       const windows = (result.windows ?? []).map((window) => ({ ...window, orbitVersion: window.orbitVersion ?? result.orbitVersion, computedAt: window.computedAt ?? result.computedAt }));
       if (visibilityRequestGeneration.current.get(task.taskId) !== requestGeneration) return;
-      setVisibility((current) => ({ ...current, [task.taskId]: { state: result.state ?? (response.ok ? "ready" : "error"), mode: result.mode, message: result.message, windows } }));
+      setVisibility((current) => ({ ...current, [task.taskId]: { state: result.state ?? (response.ok ? "ready" : "error"), mode: result.mode, message: result.message, windows, planningSummary: result.planningSummary, planningProblem: result.planningProblem } }));
     } catch {
       if (visibilityRequestGeneration.current.get(task.taskId) !== requestGeneration) return;
       setVisibility((current) => ({ ...current, [task.taskId]: { state: "error", message: "无法连接可见性计算接口", windows: [] } }));
     }
+  };
+  const runJointScheduling = async () => {
+    if (!planningProblems.length) {
+      setScheduling({ state: "error", message: "请先为至少一个任务计算卫星机会" });
+      return;
+    }
+    setScheduling({ state: "loading" });
+    try {
+      const response = await fetch("/api/planning/schedule", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ problems: planningProblems, transitionBufferSeconds: 120, manualRules }),
+      });
+      const result = await response.json() as SchedulingComparison & { error?: string };
+      if (!response.ok) throw new Error(result.error || `联合试排失败（HTTP ${response.status}）`);
+      setScheduling({ state: "ready", comparison: result });
+    } catch (error) {
+      setScheduling({ state: "error", message: error instanceof Error ? error.message : "联合试排接口不可用" });
+    }
+  };
+  const changeManualRules = (change: (current: SchedulingManualRules) => SchedulingManualRules) => {
+    setManualRules(change);
+    setScheduling({ state: "idle" });
+    setScenarioLibrary((current) => ({ ...current, active: undefined, comparison: undefined, message: undefined }));
+  };
+  const setOpportunityRule = (reference: string, rule: "lock" | "exclude") => changeManualRules((current) => {
+    const locked = new Set(current.lockedOpportunityRefs);
+    const excluded = new Set(current.excludedOpportunityRefs);
+    if (rule === "lock") {
+      if (locked.has(reference)) locked.delete(reference); else { locked.add(reference); excluded.delete(reference); }
+    } else if (excluded.has(reference)) excluded.delete(reference); else { excluded.add(reference); locked.delete(reference); }
+    return { ...current, lockedOpportunityRefs: [...locked].sort(), excludedOpportunityRefs: [...excluded].sort() };
+  });
+  const setForcedRule = (taskId: string, field: "satellite" | "mode", value: string) => changeManualRules((current) => {
+    const key = field === "satellite" ? "forcedSatelliteByTask" : "forcedImagingModeByTask";
+    const next = { ...current[key] };
+    if (value) next[taskId] = value; else delete next[taskId];
+    return { ...current, [key]: next };
+  });
+  const fetchPlanningScenario = async (scenarioId: string) => {
+    const response = await fetch(`/api/planning/scenarios?scenarioId=${encodeURIComponent(scenarioId)}`, { cache: "no-store" });
+    const result = await response.json() as { scenario?: PlanningScenarioRecord; error?: string };
+    if (!response.ok || !result.scenario) throw new Error(result.error || `规划方案读取失败（HTTP ${response.status}）`);
+    return result.scenario;
+  };
+  const savePlanningScenarioVersion = async () => {
+    if (!scheduling.comparison || !planningProblems.length) return;
+    setScenarioLibrary((current) => ({ ...current, state: "saving", message: undefined }));
+    try {
+      const response = await fetch("/api/planning/scenarios", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: scenarioName,
+          problems: planningProblems,
+          manualRules,
+          transitionBufferSeconds: 120,
+          seriesId: scenarioLibrary.active?.seriesId,
+          parentScenarioId: scenarioLibrary.active?.scenarioId,
+        }),
+      });
+      const result = await response.json() as { scenario?: PlanningScenarioRecord; error?: string };
+      if (!response.ok || !result.scenario) throw new Error(result.error || `方案保存失败（HTTP ${response.status}）`);
+      const summary = planningScenarioSummary(result.scenario);
+      setManualRules(result.scenario.manualRules);
+      setScheduling({ state: "ready", comparison: result.scenario.comparison });
+      setScenarioLibrary((current) => ({
+        ...current,
+        state: "ready",
+        active: result.scenario,
+        message: `已保存 ${result.scenario!.name} v${result.scenario!.version}`,
+        summaries: [summary, ...current.summaries.filter((item) => item.scenarioId !== summary.scenarioId)].slice(0, 100),
+      }));
+    } catch (error) {
+      setScenarioLibrary((current) => ({ ...current, state: "error", message: error instanceof Error ? error.message : "方案保存失败" }));
+    }
+  };
+  const loadPlanningScenario = async (scenarioId: string) => {
+    setScenarioLibrary((current) => ({ ...current, state: "loading", message: undefined }));
+    try {
+      const scenario = await fetchPlanningScenario(scenarioId);
+      if (!planningScenarioMatchesProblems(scenario, planningProblems.map((problem) => problem.problemId))) throw new Error("该版本使用的任务或机会已经变化，只能参与历史对比，不能恢复为当前工作方案");
+      setManualRules(scenario.manualRules);
+      setScheduling({ state: "ready", comparison: scenario.comparison });
+      setScenarioName(scenario.name);
+      setScenarioLibrary((current) => ({ ...current, state: "ready", active: scenario, message: `已恢复 ${scenario.name} v${scenario.version}` }));
+    } catch (error) {
+      setScenarioLibrary((current) => ({ ...current, state: "error", message: error instanceof Error ? error.message : "方案恢复失败" }));
+    }
+  };
+  const comparePlanningScenarios = async () => {
+    if (!compareLeftId || !compareRightId || compareLeftId === compareRightId) {
+      setScenarioLibrary((current) => ({ ...current, message: "请选择两个不同的方案版本" }));
+      return;
+    }
+    setScenarioLibrary((current) => ({ ...current, state: "loading", message: undefined }));
+    try {
+      const [left, right] = await Promise.all([fetchPlanningScenario(compareLeftId), fetchPlanningScenario(compareRightId)]);
+      setScenarioLibrary((current) => ({ ...current, state: "ready", comparison: { left, right } }));
+    } catch (error) {
+      setScenarioLibrary((current) => ({ ...current, state: "error", message: error instanceof Error ? error.message : "方案对比失败" }));
+    }
+  };
+  const exportCurrentPlanningScenario = () => {
+    if (!scheduling.comparison) return;
+    downloadJsonArtifact({
+      schemaVersion: "tianxun.planning.workbench-export/v1",
+      exportedAt: new Date().toISOString(),
+      status: "simulation_only",
+      problemIds: planningProblems.map((problem) => problem.problemId),
+      manualRules,
+      comparison: scheduling.comparison,
+    }, `tianxun-planning-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
   };
   return <aside ref={panelRef} className="task-panel" role="dialog" aria-modal="true" aria-labelledby="task-panel-title">
     <div className="task-panel-heading">
@@ -2242,6 +2406,48 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
       <button disabled={!exportable} title={exportable ? `导出 ${exportableCount} 个已通过任务` : "没有通过校验且已同步的规划任务"} onClick={() => void exportValidated("csv")}>CSV</button>
       <button disabled={!exportable} title={exportable ? `导出 ${exportableCount} 个已通过任务` : "没有通过校验且已同步的规划任务"} onClick={() => void exportValidated("geojson")}>GeoJSON</button>
     </div>
+    <section className={`joint-schedule ${scheduling.state}`} aria-labelledby="joint-schedule-title">
+      <div className="joint-schedule-heading">
+        <div><strong id="joint-schedule-title">多任务联合试排</strong><span>{planningProblems.length}/{tasks.length} 个任务已有机会</span></div>
+        <button disabled={!planningProblems.length || scheduling.state === "loading"} onClick={() => void runJointScheduling()}>{scheduling.state === "loading" ? "正在比较算法…" : "运行试排"}</button>
+      </div>
+      <small>比较优先级贪心与有界约束搜索；同星任务预留 120 秒转换缓冲。结果仅用于仿真，不改任务状态、不自动下发。</small>
+      {planningProblems.length ? <details className="joint-manual-rules">
+        <summary>人工规则 <b>{manualRuleCount}</b><span>锁定、排除或限定任务</span></summary>
+        <div className="joint-task-rules">{planningProblems.map((problem) => {
+          const satellites = [...new Set(problem.opportunities.map((opportunity) => opportunity.satelliteId))].sort();
+          const modes = [...new Set(problem.opportunities.flatMap((opportunity) => opportunity.imagingMode ? [opportunity.imagingMode] : []))].sort();
+          return <div key={problem.problemId}><strong>{problem.task.title}</strong><label>指定卫星<select value={manualRules.forcedSatelliteByTask[problem.task.taskId] ?? ""} onChange={(event) => setForcedRule(problem.task.taskId, "satellite", event.target.value)}><option value="">自动选择</option>{satellites.map((satellite) => <option key={satellite}>{satellite}</option>)}</select></label><label>指定模式<select value={manualRules.forcedImagingModeByTask[problem.task.taskId] ?? ""} onChange={(event) => setForcedRule(problem.task.taskId, "mode", event.target.value)}><option value="">自动选择</option>{modes.map((mode) => <option key={mode}>{mode}</option>)}</select></label></div>;
+        })}</div>
+        <button className="clear-manual-rules" disabled={!manualRuleCount} onClick={() => changeManualRules(() => emptySchedulingManualRules())}>清空全部人工规则</button>
+        <small>单个机会的“锁定/排除”按钮位于对应任务的可见机会下方。冲突锁定会被服务端拒绝，不会静默改写。</small>
+      </details> : null}
+      {scheduling.message ? <p role="alert">{scheduling.message}</p> : null}
+      {scheduling.comparison && recommendedSchedule ? <div className="joint-schedule-result">
+        <div className="schedule-score-row">
+          <span>贪心 <b>{scheduling.comparison.greedy.objectiveScore}</b></span>
+          <span>有界搜索 <b>{scheduling.comparison.optimized.objectiveScore}</b></span>
+          <span>采用 <b>{scheduling.comparison.recommendedAlgorithm === "bounded_constraint_search_v1" ? "有界搜索" : "贪心"}</b></span>
+        </div>
+        <p>{recommendedSchedule.summary.assignmentCount}/{recommendedSchedule.summary.requestedAssignments} 次观测已排入 · {recommendedSchedule.summary.scheduledTaskCount}/{recommendedSchedule.summary.taskCount} 个任务覆盖 · {recommendedSchedule.summary.conditionalAssignmentCount} 个条件机会</p>
+        <ScheduleTimeline schedule={recommendedSchedule} onActivate={onActivate} />
+        {recommendedSchedule.assignments.length ? <div className="schedule-assignments">{recommendedSchedule.assignments.slice(0, 12).map((assignment) => <button key={assignment.assignmentId} onClick={() => onActivate(assignment.taskId)} title="设为当前任务并在地图查看">
+          <b>{assignment.taskTitle}{assignment.manuallyLocked ? <i>已锁定</i> : null}</b><span>{assignment.satelliteId} · {formatTimeWithYear(assignment.start)} UTC+08</span><small>{assignment.imagingMode ?? assignment.instrumentId ?? "模式待定"} · {assignment.constraintDecision === "eligible" ? "约束已满足" : "条件机会"}</small>
+        </button>)}</div> : <p>当前没有可排入的候选机会。</p>}
+        {recommendedSchedule.assignments.length > 12 ? <small>另有 {recommendedSchedule.assignments.length - 12} 个安排未在此处展开。</small> : null}
+        {recommendedSchedule.unassigned.length ? <details><summary>{recommendedSchedule.unassigned.length} 个任务未满足全部重访</summary>{recommendedSchedule.unassigned.map((item) => <p key={item.taskId}>{item.taskTitle}：已排 {item.assigned}/{item.requested} 次 · {item.reason === "no_trial_eligible_opportunity" ? "无可进入试排的机会" : item.reason === "filtered_by_manual_rules" ? "已被人工卫星、模式或排除规则过滤" : item.reason === "revisit_target_partially_met" ? "仅部分满足重访次数" : "目标函数未选中"}</p>)}</details> : null}
+        <div className="planning-version-actions"><label>方案名称<input value={scenarioName} maxLength={80} onChange={(event) => setScenarioName(event.target.value)} /></label><button onClick={() => void savePlanningScenarioVersion()} disabled={scenarioLibrary.state === "saving" || scenarioName.trim().length < 2}>{scenarioLibrary.state === "saving" ? "正在保存…" : scenarioLibrary.active ? `保存为新版本 v${scenarioLibrary.active.version + 1}` : "保存首个版本 v1"}</button><button onClick={exportCurrentPlanningScenario}>导出当前方案 JSON</button></div>
+        <small>{scheduling.comparison.note}</small>
+      </div> : null}
+      <details className="planning-scenario-library">
+        <summary>方案版本库 <b>{scenarioLibrary.summaries.length}</b><span>不可变仿真快照</span></summary>
+        {scenarioLibrary.message ? <p role={scenarioLibrary.state === "error" ? "alert" : "status"}>{scenarioLibrary.message}</p> : null}
+        {scenarioLibrary.summaries.length ? <div className="planning-version-list">{scenarioLibrary.summaries.slice(0, 12).map((summary) => <div key={summary.scenarioId}><span>{summary.name} · v{summary.version}</span><small>{formatTimeWithYear(summary.createdAt)} UTC+08 · 得分 {summary.objectiveScore} · {summary.assignmentCount} 次观测</small><button disabled={scenarioLibrary.state === "loading"} onClick={() => void loadPlanningScenario(summary.scenarioId)}>恢复此版本</button></div>)}</div> : <small>{scenarioLibrary.state === "loading" ? "正在读取方案库…" : "尚未保存方案版本。"}</small>}
+        {scenarioLibrary.summaries.length >= 2 ? <div className="planning-version-compare"><select aria-label="对比基准版本" value={compareLeftId} onChange={(event) => setCompareLeftId(event.target.value)}><option value="">选择基准版本</option>{scenarioLibrary.summaries.map((summary) => <option key={summary.scenarioId} value={summary.scenarioId}>{summary.name} v{summary.version}</option>)}</select><select aria-label="对比目标版本" value={compareRightId} onChange={(event) => setCompareRightId(event.target.value)}><option value="">选择目标版本</option>{scenarioLibrary.summaries.map((summary) => <option key={summary.scenarioId} value={summary.scenarioId}>{summary.name} v{summary.version}</option>)}</select><button onClick={() => void comparePlanningScenarios()} disabled={scenarioLibrary.state === "loading"}>对比所选版本</button></div> : null}
+        {scenarioLibrary.comparison ? <PlanningScenarioDiff left={scenarioLibrary.comparison.left} right={scenarioLibrary.comparison.right} /> : null}
+        <small>“恢复”只恢复人工规则和仿真结果；任务或机会版本变化时会拒绝恢复，但仍可用于历史对比。</small>
+      </details>
+    </section>
     <details className={`orbit-fleet ${fleet.state}`}>
       <summary><span>SAR仿真轨道</span><strong>{fleet.state === "loading" ? "读取中" : `${fleet.current}/${fleet.satellites.length || 6} 当前可用`}</strong></summary>
       <div className="orbit-fleet-body">
@@ -2333,6 +2539,7 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
         <div className={`visibility-box ${visibility[task.taskId]?.state ?? "idle"}`}>
           <button onClick={() => void calculateVisibility(task)} disabled={visibility[task.taskId]?.state === "loading"}>{visibility[task.taskId]?.state === "loading" ? "正在计算轨道机会…" : task.hazard === "cyclone" && task.timeIndexedAoi?.length ? "计算台风动态跟踪机会" : "计算卫星任务机会"}</button>
           {visibility[task.taskId]?.message ? <p>{visibility[task.taskId].message}</p> : null}
+          {visibility[task.taskId]?.planningSummary ? <p className="planning-summary">规划约束：{visibility[task.taskId].planningSummary!.eligible + visibility[task.taskId].planningSummary!.conditional} 个可进入试排 · {visibility[task.taskId].planningSummary!.conditional} 个待补工程约束 · {visibility[task.taskId].planningSummary!.dispatchable} 个可直接下发</p> : null}
           {task.opportunityId ? <p className="selected-opportunity">已选机会：{task.satelliteId} · {task.opportunityId} · {task.simulationLevel === "orbit_only" ? `轨道级粗筛${task.minimumGroundTrackDistanceKm == null ? "" : ` · 最近 ${task.minimumGroundTrackDistanceKm} km`}` : task.simulationLevel === "assumed_sensor" ? "假设传感器试算" : "传感器级仿真"}</p> : null}
           {visibility[task.taskId]?.windows.map((window, windowIndex) => <div key={window.opportunityId || `${window.start}-${windowIndex}`}>
             <strong>{window.satelliteLabel || window.satelliteId || `窗口 ${windowIndex + 1}`}{window.simulationLevel === "orbit_only" ? " · 轨道近接候选" : window.simulationLevel === "assumed_sensor" ? ` · ${window.imagingMode ?? "假设传感器"}` : ""}</strong>
@@ -2342,7 +2549,14 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
             <small>{window.coveragePercent == null ? (window.simulationLevel === "orbit_only" ? "真实覆盖率未计算" : "覆盖率待仿真服务返回") : `覆盖 ${window.coveragePercent}%`}{window.incidenceAngleDeg == null ? (window.simulationLevel === "orbit_only" ? " · 地面入射角未计算" : " · 入射角待验证") : ` · 地面入射角 ${window.incidenceAngleDeg}°`}{window.offNadirAngleDeg == null ? "" : ` · 离轴 ${window.offNadirAngleDeg}°`}{window.lookSide ? ` · ${window.lookSide === "left" ? "左视" : "右视"}` : ""}{window.orbitDirection ? ` · ${window.orbitDirection === "ascending" ? "升轨" : "降轨"}` : ""}</small>
             {window.spatialResolutionM != null ? <small>标称分辨率 {window.spatialResolutionLabel ?? `${window.spatialResolutionM} m`} · 标称场景 {window.nominalSceneCrossTrackKm}×{window.nominalSceneAlongTrackKm} km · 极化 {window.polarizations?.join("/") || "待提供"} · {window.parameterStatus === "provisional_assumption" ? "临时假设参数" : "用户提供参数"}</small> : null}
             {window.productLevels?.length ? <small>可选产品：{window.productLevels.map((product) => `${product.level} ${product.code}`).join(" / ")}</small> : null}
+            {window.constraintAssessment ? <small className={`planning-decision ${window.constraintAssessment.decision}`}><b>{window.constraintAssessment.decision === "eligible" ? "约束已满足" : window.constraintAssessment.decision === "conditional" ? "可试排 · 待补工程约束" : "不满足规划约束"}</b>{window.constraintAssessment.findings.length ? ` · ${window.constraintAssessment.findings.slice(0, 2).map((finding) => finding.message).join("；")}${window.constraintAssessment.findings.length > 2 ? `；另 ${window.constraintAssessment.findings.length - 2} 项` : ""}` : " · 当前已登记约束均通过"}</small> : null}
             {window.constraintNotes?.map((note) => <small className="constraint-note" key={note}>{note}</small>)}
+            {window.constraintAssessment?.eligibleForTrialSchedule && visibility[task.taskId]?.planningProblem ? (() => {
+              const reference = schedulingOpportunityRef(visibility[task.taskId].planningProblem!.problemId, window.opportunityId);
+              const locked = manualRules.lockedOpportunityRefs.includes(reference);
+              const excluded = manualRules.excludedOpportunityRefs.includes(reference);
+              return <div className="opportunity-manual-actions"><button className={locked ? "active lock" : ""} aria-pressed={locked} onClick={() => setOpportunityRule(reference, "lock")}>{locked ? "已锁定" : "锁定机会"}</button><button className={excluded ? "active exclude" : ""} aria-pressed={excluded} onClick={() => setOpportunityRule(reference, "exclude")}>{excluded ? "已排除" : "排除机会"}</button></div>;
+            })() : null}
             <button className="choose-opportunity" onClick={() => {
               onUpdate(task.taskId, {
               satelliteId: window.satelliteId, instrumentId: window.instrumentId, imagingMode: window.imagingMode,
@@ -2368,6 +2582,42 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
     </div>
     <footer>导出字段包括灾害发生时间、任务时间窗、WGS 84坐标、多类型AOI、台风官方路径/风圈、载荷与 SAR 成像方式、目标、优先级与权威来源。</footer>
   </aside>;
+}
+
+function ScheduleTimeline({ schedule, onActivate }: { schedule: MultiTaskSchedule; onActivate: (taskId: string) => void }) {
+  if (!schedule.assignments.length) return null;
+  const bufferMs = schedule.transitionBufferSeconds * 1_000;
+  const start = Math.min(...schedule.assignments.map((assignment) => Date.parse(assignment.start)));
+  const end = Math.max(...schedule.assignments.map((assignment) => Date.parse(assignment.end) + bufferMs));
+  const duration = Math.max(1, end - start);
+  const satellites = [...new Set(schedule.assignments.map((assignment) => assignment.satelliteId))].sort();
+  return <div className="schedule-timeline" aria-label="卫星排程时间轴">
+    <div className="schedule-timeline-axis"><span>{formatTimeWithYear(new Date(start).toISOString())}</span><b>卫星时间轴 · 缓冲区以浅色显示</b><span>{formatTimeWithYear(new Date(end).toISOString())}</span></div>
+    <div className="schedule-timeline-scroll"><div className="schedule-timeline-grid">{satellites.map((satellite) => <div className="schedule-timeline-row" key={satellite}><strong>{satellite}</strong><div>{schedule.assignments.filter((assignment) => assignment.satelliteId === satellite).map((assignment) => {
+        const assignmentStart = Date.parse(assignment.start);
+        const assignmentEnd = Date.parse(assignment.end);
+        const left = ((assignmentStart - start) / duration) * 100;
+        const width = Math.max(0.6, ((assignmentEnd - assignmentStart) / duration) * 100);
+        const bufferedWidth = Math.max(width, ((assignmentEnd + bufferMs - assignmentStart) / duration) * 100);
+        return <span className="schedule-timeline-slot" key={assignment.assignmentId}><i style={{ left: `${left}%`, width: `${bufferedWidth}%` }} /><button className={`${assignment.constraintDecision} ${assignment.manuallyLocked ? "locked" : ""}`} style={{ left: `${left}%`, width: `${width}%` }} onClick={() => onActivate(assignment.taskId)} title={`${assignment.taskTitle} · ${formatTimeWithYear(assignment.start)} UTC+08`}>{assignment.taskTitle}</button></span>;
+      })}</div></div>)}</div></div>
+  </div>;
+}
+
+function PlanningScenarioDiff({ left, right }: { left: PlanningScenarioRecord; right: PlanningScenarioRecord }) {
+  const leftSchedule = left.comparison.recommendedAlgorithm === "priority_greedy_v1" ? left.comparison.greedy : left.comparison.optimized;
+  const rightSchedule = right.comparison.recommendedAlgorithm === "priority_greedy_v1" ? right.comparison.greedy : right.comparison.optimized;
+  const leftAssignments = new Set(leftSchedule.assignments.map((assignment) => assignment.assignmentId));
+  const rightAssignments = new Set(rightSchedule.assignments.map((assignment) => assignment.assignmentId));
+  const added = rightSchedule.assignments.filter((assignment) => !leftAssignments.has(assignment.assignmentId));
+  const removed = leftSchedule.assignments.filter((assignment) => !rightAssignments.has(assignment.assignmentId));
+  const scoreDelta = rightSchedule.objectiveScore - leftSchedule.objectiveScore;
+  return <div className="planning-version-diff">
+    <strong>{left.name} v{left.version} → {right.name} v{right.version}</strong>
+    <div><span>得分变化 <b>{scoreDelta >= 0 ? "+" : ""}{scoreDelta}</b></span><span>观测次数 <b>{rightSchedule.summary.assignmentCount - leftSchedule.summary.assignmentCount >= 0 ? "+" : ""}{rightSchedule.summary.assignmentCount - leftSchedule.summary.assignmentCount}</b></span><span>条件机会 <b>{rightSchedule.summary.conditionalAssignmentCount - leftSchedule.summary.conditionalAssignmentCount >= 0 ? "+" : ""}{rightSchedule.summary.conditionalAssignmentCount - leftSchedule.summary.conditionalAssignmentCount}</b></span></div>
+    <p>新增 {added.length} 项：{added.slice(0, 4).map((assignment) => `${assignment.taskTitle}/${assignment.satelliteId}`).join("、") || "无"}</p>
+    <p>移除 {removed.length} 项：{removed.slice(0, 4).map((assignment) => `${assignment.taskTitle}/${assignment.satelliteId}`).join("、") || "无"}</p>
+  </div>;
 }
 
 function ObservationPolicy() {
@@ -2558,6 +2808,16 @@ function createLandslideSarTask(event: DisasterEvent, terrain: LandslideTerrainS
 function downloadTaskArtifact(blob: Blob, contentDisposition: string | null, format: ExportFormat) {
   const match = contentDisposition?.match(/filename="?([^";]+)"?/i);
   const fileName = match?.[1] ?? `tianxun-task-package-${new Date().toISOString().replace(/[:.]/g, "-")}.${format === "geojson" ? "geojson" : format}`;
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function downloadJsonArtifact(value: unknown, fileName: string) {
+  const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;

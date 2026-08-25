@@ -1,6 +1,8 @@
 import type { DisasterEvent } from "../lib/disasters.ts";
 import type { RoadDisruption, RoadDisruptionRegistryEntry } from "../lib/response-disruptions.ts";
 import type { SatelliteOrbitCacheRecord, SatelliteTleRecord } from "../lib/satellite-orbits.ts";
+import type { SchedulingComparison, SchedulingManualRules } from "../lib/mission-scheduler.ts";
+import { createPlanningScenarioRecord, planningScenarioHasValidChecksum, planningScenarioSummary, type PlanningScenarioRecord, type PlanningScenarioSummary } from "../lib/planning-scenarios.ts";
 import { canTransitionTask } from "../lib/task-contract.ts";
 import { compareEventVersionFreshness, eventHasInvalidIdentity, isValidSourceEventId } from "../lib/event-integrity.ts";
 import { evidenceReassignmentSql } from "../lib/operational-sql.ts";
@@ -164,6 +166,9 @@ export function ensureOperationalSchema() {
     `CREATE TABLE IF NOT EXISTS event_quarantine (master_event_id TEXT PRIMARY KEY NOT NULL, reason TEXT NOT NULL, payload_json TEXT NOT NULL, quarantined_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS operational_changes (id TEXT PRIMARY KEY NOT NULL, change_type TEXT NOT NULL, master_event_id TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS operational_changes_created_idx ON operational_changes (created_at, id)`,
+    `CREATE TABLE IF NOT EXISTS planning_scenarios (scenario_id TEXT PRIMARY KEY NOT NULL, series_id TEXT NOT NULL, version INTEGER NOT NULL, parent_scenario_id TEXT, owner TEXT NOT NULL, name TEXT NOT NULL, problem_fingerprint TEXT NOT NULL, objective_score INTEGER NOT NULL, assignment_count INTEGER NOT NULL, conditional_assignment_count INTEGER NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS planning_scenarios_series_version_uidx ON planning_scenarios (series_id, version)`,
+    `CREATE INDEX IF NOT EXISTS planning_scenarios_owner_time_idx ON planning_scenarios (owner, created_at)`,
     `CREATE TABLE IF NOT EXISTS satellite_orbits (norad_id INTEGER PRIMARY KEY NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}', last_attempt_at TEXT NOT NULL, last_success_at TEXT, last_error TEXT)`,
     `CREATE INDEX IF NOT EXISTS satellite_orbits_success_idx ON satellite_orbits (last_success_at)`,
     `CREATE TABLE IF NOT EXISTS road_disruptions (disruption_id TEXT PRIMARY KEY NOT NULL, owner TEXT NOT NULL, lifecycle_status TEXT NOT NULL, verification TEXT NOT NULL, revision INTEGER NOT NULL, valid_from TEXT, valid_to TEXT, payload_json TEXT NOT NULL, reported_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
@@ -714,6 +719,93 @@ export async function resolveCanonicalEventsByReferences(references: Array<{ sou
     }
   }
   return resolved;
+}
+
+export async function listPlanningScenarioSummaries(owner: string, limit = 40): Promise<PlanningScenarioSummary[]> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const safeLimit = Math.max(1, Math.min(100, Math.trunc(limit)));
+  const result = await db.prepare(`SELECT scenario_id, series_id, version, parent_scenario_id, name, problem_fingerprint, objective_score, assignment_count, conditional_assignment_count, created_at
+    FROM planning_scenarios WHERE owner=? ORDER BY created_at DESC LIMIT ?`)
+    .bind(owner, safeLimit).all<{ scenario_id: string; series_id: string; version: number; parent_scenario_id: string | null; name: string; problem_fingerprint: string; objective_score: number; assignment_count: number; conditional_assignment_count: number; created_at: string }>();
+  return result.results.map((row) => ({
+    scenarioId: row.scenario_id,
+    seriesId: row.series_id,
+    version: Number(row.version),
+    parentScenarioId: row.parent_scenario_id ?? undefined,
+    name: row.name,
+    createdAt: row.created_at,
+    problemFingerprint: row.problem_fingerprint,
+    objectiveScore: Number(row.objective_score),
+    assignmentCount: Number(row.assignment_count),
+    conditionalAssignmentCount: Number(row.conditional_assignment_count),
+  }));
+}
+
+export async function getPlanningScenario(scenarioId: string, owner: string): Promise<PlanningScenarioRecord | null> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const row = await db.prepare(`SELECT payload_json FROM planning_scenarios WHERE scenario_id=? AND owner=?`).bind(scenarioId, owner).first<{ payload_json: string }>();
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(row.payload_json);
+    return planningScenarioHasValidChecksum(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function savePlanningScenario(input: {
+  scenarioId: string;
+  seriesId?: string;
+  parentScenarioId?: string;
+  owner: string;
+  name: string;
+  createdAt: string;
+  problemIds: string[];
+  manualRules: SchedulingManualRules;
+  comparison: SchedulingComparison;
+}): Promise<PlanningScenarioRecord> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const count = await db.prepare(`SELECT COUNT(*) AS count FROM planning_scenarios WHERE owner=?`).bind(input.owner).first<{ count: number }>();
+  if (Number(count?.count ?? 0) >= 100) throw new Error("当前账号已保存100个规划方案，请联系管理员归档后再保存");
+  let seriesId = input.seriesId;
+  if (seriesId && !/^series-[0-9a-f-]{36}$/i.test(seriesId)) throw new Error("规划方案系列ID无效");
+  if (seriesId && !input.parentScenarioId) throw new Error("续存方案必须提供父方案");
+  if (input.parentScenarioId) {
+    const parent = await db.prepare(`SELECT series_id, owner FROM planning_scenarios WHERE scenario_id=?`).bind(input.parentScenarioId).first<{ series_id: string; owner: string }>();
+    if (!parent || parent.owner !== input.owner) throw new Error("父方案不存在或不属于当前操作员");
+    if (seriesId && seriesId !== parent.series_id) throw new Error("父方案与方案系列不一致");
+    seriesId = parent.series_id;
+  }
+  seriesId ??= `series-${crypto.randomUUID()}`;
+  const latest = await db.prepare(`SELECT MAX(version) AS version FROM planning_scenarios WHERE series_id=? AND owner=?`).bind(seriesId, input.owner).first<{ version: number | null }>();
+  const version = Number(latest?.version ?? 0) + 1;
+  const record = createPlanningScenarioRecord({
+    scenarioId: input.scenarioId,
+    seriesId,
+    version,
+    parentScenarioId: input.parentScenarioId,
+    name: input.name,
+    owner: input.owner,
+    createdAt: input.createdAt,
+    problemIds: input.problemIds,
+    manualRules: input.manualRules,
+    comparison: input.comparison,
+  });
+  const summary = planningScenarioSummary(record);
+  const payload = JSON.stringify(record);
+  if (new TextEncoder().encode(payload).byteLength > 512 * 1024) throw new Error("规划方案快照超过512KB，无法保存");
+  try {
+    await db.prepare(`INSERT INTO planning_scenarios (scenario_id, series_id, version, parent_scenario_id, owner, name, problem_fingerprint, objective_score, assignment_count, conditional_assignment_count, payload_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(record.scenarioId, record.seriesId, record.version, record.parentScenarioId ?? null, record.owner, record.name, record.problemFingerprint, summary.objectiveScore, summary.assignmentCount, summary.conditionalAssignmentCount, payload, record.createdAt).run();
+  } catch (error) {
+    if (error instanceof Error && /unique|constraint/i.test(error.message)) throw new Error("规划方案版本冲突，请刷新后重试保存");
+    throw error;
+  }
+  return record;
 }
 
 export async function listRoadDisruptions(options: { includeInactive?: boolean; activeAt?: string } = {}): Promise<RoadDisruptionRegistryEntry[]> {

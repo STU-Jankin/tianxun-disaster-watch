@@ -60,6 +60,13 @@ server {
         proxy_pass http://127.0.0.1:3000;
     }
 
+    location ~ ^/api/planning/(?:schedule|scenarios)$ {
+        client_max_body_size 512k;
+        limit_req zone=tianxun_api burst=4 nodelay;
+        include /etc/nginx/snippets/tianxun-proxy-common.conf;
+        proxy_pass http://127.0.0.1:3000;
+    }
+
     location /api/ {
         limit_req zone=tianxun_api burst=12 nodelay;
         include /etc/nginx/snippets/tianxun-proxy-common.conf;

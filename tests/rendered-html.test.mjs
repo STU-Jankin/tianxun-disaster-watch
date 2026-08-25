@@ -344,6 +344,47 @@ test("keeps the authenticated Nginx gateway bounded without synthetic browser ro
   assert.doesNotMatch(nginx, /listen\s+(?:127\.0\.0\.1:)?(?:3000|8644)/);
 });
 
+test("adds an authenticated compute-only multi-task scheduling baseline", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  const scheduleRoute = await readFile(new URL("../app/api/planning/schedule/route.ts", import.meta.url), "utf8");
+  const scheduler = await readFile(new URL("../lib/mission-scheduler.ts", import.meta.url), "utf8");
+  assert.match(dashboard, /多任务联合试排/);
+  assert.match(dashboard, /比较优先级贪心与有界约束搜索/);
+  assert.match(dashboard, /不改任务状态、不自动下发/);
+  assert.match(scheduleRoute, /authorizeApiRequest\(request, "operator"\)/);
+  assert.match(scheduleRoute, /rejectCrossOriginBrowserWrite\(request\)/);
+  assert.match(scheduleRoute, /readJsonObject\(request, 512 \* 1024\)/);
+  assert.doesNotMatch(scheduleRoute, /putSatelliteTask|updateSatelliteTask|insert|delete/i);
+  assert.match(scheduler, /priority_greedy_v1/);
+  assert.match(scheduler, /bounded_constraint_search_v1/);
+  assert.match(scheduler, /同一卫星相邻任务暂按/);
+  assert.match(scheduler, /条件机会不得据此自动下发/);
+  const nginx = await readFile(new URL("../vps/nginx/tianxun-public-readonly.conf", import.meta.url), "utf8");
+  assert.match(nginx, /location ~ \^\/api\/planning\/\(\?:schedule\|scenarios\)\$[\s\S]*client_max_body_size 512k[\s\S]*burst=4/);
+});
+
+test("adds a versioned planning workbench without turning simulations into task execution", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  const scheduler = await readFile(new URL("../lib/mission-scheduler.ts", import.meta.url), "utf8");
+  const scenarios = await readFile(new URL("../app/api/planning/scenarios/route.ts", import.meta.url), "utf8");
+  const schema = await readFile(new URL("../db/schema.ts", import.meta.url), "utf8");
+  const migration = await readFile(new URL("../drizzle/0004_planning_scenarios.sql", import.meta.url), "utf8");
+  for (const text of ["卫星时间轴", "人工规则", "锁定机会", "排除机会", "保存为新版本", "恢复此版本", "对比所选版本", "导出当前方案 JSON"]) assert.ok(dashboard.includes(text));
+  assert.match(dashboard, /ScheduleTimeline/);
+  assert.match(dashboard, /PlanningScenarioDiff/);
+  assert.match(scheduler, /lockedOpportunityRefs/);
+  assert.match(scheduler, /forcedSatelliteByTask/);
+  assert.match(scheduler, /forcedImagingModeByTask/);
+  assert.match(scenarios, /authorizeApiRequest\(request, "operator"\)/);
+  assert.match(scenarios, /rejectCrossOriginBrowserWrite\(request\)/);
+  assert.match(scenarios, /status: 201/);
+  assert.doesNotMatch(scenarios, /export async function (?:PATCH|DELETE)/);
+  assert.match(schema, /planning_scenarios/);
+  assert.match(migration, /CREATE UNIQUE INDEX `planning_scenarios_series_version_uidx`/);
+});
+
 test("implements a server-side login, revocable sessions and password-hash configuration", async () => {
   const { readFile } = await import("node:fs/promises");
   const auth = await readFile(new URL("../lib/web-auth.ts", import.meta.url), "utf8");

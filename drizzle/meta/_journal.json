@@ -29,6 +29,13 @@
       "when": 1787191200000,
       "tag": "0003_task_revision_audit",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1787619600000,
+      "tag": "0004_planning_scenarios",
+      "breakpoints": true
     }
   ]
 }

@@ -144,6 +144,24 @@ export const operationalChanges = sqliteTable("operational_changes", {
   createdAt: text("created_at").notNull(),
 }, (table) => [index("operational_changes_created_idx").on(table.createdAt, table.id)]);
 
+export const planningScenarios = sqliteTable("planning_scenarios", {
+  scenarioId: text("scenario_id").primaryKey(),
+  seriesId: text("series_id").notNull(),
+  version: integer("version").notNull(),
+  parentScenarioId: text("parent_scenario_id"),
+  owner: text("owner").notNull(),
+  name: text("name").notNull(),
+  problemFingerprint: text("problem_fingerprint").notNull(),
+  objectiveScore: integer("objective_score").notNull(),
+  assignmentCount: integer("assignment_count").notNull(),
+  conditionalAssignmentCount: integer("conditional_assignment_count").notNull(),
+  payloadJson: text("payload_json").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [
+  uniqueIndex("planning_scenarios_series_version_uidx").on(table.seriesId, table.version),
+  index("planning_scenarios_owner_time_idx").on(table.owner, table.createdAt),
+]);
+
 export const webSessions = sqliteTable("web_sessions", {
   sessionHash: text("session_hash").primaryKey(),
   username: text("username").notNull(),

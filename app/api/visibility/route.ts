@@ -14,6 +14,7 @@ import {
   screenCycloneTleOpportunities,
   type CycloneTrackingTarget,
 } from "../../../lib/cyclone-tracking-opportunities";
+import { annotatePlanningWindows } from "../../../lib/mission-planning";
 
 export const dynamic = "force-dynamic";
 
@@ -149,9 +150,13 @@ export async function POST(request: Request) {
         const result = dynamicCycloneTracking
           ? screenCycloneConfiguredSarOpportunities({ ...common, slices: trackingSlices, target: trackingTarget, forecastAdvisoryId: String(task.forecastAdvisoryId ?? "") || undefined })
           : screenConfiguredSarOpportunities({ ...common, geometry: aoi });
+        const planning = annotatePlanningWindows(task, result.windows, result.computedAt);
         return Response.json({
           ...result,
           schemaVersion: "tianxun.visibility.v3",
+          windows: planning.windows,
+          planningProblem: planning.problem,
+          planningSummary: planning.summary,
           state: "ready",
           mode: "assumed_sensor",
           message: result.windows.length
@@ -174,9 +179,13 @@ export async function POST(request: Request) {
       const result = dynamicCycloneTracking
         ? screenCycloneTleOpportunities({ ...common, slices: trackingSlices, target: trackingTarget, forecastAdvisoryId: String(task.forecastAdvisoryId ?? "") || undefined })
         : screenTleOpportunities({ ...common, geometry: aoi });
+      const planning = annotatePlanningWindows(task, result.windows, result.computedAt);
       return Response.json({
         ...result,
         schemaVersion: "tianxun.visibility.v3",
+        windows: planning.windows,
+        planningProblem: planning.problem,
+        planningSummary: planning.summary,
         state: "ready",
         mode: "orbit_only",
         message: result.windows.length
@@ -213,7 +222,8 @@ export async function POST(request: Request) {
     const computedAt = validIso(result.computedAt) ?? new Date().toISOString();
     const windows = result.windows.map((window) => normalizeWindow(window, task, orbitVersion, computedAt)).filter((window): window is NonNullable<typeof window> => window !== null);
     if (result.windows.length && !windows.length) throw new Error("仿真服务没有返回有效的 UTC 可见窗口");
-    return Response.json({ schemaVersion: "tianxun.visibility.v3", mode: "sensor_model", orbitVersion, computedAt, windows, state: "ready", message: "已由外部传感器级仿真服务返回可见窗口；仍需按任务约束复核后方可排程。" });
+    const planning = annotatePlanningWindows(task, windows, computedAt);
+    return Response.json({ schemaVersion: "tianxun.visibility.v3", mode: "sensor_model", orbitVersion, computedAt, windows: planning.windows, planningProblem: planning.problem, planningSummary: planning.summary, state: "ready", message: "已由外部传感器级仿真服务返回可见窗口；仍需按任务约束复核后方可排程。" });
   } catch (error) {
     return Response.json({ state: "error", windows: [], message: error instanceof Error ? error.message : "可见性计算失败" }, { status: 502 });
   }
@@ -237,7 +247,8 @@ function normalizeWindow(window: Record<string, unknown>, task: Record<string, u
   const coverage = Number(window.coveragePercent ?? window.coverage);
   const incidenceAngle = Number(window.incidenceAngleDeg ?? window.groundIncidenceAngleDeg);
   const offNadirAngle = Number(window.offNadirAngleDeg ?? window.lookAngleDeg ?? window.lookAngle);
-  const orbitDirection = ["ascending", "descending"].includes(String(window.orbitDirection ?? window.direction)) ? String(window.orbitDirection ?? window.direction) : undefined;
+  const orbitDirectionValue = String(window.orbitDirection ?? window.direction);
+  const orbitDirection: "ascending" | "descending" | undefined = orbitDirectionValue === "ascending" || orbitDirectionValue === "descending" ? orbitDirectionValue : undefined;
   if (Number.isFinite(coverage) && coverage < Number(task.minimumCoveragePercent)) return null;
   if (Number.isFinite(incidenceAngle) && (incidenceAngle < Number(task.incidenceAngleMinDeg) || incidenceAngle > Number(task.incidenceAngleMaxDeg))) return null;
   if (["ascending", "descending"].includes(String(task.orbitDirectionPreference)) && orbitDirection && orbitDirection !== task.orbitDirectionPreference) return null;
