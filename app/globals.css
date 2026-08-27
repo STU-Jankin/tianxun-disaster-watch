@@ -321,6 +321,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .event-tags .confidence-tag.high { background: #dcebe5; color: #17675a; font-weight: 700; }.event-tags .confidence-tag.medium { background: #fff0d2; color: #805e1d; }.event-tags .confidence-tag.low { background: #f5dfdc; color: #944a40; }
 
 .task-panel { position: relative; flex: 0 0 440px; width: 440px; height: 100%; display: flex; flex-direction: column; overflow: hidden; background: #fffdf8; border-left: 1px solid #bfcac2; box-shadow: -7px 0 25px #102d2530; z-index: 40; }
+.task-panel[hidden] { display: none; }
 .task-panel-heading { padding: 18px 20px 15px; border-bottom: 1px solid #d8ddd7; display: flex; gap: 12px; background: #f4f6f1; }
 .task-panel-heading span { color: var(--teal); font-size: 8px; font-weight: 700; letter-spacing: .12em; }
 .task-panel-heading h2 { margin: 4px 0; font: 20px Georgia, "Noto Serif SC", serif; }

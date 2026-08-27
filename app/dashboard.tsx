@@ -908,8 +908,13 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     setActiveTaskId(taskId);
     setActiveResponseScenarioId(null);
     setSelected(null);
-    setTaskPanelOpen(false);
-    if (window.matchMedia("(max-width: 720px)").matches) setListOpen(false);
+    // Desktop users need the opportunity list and map preview at the same time.
+    // Narrow screens temporarily hide the panel for map space, but TaskPanel
+    // stays mounted so its computed windows and scheduling state survive.
+    if (window.matchMedia("(max-width: 1050px)").matches) {
+      setTaskPanelOpen(false);
+      setListOpen(false);
+    }
   }, []);
   const updateCustomAoi = useCallback((taskId: string, geometry?: CustomAoiGeometry) => {
     const requestedType = tasksRef.current.find((task) => task.taskId === taskId)?.aoiType;
@@ -1007,7 +1012,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
         </div>
 
         {selected && !activeResponseScenario && <DetailPanel event={selected} nowMs={clock} obscured={modalPanelOpen} dispatchBlocked={modeStale} locationZh={locationZh[selected.id]} locationLoading={locationLoading === selected.id} locationState={locationState[selected.id]?.state} onRetryLocation={() => { setLocationState((current) => { const next = { ...current }; delete next[selected.id]; return next; }); setLocationRetry((value) => value + 1); }} taskAdded={tasks.some((task) => taskMatchesEvent(task, selected))} landslideTemplateCount={new Set(tasks.filter((task) => task.masterEventId === selected.masterEventId && ["ascending", "descending"].includes(String(task.orbitDirectionPreference))).map((task) => task.orbitDirectionPreference)).size} terrainScreening={landslideTerrain[selected.masterEventId]} onTerrainChange={(terrain) => setLandslideTerrain((current) => { const next = { ...current }; if (terrain) next[selected.masterEventId] = terrain; else delete next[selected.masterEventId]; return next; })} aoiConfirmed={confirmedAois.has(selected.masterEventId)} onConfirmAoi={(confirmed) => setConfirmedAois((current) => { const next = new Set(current); if (confirmed) next.add(selected.masterEventId); else next.delete(selected.masterEventId); return next; })} onAddTask={addTask} onAddLandslideTasks={addLandslideSarTasks} onResponsePlan={openResponsePlanner} onClose={() => setSelected(null)} />}
-        {taskPanelOpen && <TaskPanel tasks={tasks} syncState={taskSync} storageMode={taskStorageMode} fleet={fleet} activeTaskId={activeTaskId} onActivate={reviewTaskAoi} onUpdate={updateTask} onRemove={(taskId) => void removeTask(taskId)} onClose={closeTaskPanel} onRetry={saveTask} />}
+        <TaskPanel open={taskPanelOpen} tasks={tasks} syncState={taskSync} storageMode={taskStorageMode} fleet={fleet} activeTaskId={activeTaskId} onActivate={reviewTaskAoi} onUpdate={updateTask} onRemove={(taskId) => void removeTask(taskId)} onClose={closeTaskPanel} onRetry={saveTask} />
         {responsePanelOpen && <ResponsePlanPanel event={responsePlanningEvent} events={deduplicatedEvents} scenarios={responseScenarios} activeScenarioId={activeResponseScenarioId} onSave={saveResponseScenario} onActivate={reviewResponseScenario} onSelectRoute={selectResponseRoute} onRemove={removeResponseScenario} onChooseEvent={(event) => setResponseEventId(event.masterEventId)} onClose={closeResponsePanel} />}
         {undoDraft ? <div className="task-undo-toast" role="status"><span>已删除本机草稿：{undoDraft.task.title}</span><button onClick={restoreDraft}>撤销</button></div> : null}
       </section>
@@ -2267,7 +2272,7 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
   </aside>;
 }
 
-function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActivate, onUpdate, onRemove, onClose, onRetry }: { tasks: SatelliteTask[]; syncState: Record<string, TaskSyncState>; storageMode: TaskStorageMode; fleet: SatelliteFleetState; activeTaskId: string | null; onActivate: (taskId: string) => void; onUpdate: (taskId: string, patch: Partial<SatelliteTask>) => void; onRemove: (taskId: string) => void; onClose: () => void; onRetry: (task: SatelliteTask) => Promise<SatelliteTask | null> }) {
+function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, onActivate, onUpdate, onRemove, onClose, onRetry }: { open: boolean; tasks: SatelliteTask[]; syncState: Record<string, TaskSyncState>; storageMode: TaskStorageMode; fleet: SatelliteFleetState; activeTaskId: string | null; onActivate: (taskId: string) => void; onUpdate: (taskId: string, patch: Partial<SatelliteTask>) => void; onRemove: (taskId: string) => void; onClose: () => void; onRetry: (task: SatelliteTask) => Promise<SatelliteTask | null> }) {
   const [visibility, setVisibility] = useState<Record<string, VisibilityState>>({});
   const [scheduling, setScheduling] = useState<JointSchedulingState>({ state: "idle" });
   const [manualRules, setManualRules] = useState<SchedulingManualRules>(() => emptySchedulingManualRules());
@@ -2331,6 +2336,7 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
     return () => { stopped = true; };
   }, []);
   useEffect(() => {
+    if (!open) return;
     closeRef.current?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
@@ -2344,7 +2350,7 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  }, [onClose, open]);
   const exportableTasks = tasks.filter((task) => validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requirePayload: true, requireProvenance: true }).ok && syncState[task.taskId]?.state === "synced" && ["candidate", "reviewed"].includes(task.status));
   const planningProblems = useMemo(() => tasks
     .map((task) => visibility[task.taskId]?.planningProblem)
@@ -2525,7 +2531,7 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
       comparison: scheduling.comparison,
     }, `tianxun-planning-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
   };
-  return <aside ref={panelRef} className="task-panel" role="dialog" aria-modal="true" aria-labelledby="task-panel-title">
+  return <aside ref={panelRef} className="task-panel" role="dialog" aria-modal={open ? "true" : undefined} aria-labelledby="task-panel-title" hidden={!open} inert={!open ? true : undefined}>
     <div className="task-panel-heading">
       <div><span>仿真系统输入</span><h2 id="task-panel-title">卫星任务候选单 <b>{tasks.length}</b></h2><p>业务数据库 + 本机离线缓存 · WGS 84</p></div>
       <button ref={closeRef} onClick={onClose} aria-label="关闭卫星任务候选单">×</button>

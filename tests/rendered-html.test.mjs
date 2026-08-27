@@ -232,6 +232,17 @@ test("computes cyclone visibility against the forecast slice valid at each satel
   assert.match(tracking, /cycloneTrackingSliceAt/);
 });
 
+test("keeps satellite simulation results mounted while previewing opportunities", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(dashboard, /<TaskPanel open=\{taskPanelOpen\}/);
+  assert.doesNotMatch(dashboard, /\{taskPanelOpen && <TaskPanel/);
+  assert.match(dashboard, /hidden=\{!open\} inert=\{!open \? true : undefined\}/);
+  assert.match(dashboard, /if \(window\.matchMedia\("\(max-width: 1050px\)"\)\.matches\) \{\s*setTaskPanelOpen\(false\)/);
+  assert.match(styles, /\.task-panel\[hidden\] \{ display: none; \}/);
+});
+
 test("returns persisted canonical identities and heals stale local draft references conservatively", async () => {
   const { readFile } = await import("node:fs/promises");
   const eventsRoute = await readFile(new URL("../app/api/events/route.ts", import.meta.url), "utf8");
