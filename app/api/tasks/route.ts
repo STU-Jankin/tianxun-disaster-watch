@@ -14,6 +14,13 @@ export async function GET(request: Request) {
   try {
     const actor = await apiActor(request);
     const owner = await apiRole(request) === "admin" ? undefined : actor;
+    const taskId = new URL(request.url).searchParams.get("taskId")?.trim();
+    if (taskId) {
+      if (taskId.length > 220) return Response.json({ error: "无效 taskId" }, { status: 400 });
+      const task = await getSatelliteTask(taskId, owner);
+      if (!task) return Response.json({ error: "任务不存在或不属于当前操作员" }, { status: 404 });
+      return Response.json({ task, storage: "operational-database" }, { headers: { "Cache-Control": "no-store" } });
+    }
     const [tasks, cancelledTaskIds] = await Promise.all([listSatelliteTasks(owner), listSatelliteTaskCancellationIds(owner)]);
     return Response.json({ tasks, cancelledTaskIds, storage: "operational-database" }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {

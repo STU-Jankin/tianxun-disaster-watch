@@ -17,6 +17,7 @@ import { aoiFingerprint, eventRevisionFingerprint, latestEventVersionsByMasterId
 import { cycloneTaskAoiSlices, cycloneUncertaintyGeometry, cycloneWindGeometry, type CycloneTaskAoiSlice } from "../lib/cyclone-forecast";
 import { weatherImagingWindows, type WeatherForecastReady, type WeatherForecastResponse } from "../lib/qweather";
 import { compactSatelliteTaskForSync } from "../lib/task-sync";
+import { mergeTaskVersions, sameOperatorTaskContent } from "../lib/task-version-conflict";
 import { antimeridianOutlineGeometry } from "../lib/geo-geometry";
 import {
   defaultResponseEndpoints,
@@ -60,6 +61,32 @@ const locationQualityLabels: Record<DisasterEvent["locationQuality"], string> = 
 const confidenceLabels: Record<DisasterEvent["confidenceLevel"], string> = { high: "高可信", medium: "中可信", low: "低可信" };
 const phenomenonLabels: Record<DisasterEvent["phenomenonStage"], string> = { observed: "实况", forecast: "预报", warning: "预警", driver: "驱动因子", context: "背景资料" };
 const observationPhaseLabels: Record<DisasterEvent["observationPhase"], string> = { forecast: "预报候选期", golden: "黄金观测期", followup: "后续观测期", archive: "已归档" };
+const taskFieldLabels: Record<string, string> = {
+  aoiType: "AOI 类型",
+  aoiRadiusKm: "AOI 半径",
+  aoiWidthKm: "AOI 宽度",
+  aoiHeightKm: "AOI 高度",
+  aoiLengthKm: "走廊长度",
+  aoiBearingDeg: "走廊方位",
+  customGeometry: "自绘 AOI",
+  imagingStart: "最早成像时间",
+  imagingEnd: "最晚成像时间",
+  sensors: "载荷类型",
+  sarImagingModes: "SAR 成像方式",
+  minimumCoveragePercent: "最低覆盖率",
+  maximumCloudPercent: "最大云量",
+  spatialResolutionMeters: "目标分辨率",
+  incidenceAngleMinDeg: "最小入射角",
+  incidenceAngleMaxDeg: "最大入射角",
+  revisitCount: "重访次数",
+  deliveryDeadline: "最迟交付时间",
+  orbitDirectionPreference: "轨向偏好",
+  cycloneTrackingTarget: "台风跟踪目标",
+  observationTargets: "观测目标",
+  sarAnalysisMode: "SAR 分析模式",
+  referenceAcquisitionRequired: "灾前参考影像要求",
+  status: "规划状态",
+};
 type SortMode = "priority" | "occurred" | "updated";
 type TimeWindow = "all" | "1h" | "6h" | "24h" | "7d";
 type TimeBasis = "occurred" | "updated";
@@ -363,8 +390,11 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
   const previousResponsePanelOpen = useRef(false);
   const taskSaveTimers = useRef(new Map<string, number>());
   const taskSaveControllers = useRef(new Map<string, AbortController>());
+  const taskSubmittedWrites = useRef(new Map<string, SatelliteTask>());
+  const taskSupersededWrites = useRef(new Map<string, SatelliteTask>());
   const taskMutationGeneration = useRef(new Map<string, number>());
   const opportunityResetNotices = useRef(new Map<string, string>());
+  const taskServerSnapshots = useRef(new Map<string, SatelliteTask>());
   const tasksRef = useRef<SatelliteTask[]>([]);
   const closeTaskPanel = useCallback(() => { setTaskPanelOpen(false); }, []);
   const closeResponsePanel = useCallback(() => { setResponsePanelOpen(false); }, []);
@@ -456,8 +486,10 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
         const storageMode: TaskStorageMode = result.storage === "public-read-only" ? "public-read-only" : "operational-database";
         setTaskStorageMode(storageMode);
         const serverTasks = result.tasks.map(migrateSatelliteTask);
+        taskServerSnapshots.current = new Map(serverTasks.map((task) => [task.taskId, task]));
         const cancelled = new Set(result.cancelledTaskIds ?? []);
         const merged = [...new Map([...localTasks.filter((task) => !cancelled.has(task.taskId)), ...serverTasks].map((task) => [task.taskId, task])).values()];
+        tasksRef.current = merged;
         setTasks(merged);
         setTaskSync(Object.fromEntries(merged.map((task) => [task.taskId, {
           state: serverTasks.some((server) => server.taskId === task.taskId) ? "synced" : "local",
@@ -467,6 +499,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
         } as TaskSyncState])));
       } catch {
         setTaskStorageMode("unavailable");
+        tasksRef.current = localTasks;
         setTasks(localTasks);
         setTaskSync(Object.fromEntries(localTasks.map((task) => [task.taskId, { state: "local", message: "任务服务不可用；仅保存在本机" } as TaskSyncState])));
       } finally {
@@ -526,45 +559,108 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     });
   }, [data, tasksHydrated]);
 
-  const saveTask = useCallback(async (task: SatelliteTask) => {
+  const saveTask = useCallback(async (task: SatelliteTask): Promise<SatelliteTask | null> => {
     if (taskStorageMode === "public-read-only") {
       setTaskSync((current) => ({ ...current, [task.taskId]: { state: "local", message: "公网入口为只读模式；任务仅保存在本机" } }));
-      return false;
+      return null;
     }
     const generation = taskMutationGeneration.current.get(task.taskId) ?? 0;
-    taskSaveControllers.current.get(task.taskId)?.abort();
+    const previousController = taskSaveControllers.current.get(task.taskId);
+    const previousSubmission = taskSubmittedWrites.current.get(task.taskId);
+    if (previousController && previousSubmission) taskSupersededWrites.current.set(task.taskId, previousSubmission);
+    previousController?.abort();
     const controller = new AbortController();
     taskSaveControllers.current.set(task.taskId, controller);
     setTaskSync((current) => ({ ...current, [task.taskId]: { state: "saving" } }));
     try {
-      const taskForSave = compactSatelliteTaskForSync(task as unknown as Record<string, unknown>);
-      const response = await fetch("/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(taskForSave), signal: controller.signal });
-      const result = await response.json() as { task?: Partial<SatelliteTask>; error?: string; errors?: string[] };
-      if (!response.ok) throw new Error(result.errors?.join("；") || result.error || "保存失败");
-      if ((taskMutationGeneration.current.get(task.taskId) ?? 0) !== generation || !tasksRef.current.some((item) => item.taskId === task.taskId)) return false;
-      if (result.task) {
+      let pendingTask = tasksRef.current.find((item) => item.taskId === task.taskId && item.revision >= task.revision) ?? task;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        taskSubmittedWrites.current.set(task.taskId, pendingTask);
+        const taskForSave = compactSatelliteTaskForSync(pendingTask as unknown as Record<string, unknown>);
+        const response = await fetch("/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(taskForSave), signal: controller.signal });
+        const result = await response.json() as { task?: Partial<SatelliteTask>; error?: string; errors?: string[] };
+        const message = result.errors?.join("；") || result.error || "保存失败";
+        if (!response.ok) {
+          if (attempt === 0 && response.status === 409 && /任务版本冲突|任务.*其他请求更新|revision/i.test(message)) {
+            const latestResponse = await fetch(`/api/tasks?taskId=${encodeURIComponent(task.taskId)}`, { cache: "no-store", signal: controller.signal });
+            const latestResult = await latestResponse.json() as { task?: Partial<SatelliteTask>; error?: string };
+            if (!latestResponse.ok || !latestResult.task) throw new Error(latestResult.error || "无法读取任务最新版本");
+            const remoteTask = migrateSatelliteTask(latestResult.task);
+            const localTask = tasksRef.current.find((item) => item.taskId === task.taskId) ?? pendingTask;
+            const baseTask = taskServerSnapshots.current.get(task.taskId);
+            const supersededTask = taskSupersededWrites.current.get(task.taskId);
+            const remoteIsOwnSupersededWrite = Boolean(supersededTask && sameOperatorTaskContent(
+              supersededTask as unknown as Record<string, unknown>,
+              remoteTask as unknown as Record<string, unknown>,
+            ));
+            const mergeBase = remoteIsOwnSupersededWrite ? remoteTask : baseTask;
+            const mergeLocal = remoteIsOwnSupersededWrite ? { ...localTask, revision: remoteTask.revision } : localTask;
+            const merge = mergeTaskVersions(
+              mergeBase as unknown as Record<string, unknown> | undefined,
+              mergeLocal as unknown as Record<string, unknown>,
+              remoteTask as unknown as Record<string, unknown>,
+            );
+            if (remoteIsOwnSupersededWrite) taskSupersededWrites.current.delete(task.taskId);
+            const mergedTask = migrateSatelliteTask(merge.merged as Partial<SatelliteTask>);
+            taskServerSnapshots.current.set(task.taskId, remoteTask);
+            tasksRef.current = tasksRef.current.map((item) => item.taskId === task.taskId ? mergedTask : item);
+            setTasks((current) => current.map((item) => item.taskId === task.taskId ? mergedTask : item));
+            if (merge.conflictingFields.length) {
+              const labels = merge.conflictingFields.slice(0, 5).map((field) => taskFieldLabels[field] ?? field).join("、");
+              const remainder = merge.conflictingFields.length > 5 ? `等 ${merge.conflictingFields.length} 项` : "";
+              setTaskSync((current) => ({ ...current, [task.taskId]: {
+                state: "error",
+                message: `检测到另一个请求也修改了${labels}${remainder ? `（${remainder}）` : ""}。已保留当前页面值并更新到服务端 v${remoteTask.revision}，请核对后重试同步。`,
+              } }));
+              return null;
+            }
+            pendingTask = mergedTask;
+            continue;
+          }
+          throw new Error(message);
+        }
+        if (!result.task) throw new Error("服务端未返回已保存任务");
         const serverTask = migrateSatelliteTask(result.task);
-        setTasks((current) => current.map((item) => item.taskId !== task.taskId ? item : item.updatedAt === task.updatedAt ? serverTask : { ...item, revision: serverTask.revision, eventRevision: serverTask.eventRevision, aoiHash: serverTask.aoiHash }));
+        taskSupersededWrites.current.delete(task.taskId);
+        taskServerSnapshots.current.set(task.taskId, serverTask);
+        const currentTask = tasksRef.current.find((item) => item.taskId === task.taskId);
+        if (!currentTask) return null;
+        const nextTask = currentTask.updatedAt === pendingTask.updatedAt
+          ? serverTask
+          : { ...currentTask, revision: serverTask.revision, eventRevision: serverTask.eventRevision, aoiHash: serverTask.aoiHash };
+        tasksRef.current = tasksRef.current.map((item) => item.taskId === task.taskId ? nextTask : item);
+        setTasks((current) => current.map((item) => item.taskId === task.taskId ? nextTask : item));
+        if ((taskMutationGeneration.current.get(task.taskId) ?? 0) !== generation) return null;
+        const resetNotice = opportunityResetNotices.current.get(task.taskId);
+        opportunityResetNotices.current.delete(task.taskId);
+        setTaskSync((current) => ({ ...current, [task.taskId]: { state: "synced", message: resetNotice } }));
+        return serverTask;
       }
-      const resetNotice = opportunityResetNotices.current.get(task.taskId);
-      opportunityResetNotices.current.delete(task.taskId);
-      setTaskSync((current) => ({ ...current, [task.taskId]: { state: "synced", message: resetNotice } }));
-      return true;
+      return null;
     } catch (saveError) {
-      if (controller.signal.aborted || (taskMutationGeneration.current.get(task.taskId) ?? 0) !== generation) return false;
+      if (controller.signal.aborted || (taskMutationGeneration.current.get(task.taskId) ?? 0) !== generation) return null;
       setTaskSync((current) => ({ ...current, [task.taskId]: { state: "error", message: saveError instanceof Error ? saveError.message : "保存失败" } }));
-      return false;
+      return null;
     } finally {
-      if (taskSaveControllers.current.get(task.taskId) === controller) taskSaveControllers.current.delete(task.taskId);
+      if (taskSaveControllers.current.get(task.taskId) === controller) {
+        taskSaveControllers.current.delete(task.taskId);
+        taskSubmittedWrites.current.delete(task.taskId);
+      }
     }
   }, [taskStorageMode]);
 
   const addTask = useCallback((event: DisasterEvent, operatorConfirmed: boolean) => {
     const task = createSatelliteTask(event, operatorConfirmed);
-    setTasks((current) => {
-      if (current.some((item) => taskMatchesEvent(item, event))) return current;
-      return [task, ...current];
-    });
+    const existingTask = tasksRef.current.find((item) => taskMatchesEvent(item, event));
+    if (existingTask) {
+      setTaskPanelOpen(true);
+      setListOpen(false);
+      setSelected(null);
+      setActiveTaskId(existingTask.taskId);
+      return;
+    }
+    tasksRef.current = [task, ...tasksRef.current];
+    setTasks(tasksRef.current);
     void saveTask(task).then((ok) => {
       if (!ok) setTaskSync((current) => ({ ...current, [task.taskId]: current[task.taskId] ?? { state: "local", message: "仅保存在本机，可稍后重试同步" } }));
     });
@@ -616,6 +712,8 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
       trackingCenterLatitude: undefined, trackingCenterLongitude: undefined, trackingCenterBasis: undefined, trackingThresholdKnots: undefined,
     } : {};
     taskMutationGeneration.current.set(taskId, (taskMutationGeneration.current.get(taskId) ?? 0) + 1);
+    const inFlightSubmission = taskSubmittedWrites.current.get(taskId);
+    if (inFlightSubmission) taskSupersededWrites.current.set(taskId, inFlightSubmission);
     taskSaveControllers.current.get(taskId)?.abort();
     setTasks((current) => current.map((task) => {
       if (task.taskId !== taskId) return task;
@@ -639,9 +737,13 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     taskMutationGeneration.current.set(taskId, (taskMutationGeneration.current.get(taskId) ?? 0) + 1);
     taskSaveControllers.current.get(taskId)?.abort();
     taskSaveControllers.current.delete(taskId);
+    taskSubmittedWrites.current.delete(taskId);
+    taskSupersededWrites.current.delete(taskId);
     const removeSyncState = () => setTaskSync((current) => { const next = { ...current }; delete next[taskId]; return next; });
     const localOnly = (taskStorageMode === "public-read-only" || taskStorageMode === "unavailable") && task.revision === 0;
     if (localOnly) {
+      taskServerSnapshots.current.delete(taskId);
+      tasksRef.current = tasksRef.current.filter((candidate) => candidate.taskId !== taskId);
       setTasks((current) => current.filter((candidate) => candidate.taskId !== taskId));
       if (activeTaskId === taskId) setActiveTaskId(null);
       removeSyncState();
@@ -666,11 +768,14 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
       const result = await response.json() as { error?: string; state?: string; revision?: number; task?: Partial<SatelliteTask> };
       if (!response.ok) throw new Error(result.error || `取消任务失败（HTTP ${response.status}）`);
       if (result.state === "cancellation_requested") {
-        setTasks((current) => current.map((candidate) => candidate.taskId === taskId
-          ? migrateSatelliteTask({ ...candidate, ...result.task, status: "cancellation_requested", revision: result.revision ?? candidate.revision })
-          : candidate));
+        const cancelledTask = migrateSatelliteTask({ ...task, ...result.task, status: "cancellation_requested", revision: result.revision ?? task.revision });
+        taskServerSnapshots.current.set(taskId, cancelledTask);
+        tasksRef.current = tasksRef.current.map((candidate) => candidate.taskId === taskId ? cancelledTask : candidate);
+        setTasks(tasksRef.current);
         setTaskSync((current) => ({ ...current, [taskId]: { state: "synced", message: "取消请求已记录，等待执行系统回执" } }));
       } else {
+        taskServerSnapshots.current.delete(taskId);
+        tasksRef.current = tasksRef.current.filter((candidate) => candidate.taskId !== taskId);
         setTasks((current) => current.filter((candidate) => candidate.taskId !== taskId));
         if (activeTaskId === taskId) setActiveTaskId(null);
         removeSyncState();
@@ -902,7 +1007,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
         </div>
 
         {selected && !activeResponseScenario && <DetailPanel event={selected} nowMs={clock} obscured={modalPanelOpen} dispatchBlocked={modeStale} locationZh={locationZh[selected.id]} locationLoading={locationLoading === selected.id} locationState={locationState[selected.id]?.state} onRetryLocation={() => { setLocationState((current) => { const next = { ...current }; delete next[selected.id]; return next; }); setLocationRetry((value) => value + 1); }} taskAdded={tasks.some((task) => taskMatchesEvent(task, selected))} landslideTemplateCount={new Set(tasks.filter((task) => task.masterEventId === selected.masterEventId && ["ascending", "descending"].includes(String(task.orbitDirectionPreference))).map((task) => task.orbitDirectionPreference)).size} terrainScreening={landslideTerrain[selected.masterEventId]} onTerrainChange={(terrain) => setLandslideTerrain((current) => { const next = { ...current }; if (terrain) next[selected.masterEventId] = terrain; else delete next[selected.masterEventId]; return next; })} aoiConfirmed={confirmedAois.has(selected.masterEventId)} onConfirmAoi={(confirmed) => setConfirmedAois((current) => { const next = new Set(current); if (confirmed) next.add(selected.masterEventId); else next.delete(selected.masterEventId); return next; })} onAddTask={addTask} onAddLandslideTasks={addLandslideSarTasks} onResponsePlan={openResponsePlanner} onClose={() => setSelected(null)} />}
-        {taskPanelOpen && <TaskPanel tasks={tasks} syncState={taskSync} storageMode={taskStorageMode} fleet={fleet} activeTaskId={activeTaskId} onActivate={reviewTaskAoi} onUpdate={updateTask} onRemove={(taskId) => void removeTask(taskId)} onClose={closeTaskPanel} onRetry={(task) => void saveTask(task)} />}
+        {taskPanelOpen && <TaskPanel tasks={tasks} syncState={taskSync} storageMode={taskStorageMode} fleet={fleet} activeTaskId={activeTaskId} onActivate={reviewTaskAoi} onUpdate={updateTask} onRemove={(taskId) => void removeTask(taskId)} onClose={closeTaskPanel} onRetry={saveTask} />}
         {responsePanelOpen && <ResponsePlanPanel event={responsePlanningEvent} events={deduplicatedEvents} scenarios={responseScenarios} activeScenarioId={activeResponseScenarioId} onSave={saveResponseScenario} onActivate={reviewResponseScenario} onSelectRoute={selectResponseRoute} onRemove={removeResponseScenario} onChooseEvent={(event) => setResponseEventId(event.masterEventId)} onClose={closeResponsePanel} />}
         {undoDraft ? <div className="task-undo-toast" role="status"><span>已删除本机草稿：{undoDraft.task.title}</span><button onClick={restoreDraft}>撤销</button></div> : null}
       </section>
@@ -2162,7 +2267,7 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
   </aside>;
 }
 
-function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActivate, onUpdate, onRemove, onClose, onRetry }: { tasks: SatelliteTask[]; syncState: Record<string, TaskSyncState>; storageMode: TaskStorageMode; fleet: SatelliteFleetState; activeTaskId: string | null; onActivate: (taskId: string) => void; onUpdate: (taskId: string, patch: Partial<SatelliteTask>) => void; onRemove: (taskId: string) => void; onClose: () => void; onRetry: (task: SatelliteTask) => void }) {
+function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActivate, onUpdate, onRemove, onClose, onRetry }: { tasks: SatelliteTask[]; syncState: Record<string, TaskSyncState>; storageMode: TaskStorageMode; fleet: SatelliteFleetState; activeTaskId: string | null; onActivate: (taskId: string) => void; onUpdate: (taskId: string, patch: Partial<SatelliteTask>) => void; onRemove: (taskId: string) => void; onClose: () => void; onRetry: (task: SatelliteTask) => Promise<SatelliteTask | null> }) {
   const [visibility, setVisibility] = useState<Record<string, VisibilityState>>({});
   const [scheduling, setScheduling] = useState<JointSchedulingState>({ state: "idle" });
   const [manualRules, setManualRules] = useState<SchedulingManualRules>(() => emptySchedulingManualRules());
@@ -2276,11 +2381,29 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
     setScenarioLibrary((current) => ({ ...current, active: undefined, comparison: undefined, message: undefined }));
     setVisibility((current) => ({ ...current, [task.taskId]: { state: "loading", windows: [] } }));
     try {
-      const requestBody = storageMode === "public-read-only"
-        ? compactSatelliteTaskForSync(task as unknown as Record<string, unknown>)
-        : { taskId: task.taskId, revision: task.revision };
-      const response = await fetch("/api/visibility", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody) });
-      const result = await response.json() as { state?: VisibilityState["state"]; mode?: VisibilityState["mode"]; message?: string; windows?: VisibilityWindow[]; orbitVersion?: string; computedAt?: string; planningSummary?: MissionPlanningSummary; planningProblem?: MissionPlanningProblem };
+      let calculationTask = task;
+      if (storageMode === "operational-database" && syncState[task.taskId]?.state !== "synced") {
+        const synchronized = await onRetry(task);
+        if (!synchronized) {
+          if (visibilityRequestGeneration.current.get(task.taskId) !== requestGeneration) return;
+          setVisibility((current) => ({ ...current, [task.taskId]: { state: "error", message: "任务尚未完成同步，请先处理上方同步提示后再计算", windows: [] } }));
+          return;
+        }
+        calculationTask = synchronized;
+      }
+      const requestVisibility = async (candidate: SatelliteTask) => {
+        const requestBody = storageMode === "public-read-only"
+          ? compactSatelliteTaskForSync(candidate as unknown as Record<string, unknown>)
+          : { taskId: candidate.taskId, revision: candidate.revision };
+        const response = await fetch("/api/visibility", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody) });
+        const result = await response.json() as { state?: VisibilityState["state"]; mode?: VisibilityState["mode"]; message?: string; windows?: VisibilityWindow[]; orbitVersion?: string; computedAt?: string; planningSummary?: MissionPlanningSummary; planningProblem?: MissionPlanningProblem };
+        return { response, result };
+      };
+      let { response, result } = await requestVisibility(calculationTask);
+      if (storageMode === "operational-database" && response.status === 409 && /任务已有新版本/.test(result.message ?? "")) {
+        const synchronized = await onRetry(calculationTask);
+        if (synchronized) ({ response, result } = await requestVisibility(synchronized));
+      }
       const windows = (result.windows ?? []).map((window) => ({ ...window, orbitVersion: window.orbitVersion ?? result.orbitVersion, computedAt: window.computedAt ?? result.computedAt }));
       if (visibilityRequestGeneration.current.get(task.taskId) !== requestGeneration) return;
       setVisibility((current) => ({ ...current, [task.taskId]: { state: result.state ?? (response.ok ? "ready" : "error"), mode: result.mode, message: result.message, windows, planningSummary: result.planningSummary, planningProblem: result.planningProblem } }));
@@ -2487,7 +2610,7 @@ function TaskPanel({ tasks, syncState, storageMode, fleet, activeTaskId, onActiv
         <WeatherForecastCard latitude={task.latitude} longitude={task.longitude} maximumCloudPercent={task.maximumCloudPercent} compact enabled={weatherTaskId === task.taskId} onRequest={() => setWeatherTaskId(task.taskId)} />
         {task.cycloneForecast ? <div className="task-forecast-summary"><strong>官方预报已随任务保存 · 动态跟踪</strong><span>{task.cycloneForecast.track.length} 个官方中心节点{task.cycloneForecast.impactField ? ` · ${task.cycloneForecast.impactField.frames.length} 个逐时时间片` : ""} · 至 {formatTimeWithYear(task.cycloneForecast.forecastValidUntil)} UTC+08</span><small>计算时按每次卫星过境时刻匹配对应预测片；官方新报次到达后必须重新计算机会。</small></div> : null}
         {task.hazard === "landslide" && task.orbitDirectionPreference ? <div className="task-landslide-summary"><strong>{task.orbitDirectionPreference === "ascending" ? "升轨" : task.orbitDirectionPreference === "descending" ? "降轨" : "任一轨向"} SAR 滑坡模板</strong><span>{task.referenceAcquisitionRequired ? "要求灾前参考影像" : "未要求灾前参考影像"} · {task.revisitCount} 次重访</span><small>地形格网是操作员确认的筛查 AOI，不是滑坡实况边界；成像机会仍需验证轨向、入射角及地形阴影/叠掩。</small></div> : null}
-        <div className={`task-sync ${syncState[task.taskId]?.state ?? "local"}`} role="status">{syncState[task.taskId]?.state === "saving" ? "正在同步…" : syncState[task.taskId]?.state === "synced" ? (syncState[task.taskId]?.message ?? "已同步到业务数据库") : syncState[task.taskId]?.state === "error" ? <>同步失败：{syncState[task.taskId]?.message ?? "请重试"} <button onClick={() => onRetry(task)}>重试同步</button></> : "仅保存在本机"}</div>
+        <div className={`task-sync ${syncState[task.taskId]?.state ?? "local"}`} role="status">{syncState[task.taskId]?.state === "saving" ? "正在同步…" : syncState[task.taskId]?.state === "synced" ? (syncState[task.taskId]?.message ?? "已同步到业务数据库") : syncState[task.taskId]?.state === "error" ? <>同步失败：{syncState[task.taskId]?.message ?? "请重试"} <button onClick={() => void onRetry(task)}>重试同步</button></> : "仅保存在本机"}</div>
     <div className="aoi-type-selector" aria-label="AOI目标类型">
           {aoiOptions.filter((option) => option.id !== "source" || task.sourceGeometry).map((option) => <button key={option.id} aria-pressed={task.aoiType === option.id} className={task.aoiType === option.id ? "active" : ""} onClick={() => onUpdate(task.taskId, {
             aoiType: option.id,
