@@ -2,6 +2,7 @@ import {
   normalizeCapSeverity,
   normalizeEarthquakeSeverity,
   type DisasterEvent,
+  type HazardSubtype,
   type HazardType,
   type PhenomenonStage,
 } from "./disasters.ts";
@@ -10,6 +11,7 @@ export type PublicEventCandidate = {
   sourceEventId: string;
   title: string;
   hazard: HazardType;
+  hazardSubtype?: HazardSubtype;
   geometry: { type: string; coordinates: unknown };
   occurredAt: string;
   updatedAt: string;
@@ -24,6 +26,9 @@ export type PublicEventCandidate = {
   magnitude?: number;
   magnitudeUnit?: string;
   country?: string;
+  originCountry?: string;
+  affectedCountries?: string[];
+  crossBorder?: boolean;
   description: string;
   requiresReview?: boolean;
 };

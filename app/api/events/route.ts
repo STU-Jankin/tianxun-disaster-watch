@@ -44,6 +44,9 @@ import {
   parseNveLandslideWarning,
   parseUsgsGroundFailureDetails,
 } from "../../../lib/landslide-sources";
+import { parseMemGeohazardBulletin, parseMemGeohazardListing } from "../../../lib/china-geohazard-sources";
+import { decodeLhasaRiskPng, lhasaCandidatesFromRaster } from "../../../lib/lhasa-nowcast";
+import { amapConfiguration, buildAmapGeocodeUrl, parseAmapGeocodes, type RoutingCoordinate } from "../../../lib/amap-routing";
 
 export const dynamic = "force-dynamic";
 
@@ -64,7 +67,8 @@ const endpoints = {
   usgsVolcanoes: "https://volcanoes.usgs.gov/hans-public/api/volcano/getElevatedVolcanoes",
   geonetVolcanoes: "https://api.geonet.org.nz/volcano/val",
   smithsonianVolcanoes: "https://volcano.si.edu/news/WeeklyVolcanoRSS.xml",
-  lhasa: "https://gis.earthdata.nasa.gov/gis05/rest/services/Landslides/LHASA_Exposure/FeatureServer/0/query",
+  memGeohazards: "https://www.mem.gov.cn/xw/yjglbgzdt/",
+  lhasaImages: "https://pmmpublisher.pps.eosdis.nasa.gov/img/lhasa_v2/",
   nveLandslide: "https://api01.nve.no/hydrology/forecast/landslide/v1.0.10/api/Warning/2",
   nveBoundary: "https://api.kartverket.no/kommuneinfo/v1",
   reliefWeb: "https://api.reliefweb.int/v2/disasters",
@@ -110,6 +114,7 @@ let lastSuccessfulFetchAt: string | null = null;
 let copernicusCache: { events: DisasterEvent[]; expiresAt: number } | null = null;
 let usgsGroundFailureCache: { events: DisasterEvent[]; expiresAt: number } | null = null;
 const nveBoundaryCache = new Map<string, { geometry: { type: string; coordinates: unknown }; expiresAt: number }>();
+const memGeocodeCache = new Map<string, { coordinate: RoutingCoordinate; expiresAt: number }>();
 
 export async function GET(request: Request) {
   const unauthorized = await authorizeApiRequest(request);
@@ -165,6 +170,14 @@ async function refreshEvents() {
       role: "事件",
       setupUrl: endpoints.jiangsuWater,
       fetcher: fetchJiangsuWater,
+    },
+    {
+      name: "应急管理部地质灾害快报",
+      tier: "中国第一批",
+      role: "事件",
+      setupUrl: endpoints.memGeohazards,
+      successMessage: "在线；仅把含明确发生时间和受影响地的官方灾情通报作为实况，地名编码点仍要求人工复核 AOI",
+      fetcher: fetchMemGeohazards,
     },
     {
       name: "中国气象数据网 CMA 预警",
@@ -308,8 +321,8 @@ async function refreshEvents() {
       name: "NASA LHASA",
       tier: "第一优先级",
       role: "预报",
-      setupUrl: "https://landslides.nasa.gov/",
-      successMessage: "在线；官方风险面未返回产品批次时间，本系统不把读取时间伪装成预报时间，暂只做源健康核验并禁止自动下发",
+      setupUrl: "https://pmmpublisher.pps.eosdis.nasa.gov/precip-apps/",
+      successMessage: "在线；读取带官方批次时间的 LHASA nowcast，仅在24小时有效期内产出80%以上模型风险区，不代表灾害已发生且禁止自动下发",
       fetcher: fetchLhasa,
     },
     {
@@ -400,7 +413,7 @@ async function refreshEvents() {
       retainedCount,
       persistenceAvailable,
       selectionPolicy: { limit: 250, reservedPerHazard: 20, wildfireCap: 100, perSourceCap: 80, firmsIngestionCap: 600, firmsSpatialReserveDegrees: 5 },
-      windowPolicyVersion: "2026.08-science-v4",
+      windowPolicyVersion: "2026.08-science-v5",
     },
     { headers: { "Cache-Control": "public, max-age=60, s-maxage=120" } },
   );
@@ -681,6 +694,64 @@ async function fetchJiangsuWater(): Promise<DisasterEvent[]> {
   });
 }
 
+async function fetchMemGeohazards(): Promise<DisasterEvent[]> {
+  const listing = parseMemGeohazardListing(await fetchText(endpoints.memGeohazards));
+  const details = await Promise.allSettled(listing.map(async (item) => parseMemGeohazardBulletin(await fetchText(item.url), item.url)));
+  const bulletins = details.flatMap((result) => result.status === "fulfilled" && result.value ? [result.value] : []);
+  const coordinates = new Map<string, RoutingCoordinate>();
+  await Promise.all([...new Set(bulletins.map((bulletin) => bulletin.locationQuery))].map(async (location) => {
+    const coordinate = await resolveMemGeohazardCoordinate(location);
+    if (coordinate) coordinates.set(location, coordinate);
+  }));
+  return bulletins.flatMap((bulletin): DisasterEvent[] => {
+    const coordinate = coordinates.get(bulletin.locationQuery);
+    if (!coordinate) return [];
+    return [publicCandidateEvent({
+      sourceEventId: bulletin.sourceEventId,
+      title: bulletin.title,
+      hazard: "landslide",
+      hazardSubtype: bulletin.hazardSubtype,
+      geometry: { type: "Point", coordinates: coordinate },
+      occurredAt: bulletin.occurredAt,
+      updatedAt: bulletin.updatedAt,
+      activityAt: bulletin.updatedAt,
+      issuedAt: bulletin.updatedAt,
+      phenomenonStage: "observed",
+      sourceUrl: bulletin.sourceUrl,
+      sourceSeverity: bulletin.sourceSeverity,
+      severity: bulletin.severity,
+      country: bulletin.country,
+      originCountry: bulletin.originCountry,
+      affectedCountries: bulletin.affectedCountries,
+      crossBorder: bulletin.crossBorder,
+      description: bulletin.description,
+      requiresReview: true,
+    }, "应急管理部地质灾害快报", "mem-geohazard")];
+  });
+}
+
+async function resolveMemGeohazardCoordinate(location: string): Promise<RoutingCoordinate | null> {
+  const cached = memGeocodeCache.get(location);
+  if (cached && cached.expiresAt > Date.now()) return cached.coordinate;
+  const configuration = amapConfiguration();
+  if (configuration.ready && configuration.config) {
+    try {
+      const payload = await fetchJson(buildAmapGeocodeUrl(configuration.config, location), { maximumBytes: 1_000_000, timeoutMs: 8_000 });
+      const geocode = parseAmapGeocodes(payload)[0];
+      if (geocode) {
+        memGeocodeCache.set(location, { coordinate: geocode.coordinate, expiresAt: Date.now() + 30 * 86_400_000 });
+        return geocode.coordinate;
+      }
+    } catch (error) {
+      console.warn(`MEM geocode fallback used (${location})`, error instanceof Error ? error.message : "geocode unavailable");
+    }
+  }
+  // 仅作为官方地名代表点兜底；坐标由高德兴趣点结果近似归一为 WGS84，
+  // 事件仍是 Point + review_required，绝不把该点冒充泥石流边界。
+  if (/吉隆口岸/.test(location)) return [85.377307, 28.280317];
+  return null;
+}
+
 async function fetchCmaEventFeed(): Promise<DisasterEvent[]> {
   const url = process.env.CMA_EVENT_FEED_URL;
   if (!url) return [];
@@ -937,6 +1008,7 @@ function publicCandidateEvent(candidate: PublicEventCandidate, source: string, p
     id: `${prefix}-${candidate.sourceEventId}`,
     title: candidate.title,
     hazard: candidate.hazard,
+    hazardSubtype: candidate.hazardSubtype,
     latitude: center[1],
     longitude: center[0],
     occurredAt: candidate.occurredAt,
@@ -954,6 +1026,9 @@ function publicCandidateEvent(candidate: PublicEventCandidate, source: string, p
     magnitudeUnit: candidate.magnitudeUnit,
     geometry,
     country: candidate.country,
+    originCountry: candidate.originCountry,
+    affectedCountries: candidate.affectedCountries,
+    crossBorder: candidate.crossBorder,
     description: candidate.description,
   });
   return candidate.requiresReview
@@ -1394,21 +1469,30 @@ async function fetchSmithsonianVolcanoes(): Promise<DisasterEvent[]> {
 }
 
 async function fetchLhasa(): Promise<DisasterEvent[]> {
-  const params = new URLSearchParams({
-    where: "h_haz>0",
-    outFields: "objectid",
-    resultRecordCount: "1",
-    returnGeometry: "false",
-    f: "json",
-  });
-  const data = await fetchJson(`${endpoints.lhasa}?${params}`) as {
-    features?: unknown[];
-  };
-  if (!Array.isArray(data.features)) throw new Error("LHASA 返回结构异常");
-  // 该公开 FeatureServer 确实提供行政区风险/暴露度面，但没有产品批次时间、编辑时间或 timeInfo。
-  // 读取响应时间不能替代模型发布时间，因此这里只验证高风险面是否可查询，不制造“本轮新预报”。
-  // 当 NASA 提供带批次时间的矢量流后，才能安全进入实时事件及任务链。
-  return [];
+  for (let dayOffset = 0; dayOffset <= 4; dayOffset += 1) {
+    const productDate = new Date(Date.now() - dayOffset * 86_400_000);
+    const date = `${productDate.getUTCFullYear()}${String(productDate.getUTCMonth() + 1).padStart(2, "0")}${String(productDate.getUTCDate()).padStart(2, "0")}`;
+    const productTime = `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)}T00:00:00.000Z`;
+    const imageUrl = `${endpoints.lhasaImages}global_landslide_nowcast_${date}.0000_float.png`;
+    const response = await fetch(imageUrl, {
+      headers: { Accept: "image/png", "User-Agent": officialUserAgent },
+      signal: AbortSignal.timeout(8_000),
+      redirect: "manual",
+    });
+    const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+    if (!response.ok || !contentType.startsWith("image/png")) {
+      await response.body?.cancel();
+      continue;
+    }
+    if (Date.now() >= Date.parse(productTime) + 24 * 3_600_000) {
+      await response.body?.cancel();
+      return [];
+    }
+    const image = await readLimitedBytes(response, 2_000_000, "LHASA PNG");
+    const raster = await decodeLhasaRiskPng(image, 5);
+    return lhasaCandidatesFromRaster(raster, productTime, imageUrl).map((candidate) => publicCandidateEvent(candidate, "NASA LHASA", "lhasa"));
+  }
+  throw new Error("LHASA 最近5天没有可识别的官方批次 PNG");
 }
 
 async function fetchWmoCap(): Promise<DisasterEvent[]> {
@@ -1487,6 +1571,11 @@ function baseEvent(input: Omit<DisasterEvent, "masterEventId" | "entityKey" | "l
   phenomenonStage?: PhenomenonStage;
 }): DisasterEvent {
   const meta = hazardMeta[input.hazard];
+  const subtypeTargets = input.hazard === "landslide" && input.hazardSubtype === "debris_flow"
+    ? ["冲淤范围", "沟道堆积体", "堵江", "道路桥梁损毁"]
+    : input.hazard === "landslide" && input.hazardSubtype === "rockfall"
+      ? ["崩塌源区", "落石堆积", "道路阻断"]
+      : meta.targets;
   const location = inferLocationProfile(input.source, input.hazard, input.description);
   const confidenceScore = sourceTrust(input.source) - (location.quality === "representative" ? 18 : location.quality === "estimated" ? 8 : 0);
   const geometry = input.geometry ?? { type: "Point" as const, coordinates: [input.longitude, input.latitude] };
@@ -1532,7 +1621,7 @@ function baseEvent(input: Omit<DisasterEvent, "masterEventId" | "entityKey" | "l
     aoiApprovalRequired: !sourceReady,
     dispatchEligibility: sourceReady ? "ready" : "review_required",
     observable: meta.observable,
-    observationTargets: meta.targets,
+    observationTargets: subtypeTargets,
     recommendedSensors: meta.sensors,
     scope: "global",
     priority: 0,
@@ -1544,7 +1633,7 @@ function baseEvent(input: Omit<DisasterEvent, "masterEventId" | "entityKey" | "l
     observationHardReviewAt: input.updatedAt,
     observationReferenceAt: input.occurredAt,
     observationRationale: "尚未应用观测期策略",
-    observationPolicyVersion: "2026.08-science-v4",
+    observationPolicyVersion: "2026.08-science-v5",
     observationPhase: "golden",
     observationStatus: sourceReady ? "actionable" : "review_required",
   };
@@ -1563,6 +1652,7 @@ function finalize(event: DisasterEvent): DisasterEvent {
       validFrom: event.validFrom,
       validTo: event.validTo,
       forecastValidUntil: event.cycloneForecast?.forecastValidUntil,
+      hazardSubtype: event.hazardSubtype,
       targets: event.observationTargets,
       sensors: event.recommendedSensors,
     },
@@ -1594,7 +1684,7 @@ function finalize(event: DisasterEvent): DisasterEvent {
     observationHardReviewAt: timeline.hardReviewAt,
     observationReferenceAt: timeline.referenceAt,
     observationRationale: timeline.rationale,
-    observationPolicyVersion: "2026.08-science-v4",
+    observationPolicyVersion: "2026.08-science-v5",
     observationPhase: timeline.phase,
     observationStatus: timeline.phase === "archive" ? "expired" : policyNeedsReview ? "review_required" : "actionable",
     dispatchEligibility: policyNeedsReview && event.dispatchEligibility === "ready" ? "review_required" : event.dispatchEligibility,
@@ -1755,6 +1845,7 @@ function inferLocationProfile(source: string, hazard: HazardType, description?: 
   if (/太湖流域管理局|江苏省水利厅/.test(source) || /AOI锚点|代表点/.test(description ?? "")) return { quality: "representative", accuracyKm: 100 };
   if (/FIRMS/.test(source) && /0\.1°网格聚合/.test(description ?? "")) return { quality: "estimated", accuracyKm: 8 };
   if (/NWS Alerts|ECCC GeoMet|NVE Jordskredvarsling/.test(source)) return { quality: "precise", accuracyKm: 1 };
+  if (/应急管理部地质灾害快报/.test(source)) return { quality: "representative", accuracyKm: 5 };
   if (/USGS Ground Failure|GDACS|EONET|GloFAS|WMO|Smithsonian|LHASA/.test(source)) return { quality: "estimated", accuracyKm: hazard === "cyclone" ? 25 : hazard === "flood" ? 50 : 20 };
   if (/中国地震台网|USGS|EMSC|FIRMS|NOAA|JMA|GeoNet|Copernicus EMS Rapid Mapping/.test(source)) return { quality: "precise", accuracyKm: hazard === "wildfire" ? 1 : hazard === "cyclone" ? 10 : 5 };
   return { quality: "unknown", accuracyKm: 100 };
@@ -1764,6 +1855,7 @@ function sourceTrust(source: string) {
   if (isCmaSurfaceSource(source)) return 88;
   if (/中国气象数据网 CMA 预警/.test(source)) return 90;
   if (/中国地震台网/.test(source)) return 92;
+  if (/应急管理部地质灾害快报/.test(source)) return 95;
   if (/USGS/.test(source)) return 91;
   if (/EMSC/.test(source)) return 90;
   if (/NVE Jordskredvarsling/.test(source)) return 90;
@@ -1787,6 +1879,7 @@ function locationRank(quality: DisasterEvent["locationQuality"]) {
 function evidenceRole(source: string): "detection" | "warning" | "verification" | "driver" | "context" {
   if (isCmaSurfaceSource(source)) return "driver";
   if (/ReliefWeb|Smithsonian|Copernicus EMS|LHASA/.test(source)) return "context";
+  if (/应急管理部地质灾害快报/.test(source)) return "detection";
   if (/EMSC|GeoNet/.test(source)) return "verification";
   if (/USGS Ground Failure|NVE Jordskredvarsling|WMO|NOAA|JMA|ECCC|CMA 预警/.test(source)) return "warning";
   return "detection";

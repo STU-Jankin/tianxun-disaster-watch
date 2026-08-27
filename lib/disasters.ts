@@ -12,6 +12,7 @@ export type HazardType =
 
 export type ScopeId = "wuxi" | "jiangsu" | "china" | "global";
 export type PhenomenonStage = "observed" | "forecast" | "warning" | "driver" | "context";
+export type HazardSubtype = "landslide" | "debris_flow" | "rockfall" | "slope_failure" | "mass_movement";
 
 export type EventEvidence = {
   source: string;
@@ -101,6 +102,7 @@ export type DisasterEvent = {
   entityKey: string;
   title: string;
   hazard: HazardType;
+  hazardSubtype?: HazardSubtype;
   latitude: number;
   longitude: number;
   occurredAt: string;
@@ -117,6 +119,9 @@ export type DisasterEvent = {
   magnitude?: number;
   magnitudeUnit?: string;
   country?: string;
+  originCountry?: string;
+  affectedCountries?: string[];
+  crossBorder?: boolean;
   description?: string;
   lifecycleStatus: "active" | "monitoring" | "resolved" | "archived";
   sourcePresence: "current" | "retained";
@@ -230,6 +235,34 @@ export const hazardMeta: Record<
   ice: { label: "冰雪", symbol: "冰", targets: ["海冰", "冰湖", "雪崩堆积"], sensors: ["SAR", "多光谱"], observable: "direct" },
 };
 
+export const hazardSubtypeLabels: Record<HazardSubtype, string> = {
+  landslide: "滑坡",
+  debris_flow: "泥石流",
+  rockfall: "崩塌/落石",
+  slope_failure: "边坡失稳",
+  mass_movement: "地表物质运动",
+};
+
+const landslideSubtypeObservationProfiles: Partial<Record<HazardSubtype, {
+  goldenHours: number;
+  followupHours: number;
+  hardReviewHours: number;
+  rationale: string;
+}>> = {
+  debris_flow: {
+    goldenHours: 24,
+    followupHours: 336,
+    hardReviewHours: 720,
+    rationale: "泥石流冲淤、沟道堵塞和道路桥梁损毁以前24小时最关键；14天为基础复核期，严重灾情或持续变化可延长，但30天必须重审",
+  },
+  rockfall: {
+    goldenHours: 24,
+    followupHours: 168,
+    hardReviewHours: 720,
+    rationale: "崩塌落石范围和道路阻断以前24小时优先；7天为基础复核期，严重灾情或持续变化可延长，但30天必须重审",
+  },
+};
+
 export function classifyScope(latitude: number, longitude: number, locationText = ""): ScopeId {
   const location = locationText.toLowerCase();
   const inWuxi = /无锡|wuxi|太湖|taihu/.test(location);
@@ -332,6 +365,7 @@ export function getObservationTimeline(
     validFrom?: string;
     validTo?: string;
     forecastValidUntil?: string;
+    hazardSubtype?: HazardSubtype;
     targets?: string[];
     sensors?: string[];
   } = {},
@@ -347,7 +381,11 @@ export function getObservationTimeline(
     Number.isFinite(occurred) ? occurred : 0,
     Number.isFinite(activity) ? activity : 0,
   );
-  const policy = observationWindowPolicy[hazard];
+  const basePolicy = observationWindowPolicy[hazard];
+  const subtypePolicy = hazard === "landslide" && context.hazardSubtype
+    ? landslideSubtypeObservationProfiles[context.hazardSubtype]
+    : undefined;
+  const policy = subtypePolicy ? { ...basePolicy, ...subtypePolicy } : basePolicy;
   const stage = context.phenomenonStage ?? "observed";
   const goldenHours = policy.goldenHours;
   const now = Date.now();

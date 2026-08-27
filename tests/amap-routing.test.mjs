@@ -15,7 +15,7 @@ test("requires a server-side 32-character Amap Web Service key", async () => {
 });
 
 test("builds bounded HTTPS coordinate and driving requests", async () => {
-  const { buildAmapCoordinateConversionUrl, buildAmapDrivingUrl } = await amap();
+  const { buildAmapCoordinateConversionUrl, buildAmapDrivingUrl, buildAmapGeocodeUrl } = await amap();
   const config = { key: "a".repeat(32), origin: "https://restapi.amap.com" };
   const conversion = new URL(buildAmapCoordinateConversionUrl(config, [[120.3, 31.5], [120.4, 31.6]]));
   assert.equal(conversion.protocol, "https:");
@@ -26,6 +26,17 @@ test("builds bounded HTTPS coordinate and driving requests", async () => {
   assert.equal(driving.searchParams.get("strategy"), "33");
   assert.equal(driving.searchParams.get("ferry"), "1");
   assert.equal(driving.searchParams.get("show_fields"), "cost,tmcs,polyline");
+  const geocode = new URL(buildAmapGeocodeUrl(config, "西藏日喀则市吉隆县吉隆口岸", "日喀则市"));
+  assert.equal(geocode.pathname, "/v3/geocode/geo");
+  assert.equal(geocode.searchParams.get("address"), "西藏日喀则市吉隆县吉隆口岸");
+});
+
+test("normalizes Amap geocoded place coordinates to WGS84", async () => {
+  const { parseAmapGeocodes } = await amap();
+  const results = parseAmapGeocodes({ status: "1", geocodes: [{ formatted_address: "西藏自治区日喀则市吉隆县吉隆口岸", district: "吉隆县", level: "兴趣点", location: "85.379735,28.276811" }] });
+  assert.equal(results.length, 1);
+  assert.equal(results[0].formattedAddress, "西藏自治区日喀则市吉隆县吉隆口岸");
+  assert.deepEqual(results[0].coordinate, [85.377307, 28.280317]);
 });
 
 test("parses Amap road geometry, cost and traffic without leaking provider coordinates", async () => {

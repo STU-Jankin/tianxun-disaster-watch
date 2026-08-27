@@ -178,6 +178,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .event-tags .phase-tag.golden { background: #dcebe5; color: #17675a; }
 .event-tags .phase-tag.followup { background: #eee9d9; color: #7a672a; }
 .event-tags .time-weight-tag { background: #e3e7f2; color: #415a88; font-weight: 700; }
+.event-tags .subtype-tag { background: #e7f2fb; color: #146690; font-weight: 700; }
+.event-tags .cross-border-tag { background: #e8e4f7; color: #5c3d92; font-weight: 700; }
 .event-tags .monitoring-tag { background: #f1e5c9; color: #785d25; font-weight: 700; }
 .event-tags .update-tag { background: #e0e9f2; color: #3f617d; font-weight: 700; }
 .retained-banner { padding: 7px 15px; border-bottom: 1px solid #e1d7bd; background: #faf5e8; color: #766747; font-size: 8px; line-height: 1.45; }.retained-banner strong { color: #8a6425; font-size: 10px; }

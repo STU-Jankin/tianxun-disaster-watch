@@ -28,6 +28,27 @@ test("observed hazards use hazard-specific follow-up and hard-review points", as
   assert.match(earthquake.rationale, /长期变化目标/);
 });
 
+test("debris-flow observations use a shorter emergency window than slow landslide follow-up", async () => {
+  const { getObservationTimeline } = await disasters();
+  const occurredAt = new Date(Date.now() - 2 * 3_600_000).toISOString();
+  const debrisFlow = getObservationTimeline(occurredAt, occurredAt, "landslide", "orange", {
+    phenomenonStage: "observed",
+    hazardSubtype: "debris_flow",
+    targets: ["冲淤范围", "道路桥梁损毁"],
+    sensors: ["SAR"],
+  });
+  const landslide = getObservationTimeline(occurredAt, occurredAt, "landslide", "orange", {
+    phenomenonStage: "observed",
+    hazardSubtype: "landslide",
+    targets: ["滑坡斑块", "残余形变"],
+    sensors: ["SAR"],
+  });
+  assert.equal(debrisFlow.goldenHours, 24);
+  assert.equal(landslide.goldenHours, 72);
+  assert.ok(debrisFlow.followupHours < landslide.followupHours);
+  assert.match(debrisFlow.rationale, /泥石流冲淤/);
+});
+
 test("future forecasts cannot receive the observed-event maximum recency score", async () => {
   const { calculateTimeScore } = await disasters();
   const future = new Date(Date.now() + 72 * 3_600_000).toISOString();

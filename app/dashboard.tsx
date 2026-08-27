@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   hazardMeta,
+  hazardSubtypeLabels,
   isVisibleInScope,
   observationWindowPolicy,
   scopes,
@@ -979,6 +980,8 @@ function EventCard({ event, active, onClick }: { event: DisasterEvent; active: b
       <p>{event.country || `${event.latitude.toFixed(2)}°, ${event.longitude.toFixed(2)}°`}</p>
       <div className="event-tags">
         <span className="severity-tag">{severityLabels[event.severity]} · {phenomenonLabels[event.phenomenonStage]}</span>
+        {event.hazardSubtype ? <span className="subtype-tag">{hazardSubtypeLabels[event.hazardSubtype]}</span> : null}
+        {event.crossBorder ? <span className="cross-border-tag">跨境影响</span> : null}
         <span className={`phase-tag ${event.observationPhase}`}>{observationPhaseLabels[event.observationPhase]}</span>
         {event.sourcePresence === "retained" ? <span className="monitoring-tag">来源暂未复现</span> : null}
         {event.updateCount > 1 ? <span className="update-tag">{event.updateCount}期更新</span> : null}
@@ -1687,7 +1690,7 @@ function DetailPanel({ event, nowMs, obscured, dispatchBlocked, locationZh, loca
   const canBuildTerrainTask = !dispatchBlocked && !isDemo && taskWindowValid && event.dispatchEligibility !== "blocked" && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived";
   return <aside className="detail-panel" aria-labelledby={`detail-title-${event.id}`} inert={obscured ? true : undefined} aria-hidden={obscured || undefined}>
     <button ref={closeRef} className="detail-close" onClick={onClose} aria-label="关闭详情">×</button>
-    <div className={`detail-kicker ${event.severity}`}><span>{hazardMeta[event.hazard].symbol}</span>{hazardMeta[event.hazard].label} · {severityLabels[event.severity]} · {phenomenonLabels[event.phenomenonStage]}</div>
+    <div className={`detail-kicker ${event.severity}`}><span>{hazardMeta[event.hazard].symbol}</span>{event.hazardSubtype ? hazardSubtypeLabels[event.hazardSubtype] : hazardMeta[event.hazard].label} · {severityLabels[event.severity]} · {phenomenonLabels[event.phenomenonStage]}{event.crossBorder ? " · 跨境影响" : ""}</div>
     <h2 id={`detail-title-${event.id}`}>{event.title}</h2>
     <div className="detail-location">
       <span>⌖ 中文地点</span>
@@ -1701,6 +1704,7 @@ function DetailPanel({ event, nowMs, obscured, dispatchBlocked, locationZh, loca
       <div><strong>{confidenceLabels[event.confidenceLevel]} {event.confidenceScore}</strong><span>{event.independentSourceCount ?? new Set(event.evidence.map((item) => item.source.split(" · ")[0])).size} 个独立来源 · {event.bulletinCount ?? event.updateCount} 期公告</span></div>
       {event.peakSeverity && event.peakSeverity !== event.severity ? <p><b>当前{severityLabels[event.severity]}</b> · 历史峰值{severityLabels[event.peakSeverity]}</p> : null}
       <p><b>{locationQualityLabels[event.locationQuality]}</b> · 估计误差约 {event.locationAccuracyKm} km</p>
+      {event.crossBorder ? <p><b>跨境影响事件</b> · 起源地 {event.originCountry || "待核验"} · 受影响 {event.affectedCountries?.join("、") || "待核验"}</p> : null}
       <small>主事件ID：{event.masterEventId}</small>
       {event.sourcePresence === "retained" ? <em>当前短时数据源未再次报告该事件；未据此判定灾害已结束，仍保留至观测期届满或权威撤销。</em> : null}
     </div>
@@ -1733,6 +1737,9 @@ function DetailPanel({ event, nowMs, obscured, dispatchBlocked, locationZh, loca
       {event.validFrom ? <div><dt>生效时间</dt><dd>{formatTimeWithYear(event.validFrom)} UTC+08</dd></div> : null}
       {event.validTo ? <div><dt>权威有效至</dt><dd>{formatTimeWithYear(event.validTo)} UTC+08</dd></div> : null}
       <div><dt>最新更新</dt><dd>{formatTimeWithYear(event.updatedAt)} UTC+08</dd></div>
+      {event.hazardSubtype ? <div><dt>灾害子类型</dt><dd>{hazardSubtypeLabels[event.hazardSubtype]}</dd></div> : null}
+      {event.originCountry ? <div><dt>起源国家/地区</dt><dd>{event.originCountry}</dd></div> : null}
+      {event.affectedCountries?.length ? <div><dt>受影响国家/地区</dt><dd>{event.affectedCountries.join("、")}</dd></div> : null}
       <div><dt>来源等级</dt><dd>{event.sourceSeverity}</dd></div>
       <div><dt>坐标</dt><dd>{event.latitude.toFixed(3)}°, {event.longitude.toFixed(3)}°</dd></div>
       <div><dt>数据来源</dt><dd>{event.source}</dd></div>
@@ -1777,7 +1784,7 @@ function LandslidePlanningCard({ event, terrain, templateCount, taskAllowed, onT
 
   if (!workflow) return null;
   return <section className="landslide-planning-card">
-    <div className="landslide-stage"><span>滑坡证据状态</span><strong>{workflow.label}</strong></div>
+    <div className="landslide-stage"><span>{event.hazardSubtype ? hazardSubtypeLabels[event.hazardSubtype] : "滑坡"}证据状态</span><strong>{workflow.label}</strong></div>
     <p>{workflow.evidenceMeaning}</p>
     <small>{workflow.dispatchRule}</small>
     <div className="terrain-request">
@@ -1789,7 +1796,7 @@ function LandslidePlanningCard({ event, terrain, templateCount, taskAllowed, onT
       <div><strong>{terrain.selectedCellCount}</strong><span>候选格网</span></div><div><strong>{terrain.maximumSlopeDeg}°</strong><span>最大近似坡度</span></div><div><strong>≥{terrain.screeningThresholdDeg}°</strong><span>本轮筛查阈值</span></div>
       <p>{terrain.note}</p>
       <a href={safeHttpUrl(terrain.sourceUrl)} target="_blank" rel="noreferrer">{terrain.attribution} ↗</a>
-      <label className="terrain-confirm" htmlFor="landslide-terrain-confirm" aria-label="人工核对地形 AOI"><input id="landslide-terrain-confirm" type="checkbox" checked={terrainReviewed} onChange={(change) => setTerrainReviewed(change.target.checked)} /><span><b>人工核对地形 AOI</b><small>我已在地图核对代表点、范围和格网；知道该结果不是滑坡实况边界。</small></span></label>
+      <label className="terrain-confirm" htmlFor="landslide-terrain-confirm" aria-label="人工核对地形 AOI"><input id="landslide-terrain-confirm" type="checkbox" checked={terrainReviewed} onChange={(change) => setTerrainReviewed(change.target.checked)} /><span><b>人工核对地形 AOI</b><small>我已在地图核对代表点、范围和格网；知道该结果不是滑坡或泥石流实况边界。</small></span></label>
       <button className="landslide-template-button" disabled={!taskAllowed || !terrainReviewed || templateCount >= 2} onClick={() => onAddTasks(terrain)}>{templateCount >= 2 ? "升降轨 SAR 模板已建立" : !taskAllowed ? "当前数据状态禁止建立任务" : !terrainReviewed ? "核对后建立双向 SAR 任务" : "建立升轨 + 降轨 SAR 任务"}</button>
       <small className="sar-template-note">两个候选均要求灾前参考影像、3 次重访和幅度变化 + InSAR 对比；最终轨向、入射角、阴影/叠掩仍由仿真窗口验证。</small>
     </div> : null}

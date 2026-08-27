@@ -18,6 +18,7 @@ const HAZARD_LABELS = {
   dust: "沙尘",
   ice: "冰雪",
 };
+const HAZARD_SUBTYPE_LABELS = { landslide: "滑坡", debris_flow: "泥石流", rockfall: "崩塌/落石", slope_failure: "边坡失稳", mass_movement: "地表物质运动" };
 
 const SEVERITY_LABELS = { red: "红色", orange: "橙色", yellow: "黄色", blue: "蓝色" };
 const SEVERITY_EMOJI = { red: "🔴", orange: "🟠", yellow: "🟡", blue: "🔵" };
@@ -105,8 +106,9 @@ export function buildEventMessage(event, changeLabel) {
 
   return [
     `${SEVERITY_EMOJI[event.severity] ?? "⚪"} **${markdownText(changeLabel, 160)}｜${markdownText(event.title, 220)}**`,
-    `- 类型/等级：${hazardLabel(event.hazard)} · ${severityLabel(event.severity)} · 优先级 **${number(event.priority, 0)}**`,
+    `- 类型/等级：${hazardLabel(event.hazard, event.hazardSubtype)} · ${severityLabel(event.severity)} · 优先级 **${number(event.priority, 0)}**`,
     `- 范围/坐标：${SCOPE_LABELS[event.scope] ?? "全球"} · \`${coordinate}\``,
+    event.crossBorder ? `- 跨境影响：起源 ${clean(event.originCountry, 40) || "待核验"} · 受影响 ${Array.isArray(event.affectedCountries) ? event.affectedCountries.map((item) => clean(item, 40)).filter(Boolean).join("、") : "待核验"}` : "",
     `- 定位质量：${locationLabel(event.locationQuality)}${accuracy} · ${review}`,
     `- 发生/更新：${formatTime(event.occurredAt)} / ${formatTime(event.updatedAt)}`,
     `- 观测阶段：${PHASE_LABELS[event.observationPhase] ?? clean(event.observationPhase, 40)}，截止 ${formatTime(event.observationExpiresAt)}`,
@@ -665,8 +667,8 @@ function booleanValue(value, fallback) {
   return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
 }
 
-function hazardLabel(value) {
-  return HAZARD_LABELS[value] ?? (clean(value, 40) || "未知灾害");
+function hazardLabel(value, subtype) {
+  return HAZARD_SUBTYPE_LABELS[subtype] ?? HAZARD_LABELS[value] ?? (clean(value, 40) || "未知灾害");
 }
 
 function severityLabel(value) {

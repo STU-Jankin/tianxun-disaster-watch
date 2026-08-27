@@ -6,12 +6,13 @@
 
 ## 当前能力
 
-- 接入 USGS 与 EMSC 地震、USGS Ground Failure 震生滑坡概率、NVE Jordskredvarsling 官方区域预警、NASA EONET、GDACS、NOAA NHC 与 NWS Alerts、加拿大 ECCC GeoMet、日本气象厅 JMA、Copernicus EMS Rapid Mapping、USGS HANS、Smithsonian GVP 与 NASA LHASA。
-- USGS Ground Failure 仅把黄色及以上模型产品作为“预报”并强制复核；NVE 使用 Kartverket 官方市县 Polygon/MultiPolygon 恢复预警适用区；NASA LHASA 公开暴露度面没有产品批次时间，当前只做源健康核验，不以读取时间伪造实时预报，也不进入自动派发。
+- 接入应急管理部地质灾害快报、USGS 与 EMSC 地震、USGS Ground Failure 震生滑坡概率、NVE Jordskredvarsling 官方区域预警、NASA EONET、GDACS、NOAA NHC 与 NWS Alerts、加拿大 ECCC GeoMet、日本气象厅 JMA、Copernicus EMS Rapid Mapping、USGS HANS、Smithsonian GVP 与 NASA LHASA。
+- 应急管理部通报只有在正文明确给出发生时间、灾种和受影响地时才进入“实况”，同一灾害后续通报聚合为一个主事件；官方地名经高德编码并近似归一到 WGS84，始终按代表点要求人工核对 AOI。跨境灾害分别保存起源国家和受影响国家。
+- USGS Ground Failure 仅把黄色及以上模型产品作为“预报”并强制复核；NVE 使用 Kartverket 官方市县 Polygon/MultiPolygon 恢复预警适用区；NASA LHASA 读取带批次时间的免认证灰度风险图，仅在官方24小时有效期内产出不低于80%的风险区，过期产品不续期，模型范围不冒充已发生灾害边界。
 - 第一优先级的 NASA FIRMS、WMO SWIC/CAP、Copernicus GloFAS，以及第二优先级的 OCHA ReliefWeb 已有独立连接器；需要密钥或订阅地址的源会明确显示“待配置”，配置字段见 `.env.example`。
 - 中国气象数据网 CMA 支持两条独立链路：带几何的 CAP/GeoJSON 预警流，以及 `SURF_CHN_MUL_HOR_3H` 地面站核验流。后者按官方目录约滞后2天、每日更新，仅作为独立核验数据读取；在没有预警编号、流域或台风编号等确定关联键时，不自动并入灾害、不单独创建任务，也不会替换权威事件中心和等级。
 - 免密钥的 MET Norway Locationforecast 为全球默认逐小时天气底座；配置 QWeather 后优先使用其格点预报，失败或额度耗尽时自动回退。二者均按事件或任务 AOI 查询未来72小时云量、降水、风速和光学气象窗口，采用30分钟服务端缓存，且不改变灾害等级，也不把数值模式结果冒充站点实况或官方预警。
-- 统一地震、火灾、洪水、气旋、火山、滑坡、干旱等事件模型。
+- 统一地震、火灾、洪水、气旋、火山、滑坡、泥石流、干旱等事件模型；泥石流作为滑坡/地表物质运动父类下的独立子类型，拥有更短的24小时黄金观测期和跨境影响字段。
 - 将不同来源的同一物理事件按灾种时空阈值合并为主事件，并保留来源证据链、可信度和事件生命周期。
 - 对有编号或名称的持续过程建立灾害实体键：同一台风、编号洪水、火山活动和季度干旱只显示一个主事件；同源连续通报作为“更新历史”，不同来源才计为独立证据。
 - 标注精确点位、估算点位、区域代表点和未知位置；非精确坐标必须由操作员核对 AOI 后才能进入任务候选单。

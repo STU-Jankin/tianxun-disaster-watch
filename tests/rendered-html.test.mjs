@@ -77,7 +77,7 @@ test("includes typed AOI, payload options, and expanded source connectors", asyn
   for (const text of ["点目标", "圆形面", "矩形面", "线状走廊", "发生时间", "载荷类型（可多选）", "SAR 成像方式（可多选）"]) assert.ok(dashboard.includes(text));
   assert.match(dashboard, /const payloadOptions = \["光学", "SAR"\]/);
   assert.match(dashboard, /sarImagingModes/);
-  for (const source of ["NASA FIRMS", "WMO SWIC/CAP", "Copernicus GloFAS", "USGS HANS", "Smithsonian GVP", "NASA LHASA", "OCHA ReliefWeb"]) assert.ok(route.includes(source));
+  for (const source of ["NASA FIRMS", "WMO SWIC/CAP", "Copernicus GloFAS", "USGS HANS", "Smithsonian GVP", "NASA LHASA", "OCHA ReliefWeb", "应急管理部地质灾害快报"]) assert.ok(route.includes(source));
   assert.match(route, /needs_config/);
 });
 
@@ -432,10 +432,10 @@ test("adds evidence-safe landslide terrain screening and complementary SAR task 
   const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
   const terrainApi = await readFile(new URL("../app/api/landslide-terrain/route.ts", import.meta.url), "utf8");
   const planning = await readFile(new URL("../lib/landslide-planning.ts", import.meta.url), "utf8");
-  assert.match(dashboard, /滑坡证据状态/);
+  assert.match(dashboard, /证据状态/);
   assert.match(dashboard, /生成地形约束 AOI/);
   assert.match(dashboard, /建立升轨 \+ 降轨 SAR 任务/);
-  assert.match(dashboard, /不是滑坡实况边界/);
+  assert.match(dashboard, /不是滑坡或泥石流实况边界/);
   assert.match(terrainApi, /authorizeApiRequest\(request, "operator"\)/);
   assert.match(terrainApi, /plan\.points\.map/);
   assert.match(planning, /gridSize = 7/);

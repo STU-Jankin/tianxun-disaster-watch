@@ -44,6 +44,13 @@ export type AmapConfiguration = {
   origin: string;
 };
 
+export type AmapGeocodeResult = {
+  formattedAddress: string;
+  level: string;
+  district: string;
+  coordinate: RoutingCoordinate;
+};
+
 const strategyLabels: Record<number, string> = {
   32: "高德推荐路线",
   33: "躲避拥堵路线",
@@ -80,6 +87,36 @@ export function buildAmapCoordinateConversionUrl(config: AmapConfiguration, coor
     output: "json",
   }).toString();
   return url.toString();
+}
+
+export function buildAmapGeocodeUrl(config: AmapConfiguration, address: string, city = "") {
+  const normalizedAddress = address.replace(/[\r\n\t]+/g, " ").trim().slice(0, 160);
+  if (normalizedAddress.length < 2) throw new Error("高德地理编码地址过短");
+  const url = new URL("/v3/geocode/geo", config.origin);
+  url.search = new URLSearchParams({
+    key: config.key,
+    address: normalizedAddress,
+    ...(city.trim() ? { city: city.trim().slice(0, 40) } : {}),
+    output: "json",
+  }).toString();
+  return url.toString();
+}
+
+export function parseAmapGeocodes(payload: unknown): AmapGeocodeResult[] {
+  const record = asRecord(payload, "高德地理编码响应无效");
+  if (String(record.status ?? "") !== "1") throw new Error(amapFailure(record, "高德地理编码失败"));
+  const geocodes = Array.isArray(record.geocodes) ? record.geocodes : [];
+  return geocodes.flatMap((value): AmapGeocodeResult[] => {
+    if (!isRecord(value)) return [];
+    const coordinate = parseCoordinate(cleanText(value.location, 60));
+    if (!coordinate || outsideChina(coordinate)) return [];
+    return [{
+      formattedAddress: cleanText(value.formatted_address, 160),
+      level: cleanText(value.level, 30),
+      district: cleanText(value.district, 60),
+      coordinate: gcj02ToWgs84(coordinate),
+    }];
+  }).slice(0, 10);
 }
 
 export function buildAmapDrivingUrl(config: AmapConfiguration, origin: RoutingCoordinate, destination: RoutingCoordinate, strategy: number) {
