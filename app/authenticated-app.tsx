@@ -8,6 +8,9 @@ type SessionUser = { username: string; role: "viewer" | "operator" | "admin" };
 export function AuthenticatedApp({ user }: { user: SessionUser }) {
   const [logoutBusy, setLogoutBusy] = useState(false);
   const [logoutError, setLogoutError] = useState("");
+  const [sessionExpiresAt, setSessionExpiresAt] = useState<number | null>(null);
+  const [sessionWarningDismissed, setSessionWarningDismissed] = useState(false);
+  const [clock, setClock] = useState(() => Date.now());
 
   useEffect(() => {
     let stopped = false;
@@ -15,22 +18,37 @@ export function AuthenticatedApp({ user }: { user: SessionUser }) {
       if (document.visibilityState === "hidden") return;
       try {
         const response = await fetch("/api/auth/session", { cache: "no-store" });
-        if (!stopped && response.status === 401) window.location.replace("/");
+        if (!stopped && response.status === 401) {
+          window.sessionStorage.setItem("tianxun:session-notice", "登录已到期。你的本机候选任务和推演草稿仍已保留，请重新登录后继续。 ");
+          window.location.replace("/");
+          return;
+        }
+        if (!stopped && response.ok) {
+          const result = await response.json() as { expiresAt?: string | number };
+          const expiresAt = typeof result.expiresAt === "number" ? result.expiresAt : Date.parse(String(result.expiresAt ?? ""));
+          if (Number.isFinite(expiresAt)) setSessionExpiresAt(expiresAt);
+        }
       } catch {
         // A transient network failure must not discard a still-valid session.
       }
     };
+    void verifySession();
     const timer = window.setInterval(() => void verifySession(), 60_000);
+    const clockTimer = window.setInterval(() => setClock(Date.now()), 30_000);
     const onVisible = () => { if (document.visibilityState === "visible") void verifySession(); };
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("focus", onVisible);
     return () => {
       stopped = true;
       window.clearInterval(timer);
+      window.clearInterval(clockTimer);
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", onVisible);
     };
   }, []);
+
+  const remainingSessionMs = sessionExpiresAt === null ? Number.POSITIVE_INFINITY : sessionExpiresAt - clock;
+  const showSessionWarning = !sessionWarningDismissed && remainingSessionMs > 0 && remainingSessionMs <= 5 * 60_000;
 
   const logout = async () => {
     setLogoutBusy(true);
@@ -50,6 +68,7 @@ export function AuthenticatedApp({ user }: { user: SessionUser }) {
 
   return <>
     <Dashboard currentUser={user} onLogout={() => void logout()} logoutBusy={logoutBusy} />
+    {showSessionWarning ? <div className="auth-toast session-warning" role="alert"><span>登录将在 {Math.max(1, Math.ceil(remainingSessionMs / 60_000))} 分钟内到期。本机候选任务和推演草稿会保留；请及时完成当前操作并重新登录。</span><button onClick={() => setSessionWarningDismissed(true)}>知道了</button></div> : null}
     {logoutError ? <div className="auth-toast" role="alert">{logoutError}<button onClick={() => setLogoutError("")}>关闭</button></div> : null}
   </>;
 }
@@ -62,7 +81,17 @@ export function LoginScreen({ configured, serviceUnavailable = false }: { config
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [credentialError, setCredentialError] = useState(false);
+  const [sessionNotice, setSessionNotice] = useState("");
   const errorRef = useRef<HTMLParagraphElement>(null);
+
+  useEffect(() => {
+    const notice = window.sessionStorage.getItem("tianxun:session-notice") ?? "";
+    const timer = window.setTimeout(() => {
+      if (notice) setSessionNotice(notice.trim());
+      window.sessionStorage.removeItem("tianxun:session-notice");
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   useEffect(() => {
     if (error) errorRef.current?.focus();
@@ -182,6 +211,7 @@ export function LoginScreen({ configured, serviceUnavailable = false }: { config
         {capsLock ? <p id="login-caps-lock" className="login-caps-lock" role="status">大写锁定已开启，请确认密码大小写。</p> : null}
         {!configured ? <p className="login-error" role="alert">登录服务尚未启用，请联系系统管理员。</p> : null}
         {serviceUnavailable ? <p className="login-error" role="alert">登录服务暂时不可用，请稍后重试或联系系统管理员。</p> : null}
+        {sessionNotice ? <p className="login-session-notice" role="status">{sessionNotice}</p> : null}
         {error ? <p id="login-error" ref={errorRef} className="login-error" role="alert" tabIndex={-1}>{error}</p> : null}
         <button type="submit" disabled={disabled}>{busy ? "正在验证…" : "登录并进入系统"}</button>
       </form>

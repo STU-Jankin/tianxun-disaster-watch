@@ -134,9 +134,10 @@ export function validateSatelliteTask(task: Record<string, unknown>, options: { 
   if (task.cycloneTrackingTarget !== undefined && !["center", "wind_field", "uncertainty_area"].includes(String(task.cycloneTrackingTarget))) errors.push("台风动态跟踪目标无效");
   validateCycloneTrackingSelection(task, start, end, errors);
   if (!isValidApproval(task.aoiApproval)) errors.push("AOI 审批状态无效");
-  if (options.requireApproved && task.aoiApproval !== "source_verified" && task.aoiApproval !== "operator_confirmed") errors.push("任务尚未通过 AOI 审批");
-  if (options.requireApproved && task.aoiApproval === "source_verified" && task.aoiType !== "source") errors.push("来源核验任务必须使用不可修改的来源几何");
-  if (options.requireApproved && task.aoiApproval === "operator_confirmed" && (typeof task.approvalReason !== "string" || !task.approvalReason.trim() || task.approvalReason.length > 500)) errors.push("人工核对任务必须填写审批理由");
+  const approvalRequired = options.requireApproved || task.status !== "candidate";
+  if (approvalRequired && task.aoiApproval !== "source_verified" && task.aoiApproval !== "operator_confirmed") errors.push("任务尚未通过 AOI 审批");
+  if (approvalRequired && task.aoiApproval === "source_verified" && task.aoiType !== "source") errors.push("来源核验任务必须使用不可修改的来源几何");
+  if (approvalRequired && task.aoiApproval === "operator_confirmed" && (typeof task.approvalReason !== "string" || !task.approvalReason.trim() || task.approvalReason.length > 500)) errors.push("人工核对任务必须填写审批理由");
   const revision = Number(task.revision ?? 0);
   if (!Number.isInteger(revision) || revision < 0) errors.push("任务 revision 必须是非负整数");
   if (options.requireProvenance) {
@@ -212,7 +213,7 @@ export function safeHttpUrl(value: unknown, fallback = "#") {
 }
 
 function isValidApproval(value: unknown) {
-  return value === "source_verified" || value === "operator_confirmed";
+  return value === "source_verified" || value === "operator_confirmed" || value === "review_required";
 }
 
 function validateExecutionProvenance(task: Record<string, unknown>, errors: string[]) {

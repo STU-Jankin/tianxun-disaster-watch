@@ -25,6 +25,7 @@ const SEVERITY_EMOJI = { red: "🔴", orange: "🟠", yellow: "🟡", blue: "�
 const LOCATION_LABELS = { precise: "精确", estimated: "估算", representative: "代表点", unknown: "未知" };
 const SCOPE_LABELS = { wuxi: "无锡市", jiangsu: "江苏省", china: "中国", global: "全球" };
 const PHASE_LABELS = { golden: "黄金观测期", followup: "后续观测期", archive: "已过观测期" };
+const PHENOMENON_LABELS = { observed: "灾害实况", warning: "权威预警", forecast: "灾害预报" };
 
 export function severityRank(value) {
   return { blue: 1, yellow: 2, orange: 3, red: 4 }[value] ?? 0;
@@ -51,7 +52,7 @@ export function signPayload(secret, body, timestamp = "") {
 export function changeNotifications(previous, event, config) {
   const changes = [];
   if (!previous) {
-    if (isAlertable(event, config)) changes.push({ type: "new", label: "新灾害事件" });
+    if (isAlertable(event, config)) changes.push({ type: "new", label: event.phenomenonStage === "observed" ? "发现新的灾害实况" : event.phenomenonStage === "warning" ? "收到新的权威预警" : "收到新的灾害预报" });
     return changes;
   }
 
@@ -87,7 +88,7 @@ export function changeNotifications(previous, event, config) {
   return changes;
 }
 
-export function buildEventMessage(event, changeLabel) {
+export function buildEventMessage(event, changeLabel, publicUrl = "") {
   const coordinate = `${number(event.latitude, 5)}, ${number(event.longitude, 5)}`;
   const accuracy = Number.isFinite(Number(event.locationAccuracyKm)) ? `（约 ±${number(event.locationAccuracyKm, 0)} km）` : "";
   const sourceUrl = safeUrl(event.sourceUrl);
@@ -99,24 +100,34 @@ export function buildEventMessage(event, changeLabel) {
   const targets = Array.isArray(event.observationTargets) && event.observationTargets.length
     ? event.observationTargets.slice(0, 5).map((item) => markdownText(item, 50)).join("、")
     : "待判定";
-  const review = event.aoiApprovalRequired ? "⚠️ AOI 需人工复核" : "✅ AOI 可直接进入仿真规划";
+  const review = event.aoiApprovalRequired ? "⚠️ AOI 需人工复核" : "✅ 来源几何已核验，可建立规划候选";
   const forecast = event.hazard === "cyclone" && event.cycloneForecast
     ? `- 官方预报：${clean(event.cycloneForecast.source, 80)} · ${number(event.cycloneForecast.track?.length, 0)} 个中心节点 · 有效至 ${formatTime(event.cycloneForecast.forecastValidUntil)} · ${clean(event.cycloneForecast.impactThreshold || "本报次无官方风圈", 100)}`
     : "";
+  const referenceTime = event.phenomenonStage === "observed"
+    ? `- 发生时间：${formatTime(event.occurredAt)} · 最新更新 ${formatTime(event.updatedAt)}`
+    : `- 发布时间：${formatTime(event.issuedAt || event.updatedAt)}${event.validFrom ? ` · 生效 ${formatTime(event.validFrom)}` : ""}${event.validTo ? ` · 有效至 ${formatTime(event.validTo)}` : ""}`;
+  const nextStep = event.aoiApprovalRequired
+    ? "请在系统中核对事件位置和观测范围，再建立卫星任务候选。"
+    : "可进入系统查看详情，并建立卫星任务候选后进行机会计算。";
+  const systemLink = safeUrl(publicUrl) ? `- 打开系统：[查看事件与规划任务](${safeUrl(publicUrl)})` : "";
 
   return [
     `${SEVERITY_EMOJI[event.severity] ?? "⚪"} **${markdownText(changeLabel, 160)}｜${markdownText(event.title, 220)}**`,
+    `- 信息性质：${PHENOMENON_LABELS[event.phenomenonStage] ?? "待核验信息"}`,
     `- 类型/等级：${hazardLabel(event.hazard, event.hazardSubtype)} · ${severityLabel(event.severity)} · 优先级 **${number(event.priority, 0)}**`,
     `- 范围/坐标：${SCOPE_LABELS[event.scope] ?? "全球"} · \`${coordinate}\``,
     event.crossBorder ? `- 跨境影响：起源 ${clean(event.originCountry, 40) || "待核验"} · 受影响 ${Array.isArray(event.affectedCountries) ? event.affectedCountries.map((item) => clean(item, 40)).filter(Boolean).join("、") : "待核验"}` : "",
     `- 定位质量：${locationLabel(event.locationQuality)}${accuracy} · ${review}`,
-    `- 发生/更新：${formatTime(event.occurredAt)} / ${formatTime(event.updatedAt)}`,
+    referenceTime,
     `- 观测阶段：${PHASE_LABELS[event.observationPhase] ?? clean(event.observationPhase, 40)}，截止 ${formatTime(event.observationExpiresAt)}`,
     `- AOI/目标：${clean(event.geometryType || "Point", 30)} · ${targets}`,
     forecast,
     `- 可选载荷：${sensors}`,
     `- 证据/来源：${number(sourceEvidenceCount(event), 0)} 个独立来源，过程公告 ${number(event.bulletinCount ?? event.updateCount, 0)} 期 · ${source}`,
-    `- 事件键：\`${clean(event.entityKey || event.masterEventId || event.id, 180)}\``,
+    `- 事件编号：\`${clean(event.entityKey || event.masterEventId || event.id, 180)}\``,
+    `- 建议下一步：${nextStep}`,
+    systemLink,
   ].filter(Boolean).join("\n");
 }
 
@@ -137,6 +148,7 @@ export function defaultConfig(env = process.env) {
     requestTimeoutMs: boundedNumber(env.REQUEST_TIMEOUT_MS, 1000, 120000, 45000),
     bootstrapNotify: booleanValue(env.BOOTSTRAP_NOTIFY, true),
     notifyPhaseTransition: booleanValue(env.NOTIFY_PHASE_TRANSITION, true),
+    publicUrl: safeUrl(env.TIANXUN_PUBLIC_URL || ""),
   };
 }
 
@@ -344,7 +356,7 @@ function processEvents(db, events, payload, config) {
             dedupeKey: `${key}:material:${version}`,
             kind: "event_material_change",
             entityKey: key,
-            message: buildEventMessage(event, changes.map((change) => change.label).join("；")),
+            message: buildEventMessage(event, changes.map((change) => change.label).join("；"), config.publicUrl),
           });
         }
       }
@@ -379,7 +391,7 @@ function processEvents(db, events, payload, config) {
           message: [
             "✅ **天巡灾害后台已建立运行基线**",
             `- 当前有效主事件：${actionable} 个`,
-            `- 达到通知阈值：${high} 个（基线事件不逐条轰炸）`,
+            `- 达到通知阈值：${high} 个（首次启动只记录现状，不逐条发送旧事件）`,
             `- 在线数据源：${online}/${(payload.sourceStatus || []).length}`,
             `- 首次采集：${formatTime(payload.fetchedAt || now)}`,
             "- 后续仅推送新事件、等级升级、证据增强、定位改善、重要台风位移及系统故障。",

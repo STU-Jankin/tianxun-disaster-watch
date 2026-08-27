@@ -161,7 +161,8 @@ test("models canonical events, evidence provenance and AOI dispatch gates", asyn
   assert.match(route, /mergePolicy/);
   assert.match(route, /isSamePhysicalEvent/);
   for (const field of ["masterEventId", "evidenceCount", "confidenceScore", "locationQuality", "dispatchEligibility"]) assert.ok(route.includes(field));
-  assert.match(dashboard, /需先人工核对 AOI/);
+  assert.match(dashboard, /保存为候选草稿/);
+  assert.match(dashboard, /AOI 待复核/);
   assert.match(dashboard, /计算卫星任务机会/);
   for (const table of ["canonical_events", "event_evidence", "satellite_tasks", "task_status_history"]) assert.ok(schema.includes(table));
 });
@@ -278,8 +279,8 @@ test("implements stale-data, map resize, AOI preview and server task gates", asy
   assert.match(dashboard, /数据更新异常/);
   assert.match(dashboard, /aoiLayerRef/);
   assert.match(dashboard, /geo-cluster/);
-  assert.match(dashboard, /aria-modal="true"/);
-  assert.match(dashboard, /inert=\{modalPanelOpen/);
+  assert.match(dashboard, /aria-modal=\{compact \? "true"/);
+  assert.match(dashboard, /obscured=\{mapObscured\}/);
   assert.match(dashboard, /高优先事件/);
   assert.match(dashboard, /重试解析/);
   assert.match(taskRoute, /validateSatelliteTask/);
@@ -306,7 +307,7 @@ test("adds a bounded phase-three response simulation, disruption review and infr
   const infrastructure = await readFile(new URL("../lib/osm-infrastructure.ts", import.meta.url), "utf8");
   const operational = await readFile(new URL("../db/operational.ts", import.meta.url), "utf8");
   assert.match(dashboard, /建立处置推演场景/);
-  assert.match(dashboard, /真实道路、毁损台账与基础设施暴露第三阶段/);
+  assert.match(dashboard, /真实路网、道路中断与基础设施复核/);
   assert.match(dashboard, /生成真实道路候选/);
   assert.match(dashboard, /真实路网不可用时：直线敏感性估算/);
   assert.match(dashboard, /耗时采用高德返回值，不读取直线估算速度/);

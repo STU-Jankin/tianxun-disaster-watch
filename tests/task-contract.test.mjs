@@ -40,6 +40,17 @@ test("requires payload for visibility/export and accepts a complete task", async
   assert.equal(validateSatelliteTask(task).ok, false, "reviewed tasks always require a payload");
 });
 
+test("persists an unapproved candidate draft but blocks calculation and reviewed status", async () => {
+  const { validateSatelliteTask } = await contract();
+  const task = validTask();
+  task.aoiApproval = "review_required";
+  task.aoiType = "circle";
+  assert.equal(validateSatelliteTask(task).ok, true, "candidate drafts may be saved before AOI review");
+  assert.match(validateSatelliteTask(task, { requireApproved: true }).errors.join(" "), /尚未通过 AOI 审批/);
+  task.status = "reviewed";
+  assert.equal(validateSatelliteTask(task).ok, false, "reviewed tasks must have an explicit AOI approval");
+});
+
 test("validates the operator-selected SAR imaging modes independently of optical payloads", async () => {
   const { validateSatelliteTask } = await contract();
   const task = validTask();

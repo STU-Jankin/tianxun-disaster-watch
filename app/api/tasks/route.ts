@@ -132,12 +132,12 @@ export async function POST(request: Request) {
     const approvalUnchanged = task.aoiApproval === "operator_confirmed" && existing?.aoiApproval === "operator_confirmed" && existing.aoiHash === nextAoiHash;
     const approvedAt = task.aoiApproval === "operator_confirmed"
       ? approvalUnchanged ? existing?.approvedAt : new Date().toISOString()
-      : canonical.event.updatedAt;
+      : task.aoiApproval === "source_verified" ? canonical.event.updatedAt : undefined;
     const approvedBy = task.aoiApproval === "operator_confirmed"
       ? approvalUnchanged ? existing?.approvedBy : actor
-      : canonical.event.source;
+      : task.aoiApproval === "source_verified" ? canonical.event.source : undefined;
     const approvedTask = { ...draft, approvedAt, approvedBy, aoiHash: nextAoiHash };
-    const finalValidation = validateSatelliteTask(approvedTask, { requireApproved: true, requireProvenance: true });
+    const finalValidation = validateSatelliteTask(approvedTask, { requireApproved: task.status === "reviewed", requireProvenance: true });
     if (!finalValidation.ok) return Response.json({ error: "任务校验失败", errors: finalValidation.errors }, { status: 400 });
     return Response.json({ task: await upsertSatelliteTask(approvedTask as unknown as Parameters<typeof upsertSatelliteTask>[0], { payloadJson: JSON.stringify(canonical.event) }, actor, isAdmin), storage: "operational-database" });
   } catch (error) {

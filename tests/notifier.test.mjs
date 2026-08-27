@@ -127,8 +127,8 @@ test("Feishu message includes task-planning fields and coordinates", () => {
   assert.match(message, /20\.00000, 120\.00000/);
   assert.match(message, /AOI 需人工复核/);
   assert.match(message, /SAR \/ 红外/);
-  assert.match(message, /发生\/更新/);
-  assert.match(message, /事件键/);
+  assert.match(message, /发生时间|发布时间/);
+  assert.match(message, /事件编号/);
   assert.match(message, /官方预报：JMA · 3 个中心节点/);
   assert.match(message, /当前强风警戒域/);
 });

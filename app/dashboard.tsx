@@ -104,6 +104,8 @@ type SourceStatus = {
   setupUrl: string;
 };
 type AoiType = "source" | "point" | "circle" | "rectangle" | "corridor" | "polygon" | "multi";
+type ResponsePointPickTarget = "origin" | "destination";
+type ResponsePickedPoint = { target: ResponsePointPickTarget; longitude: number; latitude: number; sequence: number };
 
 type SatelliteTask = {
   taskId: string;
@@ -160,7 +162,7 @@ type SatelliteTask = {
   locationQuality: DisasterEvent["locationQuality"];
   locationAccuracyKm: number;
   evidenceCount: number;
-  aoiApproval: "source_verified" | "operator_confirmed";
+  aoiApproval: "source_verified" | "operator_confirmed" | "review_required";
   approvedAt?: string;
   approvedBy?: string;
   createdAt: string;
@@ -350,6 +352,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
   const storageOwner = encodeURIComponent(currentUser?.username ?? "local-developer");
   const userTaskStorageKey = `${taskStorageKey}:${storageOwner}`;
   const userResponseStorageKey = `${responseStorageKey}:${storageOwner}`;
+  const userWorkspaceStorageKey = `tianxun-workspace-v1:${storageOwner}`;
   const [data, setData] = useState<ApiResponse | null>(null);
   const [scope, setScope] = useState<ScopeId>("global");
   const [hazard, setHazard] = useState<HazardType | "all">("all");
@@ -371,6 +374,8 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
   const [tasksHydrated, setTasksHydrated] = useState(false);
   const [taskPanelOpen, setTaskPanelOpen] = useState(false);
   const [responsePanelOpen, setResponsePanelOpen] = useState(false);
+  const [responsePointPickTarget, setResponsePointPickTarget] = useState<ResponsePointPickTarget | null>(null);
+  const [responsePickedPoint, setResponsePickedPoint] = useState<ResponsePickedPoint | null>(null);
   const [responseEventId, setResponseEventId] = useState<string | null>(null);
   const [responseScenarios, setResponseScenarios] = useState<ResponseScenario[]>([]);
   const [responseHydrated, setResponseHydrated] = useState(false);
@@ -381,8 +386,11 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
   const [taskStorageMode, setTaskStorageMode] = useState<TaskStorageMode>("loading");
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [clock, setClock] = useState(() => Date.now());
+  const [compactViewport, setCompactViewport] = useState(false);
   const [fleet, setFleet] = useState<SatelliteFleetState>({ state: "loading", satellites: [], current: 0 });
   const [undoDraft, setUndoDraft] = useState<{ task: SatelliteTask; expiresAt: number } | null>(null);
+  const [workspaceHydrated, setWorkspaceHydrated] = useState(false);
+  const [restoredSelectedMasterEventId, setRestoredSelectedMasterEventId] = useState<string | null>(null);
   const undoDraftTimer = useRef<number | null>(null);
   const taskTriggerRef = useRef<HTMLButtonElement>(null);
   const responseTriggerRef = useRef<HTMLButtonElement>(null);
@@ -406,6 +414,12 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     // compressing all three surfaces into an unusable strip.
     if (window.matchMedia("(max-width: 1050px)").matches) setListOpen(false);
   }, []);
+  const closeSelected = useCallback(() => {
+    const eventId = selected?.id;
+    setSelected(null);
+    if (window.matchMedia("(max-width: 1050px)").matches) setListOpen(true);
+    if (eventId) window.setTimeout(() => document.querySelector<HTMLElement>(`[data-event-id="${CSS.escape(eventId)}"]`)?.focus(), 0);
+  }, [selected]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -455,6 +469,40 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     const timer = window.setInterval(() => setClock(Date.now()), 30_000);
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 720px)");
+    const update = () => setCompactViewport(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  useEffect(() => {
+    try {
+      const saved = window.sessionStorage.getItem(userWorkspaceStorageKey);
+      if (saved) {
+        const workspace = JSON.parse(saved) as Partial<{ scope: ScopeId; hazard: HazardType | "all"; query: string; sortMode: SortMode; timeWindow: TimeWindow; timeBasis: TimeBasis; phaseFilter: PhaseFilter; selectedMasterEventId: string }>;
+        if (scopeOrder.includes(workspace.scope as ScopeId)) setScope(workspace.scope as ScopeId);
+        if (workspace.hazard === "all" || Object.hasOwn(hazardMeta, String(workspace.hazard))) setHazard(workspace.hazard as HazardType | "all");
+        if (typeof workspace.query === "string") setQuery(workspace.query.slice(0, 160));
+        if (["priority", "occurred", "updated"].includes(String(workspace.sortMode))) setSortMode(workspace.sortMode as SortMode);
+        if (["all", "1h", "6h", "24h", "7d"].includes(String(workspace.timeWindow))) setTimeWindow(workspace.timeWindow as TimeWindow);
+        if (["occurred", "updated"].includes(String(workspace.timeBasis))) setTimeBasis(workspace.timeBasis as TimeBasis);
+        if (["all", "forecast", "golden", "followup", "archive"].includes(String(workspace.phaseFilter))) setPhaseFilter(workspace.phaseFilter as PhaseFilter);
+        if (workspace.selectedMasterEventId) setRestoredSelectedMasterEventId(workspace.selectedMasterEventId);
+      }
+    } catch {
+      window.sessionStorage.removeItem(userWorkspaceStorageKey);
+    } finally {
+      setWorkspaceHydrated(true);
+    }
+  }, [userWorkspaceStorageKey]);
+
+  useEffect(() => {
+    if (!workspaceHydrated) return;
+    window.sessionStorage.setItem(userWorkspaceStorageKey, JSON.stringify({ scope, hazard, query, sortMode, timeWindow, timeBasis, phaseFilter, selectedMasterEventId: selected?.masterEventId }));
+  }, [hazard, phaseFilter, query, scope, selected?.masterEventId, sortMode, timeBasis, timeWindow, userWorkspaceStorageKey, workspaceHydrated]);
 
   useEffect(() => {
     if (previousTaskPanelOpen.current && !taskPanelOpen) taskTriggerRef.current?.focus();
@@ -655,7 +703,6 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     if (existingTask) {
       setTaskPanelOpen(true);
       setListOpen(false);
-      setSelected(null);
       setActiveTaskId(existingTask.taskId);
       return;
     }
@@ -666,7 +713,6 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     });
     setTaskPanelOpen(true);
     setListOpen(false);
-    setSelected(null);
     setActiveTaskId(task.taskId);
   }, [saveTask]);
 
@@ -676,7 +722,6 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     const additions = generated.filter((task) => !existingDirections.has(task.orbitDirectionPreference));
     if (!additions.length) {
       setTaskPanelOpen(true);
-      setSelected(null);
       return;
     }
     const next = [...additions, ...tasksRef.current];
@@ -687,14 +732,13 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     }));
     setTaskPanelOpen(true);
     setListOpen(false);
-    setSelected(null);
     setActiveTaskId(additions[0].taskId);
   }, [saveTask]);
 
   const updateTask = useCallback((taskId: string, patch: Partial<SatelliteTask>) => {
     const aoiKeys = ["aoiType", "aoiRadiusKm", "aoiWidthKm", "aoiHeightKm", "aoiLengthKm", "aoiBearingDeg", "customGeometry"];
     const touchesAoi = Object.keys(patch).some((key) => aoiKeys.includes(key));
-    const opportunityInputKeys = [...aoiKeys, "imagingStart", "imagingEnd", "sensors", "sarImagingModes", "minimumCoveragePercent", "spatialResolutionMeters", "incidenceAngleMinDeg", "incidenceAngleMaxDeg", "orbitDirectionPreference", "cycloneTrackingTarget"];
+    const opportunityInputKeys = [...aoiKeys, "imagingStart", "imagingEnd", "sensors", "sarImagingModes", "minimumCoveragePercent", "maximumCloudPercent", "spatialResolutionMeters", "incidenceAngleMinDeg", "incidenceAngleMaxDeg", "orbitDirectionPreference", "cycloneTrackingTarget", "priority", "revisitCount", "deliveryDeadline"];
     const invalidatesOpportunity = Object.keys(patch).some((key) => opportunityInputKeys.includes(key));
     const taskBeforeUpdate = tasksRef.current.find((task) => task.taskId === taskId);
     if (invalidatesOpportunity && taskBeforeUpdate?.opportunityId) {
@@ -717,7 +761,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     taskSaveControllers.current.get(taskId)?.abort();
     setTasks((current) => current.map((task) => {
       if (task.taskId !== taskId) return task;
-      return { ...task, ...opportunityReset, ...patch, ...(touchesAoi ? { aoiApproval: "operator_confirmed" as const, approvalReason: "操作员调整 AOI 参数" } : {}), updatedAt: new Date().toISOString() };
+      return { ...task, ...opportunityReset, ...patch, ...(touchesAoi ? { aoiApproval: "review_required" as const, approvedAt: undefined, approvedBy: undefined, approvalReason: undefined } : {}), updatedAt: new Date().toISOString() };
     }));
     const priorTimer = taskSaveTimers.current.get(taskId);
     if (priorTimer) window.clearTimeout(priorTimer);
@@ -824,6 +868,13 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
   const deduplicatedEvents = useMemo(() => latestEventVersionsByMasterId(data?.events ?? []), [data]);
 
   useEffect(() => {
+    if (!restoredSelectedMasterEventId || !deduplicatedEvents.length || selected) return;
+    const restored = deduplicatedEvents.find((event) => event.masterEventId === restoredSelectedMasterEventId);
+    if (restored) setSelected(restored);
+    setRestoredSelectedMasterEventId(null);
+  }, [deduplicatedEvents, restoredSelectedMasterEventId, selected]);
+
+  useEffect(() => {
     if (!selected || !data) return;
     const current = deduplicatedEvents.find((event) => event.masterEventId === selected.masterEventId) ?? deduplicatedEvents.find((event) => event.id === selected.id);
     if (!current) setSelected(null);
@@ -853,9 +904,16 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
         : b.priority - a.priority || +new Date(b.updatedAt) - +new Date(a.updatedAt));
   }, [clock, deduplicatedEvents, hazard, locationZh, phaseFilter, query, scope, sortMode, timeBasis, timeWindow]);
 
-  useEffect(() => {
-    if (selected && !filtered.some((event) => event.masterEventId === selected.masterEventId)) setSelected(null);
-  }, [filtered, selected]);
+  const selectedOutsideFilters = Boolean(selected && !filtered.some((event) => event.masterEventId === selected.masterEventId));
+  const filtersActive = Boolean(query || hazard !== "all" || timeWindow !== "all" || phaseFilter !== "all" || sortMode !== "priority" || timeBasis !== "updated");
+  const clearFilters = useCallback(() => {
+    setQuery("");
+    setHazard("all");
+    setTimeWindow("all");
+    setTimeBasis("updated");
+    setPhaseFilter("all");
+    setSortMode("priority");
+  }, []);
 
   const scopedEvents = useMemo(() => deduplicatedEvents.filter((event) => isVisibleInScope(event.scope, scope)), [deduplicatedEvents, scope]);
 
@@ -879,7 +937,16 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     setResponseEventId(event?.masterEventId ?? null);
     setResponsePanelOpen(true);
     setListOpen(false);
-    if (event) setSelected(null);
+  }, []);
+  const requestResponsePointPick = useCallback((target: ResponsePointPickTarget) => {
+    setResponsePointPickTarget(target);
+    setResponsePanelOpen(false);
+    setListOpen(false);
+  }, []);
+  const acceptResponsePointPick = useCallback((target: ResponsePointPickTarget, longitude: number, latitude: number) => {
+    setResponsePickedPoint({ target, longitude, latitude, sequence: Date.now() });
+    setResponsePointPickTarget(null);
+    setResponsePanelOpen(true);
   }, []);
   const saveResponseScenario = useCallback((scenario: ResponseScenario) => {
     setResponseScenarios((current) => [scenario, ...current.filter((item) => item.scenarioId !== scenario.scenarioId)].slice(0, 50));
@@ -925,6 +992,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     });
   }, [updateTask]);
   const modalPanelOpen = taskPanelOpen || responsePanelOpen;
+  const mapObscured = modalPanelOpen || (compactViewport && (listOpen || Boolean(selected)));
 
   return (
     <main className="app-shell">
@@ -946,7 +1014,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
           <button ref={responseTriggerRef} className="response-queue-button" onClick={() => openResponsePlanner()} aria-label={`打开处置推演场景，共${responseScenarios.length}项`}>
             处置推演 <b>{responseScenarios.length}</b>
           </button>
-          <button ref={taskTriggerRef} className="task-queue-button" onClick={() => { document.querySelectorAll<HTMLDetailsElement>("details[open]").forEach((details) => { details.open = false; }); setResponsePanelOpen(false); setActiveResponseScenarioId(null); setSelected(null); setListOpen(false); setTaskPanelOpen(true); }} aria-label={`打开卫星任务候选单，共${tasks.length}项`}>
+          <button ref={taskTriggerRef} className="task-queue-button" onClick={() => { document.querySelectorAll<HTMLDetailsElement>("details[open]").forEach((details) => { details.open = false; }); setResponsePanelOpen(false); setActiveResponseScenarioId(null); setListOpen(false); setTaskPanelOpen(true); }} aria-label={`打开卫星任务候选单，共${tasks.length}项`}>
             任务候选 <b>{tasks.length}</b>
           </button>
           <div className="time-box"><strong>{chinaTime(clock)}</strong><small>UTC+08:00</small></div>
@@ -955,7 +1023,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
       </header>
 
       <section className="control-strip" inert={modalPanelOpen ? true : undefined} aria-hidden={modalPanelOpen || undefined}>
-        <div className="scope-tabs" aria-label="重点观测范围">
+        <div className="scope-tabs" role="group" aria-label="重点观测范围">
           <span className="strip-label">重点范围</span>
           {scopeOrder.map((id, index) => (
             <button key={id} onClick={() => setScope(id)} className={scope === id ? "active" : ""} aria-pressed={scope === id}>
@@ -963,7 +1031,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
             </button>
           ))}
         </div>
-        <SourceStatusPanel sources={data?.sourceStatus ?? []} forceClosed={modalPanelOpen} />
+        <SourceStatusPanel sources={data?.sourceStatus ?? []} forceClosed={modalPanelOpen} isAdmin={currentUser?.role === "admin"} />
       </section>
 
       <section className={`workspace ${modalPanelOpen ? "tasks-open" : ""} ${responsePanelOpen ? "response-open" : ""}`}>
@@ -979,10 +1047,12 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
             <div><span>时效剔除</span><strong>{data?.expiredCount ?? 0}</strong><small>已自动归档</small></div>
           </div>
           {data?.retainedCount ? <div className="retained-banner"><strong>{data.retainedCount}</strong> 个主事件当前未在短时源中复现，仍按既定观测期持续监测。</div> : null}
-          {modeStale ? <div className="stale-banner" role="alert">当前为{lastRefreshErrorAt ? "刷新失败后的保留结果" : runtimeMode}；不得将本轮读取时间当作灾害观测时间，自动下发已禁止。</div> : null}
+          {modeStale ? <div className="stale-banner" role="alert">当前为{lastRefreshErrorAt ? "刷新失败后的保留结果" : runtimeMode}；可以保存候选草稿，但不能把本轮读取时间当作灾害观测时间，也不能计算、导出或进入下发复核。</div> : null}
           <HazardFilters selected={hazard} onChange={setHazard} events={scopedEvents} />
           <SortControl selected={sortMode} onChange={setSortMode} />
           <TimeFilterControl windowValue={timeWindow} basis={timeBasis} phase={phaseFilter} onWindowChange={setTimeWindow} onBasisChange={setTimeBasis} onPhaseChange={setPhaseFilter} />
+          {filtersActive ? <button className="clear-filters" onClick={clearFilters}>清除全部筛选</button> : null}
+          {selectedOutsideFilters ? <div className="selection-outside-filter" role="status">当前详情不在筛选结果中，仍为你保留。<button onClick={clearFilters}>显示在列表中</button></div> : null}
           <ObservationPolicy />
           <div className="event-list">
             {loading && !data ? <LoadingList /> : null}
@@ -1000,7 +1070,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
 
         {!listOpen && <button className="reopen-panel" onClick={() => setListOpen(true)} inert={modalPanelOpen ? true : undefined} aria-hidden={modalPanelOpen || undefined}>事件列表 <b>{filtered.length}</b> ›</button>}
 
-          <MapView scope={scope} events={filtered} selected={selected} terrainScreening={selected ? landslideTerrain[selected.masterEventId] : undefined} activeTask={activeTask} activeResponseScenario={activeResponseScenario} fleet={fleet} detailOpen={Boolean(selected) && !modalPanelOpen && !activeResponseScenario} layoutKey={`${modalPanelOpen}-${listOpen}-${activeResponseScenario?.scenarioId ?? "none"}`} obscured={modalPanelOpen} onSelect={selectEvent} onCustomAoiChange={updateCustomAoi} onReturnToTask={() => setTaskPanelOpen(true)} onReturnToResponse={() => setResponsePanelOpen(true)} />
+          <MapView scope={scope} events={filtered} selected={selected} terrainScreening={selected ? landslideTerrain[selected.masterEventId] : undefined} activeTask={activeTask} activeResponseScenario={activeResponseScenario} fleet={fleet} detailOpen={Boolean(selected) && !modalPanelOpen && !activeResponseScenario} layoutKey={`${modalPanelOpen}-${listOpen}-${activeResponseScenario?.scenarioId ?? "none"}`} obscured={mapObscured} responsePointPickTarget={responsePointPickTarget} onResponsePointPick={acceptResponsePointPick} onCancelResponsePointPick={() => { setResponsePointPickTarget(null); setResponsePanelOpen(true); }} onSelect={selectEvent} onCustomAoiChange={updateCustomAoi} onReturnToTask={() => setTaskPanelOpen(true)} onReturnToResponse={() => setResponsePanelOpen(true)} />
 
         <div className="map-legend" inert={modalPanelOpen ? true : undefined} aria-hidden={modalPanelOpen || undefined}>
           <span><i className="red" />红色</span><span><i className="orange" />橙色</span><span><i className="yellow" />黄色</span><span><i className="blue" />蓝色</span>
@@ -1011,9 +1081,9 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
           {activeResponseScenario ? <><em /><span><i className="response-route-clear-key" />未检出相交</span><span><i className="response-route-limited-key" />影响区内撤离</span><span><i className="response-route-blocked-key" />禁用/未核验</span>{activeResponseScenario.infrastructureFeatures?.length ? <span><i className="infrastructure-exposure-key" />OSM 设施暴露</span> : null}</> : null}
         </div>
 
-        {selected && !activeResponseScenario && <DetailPanel event={selected} nowMs={clock} obscured={modalPanelOpen} dispatchBlocked={modeStale} locationZh={locationZh[selected.id]} locationLoading={locationLoading === selected.id} locationState={locationState[selected.id]?.state} onRetryLocation={() => { setLocationState((current) => { const next = { ...current }; delete next[selected.id]; return next; }); setLocationRetry((value) => value + 1); }} taskAdded={tasks.some((task) => taskMatchesEvent(task, selected))} landslideTemplateCount={new Set(tasks.filter((task) => task.masterEventId === selected.masterEventId && ["ascending", "descending"].includes(String(task.orbitDirectionPreference))).map((task) => task.orbitDirectionPreference)).size} terrainScreening={landslideTerrain[selected.masterEventId]} onTerrainChange={(terrain) => setLandslideTerrain((current) => { const next = { ...current }; if (terrain) next[selected.masterEventId] = terrain; else delete next[selected.masterEventId]; return next; })} aoiConfirmed={confirmedAois.has(selected.masterEventId)} onConfirmAoi={(confirmed) => setConfirmedAois((current) => { const next = new Set(current); if (confirmed) next.add(selected.masterEventId); else next.delete(selected.masterEventId); return next; })} onAddTask={addTask} onAddLandslideTasks={addLandslideSarTasks} onResponsePlan={openResponsePlanner} onClose={() => setSelected(null)} />}
+        {selected && !activeResponseScenario && <DetailPanel event={selected} nowMs={clock} compact={compactViewport} obscured={modalPanelOpen} dispatchBlocked={modeStale} locationZh={locationZh[selected.id]} locationLoading={locationLoading === selected.id} locationState={locationState[selected.id]?.state} onRetryLocation={() => { setLocationState((current) => { const next = { ...current }; delete next[selected.id]; return next; }); setLocationRetry((value) => value + 1); }} taskAdded={tasks.some((task) => taskMatchesEvent(task, selected))} landslideTemplateCount={new Set(tasks.filter((task) => task.masterEventId === selected.masterEventId && ["ascending", "descending"].includes(String(task.orbitDirectionPreference))).map((task) => task.orbitDirectionPreference)).size} terrainScreening={landslideTerrain[selected.masterEventId]} onTerrainChange={(terrain) => setLandslideTerrain((current) => { const next = { ...current }; if (terrain) next[selected.masterEventId] = terrain; else delete next[selected.masterEventId]; return next; })} aoiConfirmed={confirmedAois.has(selected.masterEventId)} onConfirmAoi={(confirmed) => setConfirmedAois((current) => { const next = new Set(current); if (confirmed) next.add(selected.masterEventId); else next.delete(selected.masterEventId); return next; })} onAddTask={addTask} onAddLandslideTasks={addLandslideSarTasks} onResponsePlan={openResponsePlanner} onClose={closeSelected} />}
         <TaskPanel open={taskPanelOpen} tasks={tasks} syncState={taskSync} storageMode={taskStorageMode} fleet={fleet} activeTaskId={activeTaskId} onActivate={reviewTaskAoi} onUpdate={updateTask} onRemove={(taskId) => void removeTask(taskId)} onClose={closeTaskPanel} onRetry={saveTask} />
-        {responsePanelOpen && <ResponsePlanPanel event={responsePlanningEvent} events={deduplicatedEvents} scenarios={responseScenarios} activeScenarioId={activeResponseScenarioId} onSave={saveResponseScenario} onActivate={reviewResponseScenario} onSelectRoute={selectResponseRoute} onRemove={removeResponseScenario} onChooseEvent={(event) => setResponseEventId(event.masterEventId)} onClose={closeResponsePanel} />}
+        <ResponsePlanPanel open={responsePanelOpen} event={responsePlanningEvent} events={deduplicatedEvents} scenarios={responseScenarios} activeScenarioId={activeResponseScenarioId} currentUserRole={currentUser?.role ?? "admin"} pickedPoint={responsePickedPoint} onRequestPointPick={requestResponsePointPick} onSave={saveResponseScenario} onActivate={reviewResponseScenario} onSelectRoute={selectResponseRoute} onRemove={removeResponseScenario} onChooseEvent={(event) => setResponseEventId(event.masterEventId)} onClose={closeResponsePanel} />
         {undoDraft ? <div className="task-undo-toast" role="status"><span>已删除本机草稿：{undoDraft.task.title}</span><button onClick={restoreDraft}>撤销</button></div> : null}
       </section>
     </main>
@@ -1024,27 +1094,49 @@ function roleLabel(role: "viewer" | "operator" | "admin") {
   return role === "admin" ? "系统管理员" : role === "operator" ? "任务操作员" : "只读观察员";
 }
 
-function SourceStatusPanel({ sources, forceClosed }: { sources: SourceStatus[]; forceClosed: boolean }) {
+function SourceStatusPanel({ sources, forceClosed, isAdmin }: { sources: SourceStatus[]; forceClosed: boolean; isAdmin: boolean }) {
   const detailsRef = useRef<HTMLDetailsElement>(null);
-  useEffect(() => { if (forceClosed && detailsRef.current) detailsRef.current.open = false; }, [forceClosed]);
+  const [open, setOpen] = useState(false);
+  const effectiveOpen = open && !forceClosed;
+  useEffect(() => {
+    if (!effectiveOpen) return;
+    const close = (event: MouseEvent | globalThis.KeyboardEvent) => {
+      if (event instanceof globalThis.KeyboardEvent && event.key !== "Escape") return;
+      if (event instanceof MouseEvent && detailsRef.current?.contains(event.target as Node)) return;
+      setOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", close);
+    return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", close); };
+  }, [effectiveOpen]);
   const online = sources.filter((source) => source.state === "online").length;
   const pending = sources.filter((source) => source.state === "needs_config").length;
-  return <details ref={detailsRef} className="source-status">
-    <summary><span><i className="online-dot" />数据源 {online}/{sources.length}</span>{pending ? <b>{pending} 待配置</b> : null}</summary>
-    <div className="source-status-popover">
+  return <details ref={detailsRef} className="source-status" open={effectiveOpen} onToggle={(event) => setOpen(!forceClosed && event.currentTarget.open)}>
+    <summary><span><i className="online-dot" />{sources.length ? `数据源 ${online}/${sources.length}` : "数据源正在连接…"}</span>{pending ? <b>{pending} 待配置</b> : null}</summary>
+    <div className="source-status-popover" role="dialog" aria-modal="false" aria-label="数据源运行状态">
+      <div className="source-status-heading"><strong>数据源运行状态</strong><button type="button" onClick={() => setOpen(false)} aria-label="关闭数据源状态">×</button></div>
       {(["中国第一批", "中国第二批", "基础", "第一优先级", "第二优先级"] as const).map((tier) => <section key={tier}>
         <h3>{tier}</h3>
-        {sources.filter((source) => source.tier === tier).map((source) => <a key={source.name} href={safeHttpUrl(source.setupUrl)} target="_blank" rel="noreferrer" className={source.state} title={source.message}>
-          <i /><span><strong>{source.name}</strong><small>{source.role} · {source.message}</small></span><b>{source.state === "online" ? source.producing ? source.count : "仅连通" : source.state === "needs_config" ? "待配置" : "异常"}</b>
-        </a>)}
+        {sources.filter((source) => source.tier === tier).map((source) => <div key={source.name} className={`source-status-item ${source.state}`}>
+          <i /><span><strong>{source.name}</strong><small>{source.role} · {humanizeSourceStatus(source)}</small>{isAdmin ? <details><summary>技术详情</summary><code>{source.message}</code></details> : null}</span><b>{source.state === "online" ? source.producing ? `${source.count} 条` : "连接正常" : source.state === "needs_config" ? "需配置" : "暂不可用"}</b><a href={safeHttpUrl(source.setupUrl)} target="_blank" rel="noreferrer">查看来源</a>
+        </div>)}
       </section>)}
-      <footer>区域通报只生成任务初筛AOI；传感器点位和受灾边界必须由正式矢量或实测数据替换。“核验”源不生成任务坐标。</footer>
+      <footer>区域通报只用于任务初筛；正式规划前仍需用权威矢量或实测数据复核范围。“核验”来源只补充证据，不生成任务坐标。</footer>
     </div>
   </details>;
 }
 
+function humanizeSourceStatus(source: SourceStatus) {
+  if (source.state === "online" && source.producing) return `本轮已接收 ${source.count} 条有效记录`;
+  if (source.state === "online") return "连接正常，本轮暂无符合条件的新记录";
+  if (source.state === "needs_config") return "尚未完成服务配置，请联系管理员";
+  if (/timeout|timed out|fetch failed|ECONN|ENOTFOUND|HTTP\s*5/i.test(source.message)) return "上游服务暂时不可用，系统将保留上次有效结果";
+  if (/key|token|credential|env|配置|认证/i.test(source.message)) return "服务凭据或访问配置需要管理员处理";
+  return "本轮连接失败，系统将按既定观测期保留已有事件";
+}
+
 function SortControl({ selected, onChange }: { selected: SortMode; onChange: (value: SortMode) => void }) {
-  return <div className="sort-control" aria-label="事件排序方式">
+  return <div className="sort-control" role="group" aria-label="事件排序方式">
     <span>排序</span>
     <button aria-pressed={selected === "priority"} className={selected === "priority" ? "active" : ""} onClick={() => onChange("priority")}>综合优先</button>
     <button aria-pressed={selected === "occurred"} className={selected === "occurred" ? "active" : ""} onClick={() => onChange("occurred")}>最新发生</button>
@@ -1055,7 +1147,7 @@ function SortControl({ selected, onChange }: { selected: SortMode; onChange: (va
 
 function TimeFilterControl({ windowValue, basis, phase, onWindowChange, onBasisChange, onPhaseChange }: { windowValue: TimeWindow; basis: TimeBasis; phase: PhaseFilter; onWindowChange: (value: TimeWindow) => void; onBasisChange: (value: TimeBasis) => void; onPhaseChange: (value: PhaseFilter) => void }) {
   const windows: Array<{ id: TimeWindow; label: string }> = [{ id: "all", label: "全部" }, { id: "1h", label: "1小时" }, { id: "6h", label: "6小时" }, { id: "24h", label: "24小时" }, { id: "7d", label: "7天" }];
-  return <div className="time-filter-control" aria-label="事件时间与观测阶段筛选">
+  return <div className="time-filter-control" role="group" aria-label="事件时间与观测阶段筛选">
     <div><span>时间</span>{windows.map((item) => <button key={item.id} aria-pressed={windowValue === item.id} className={windowValue === item.id ? "active" : ""} onClick={() => onWindowChange(item.id)}>{item.label}</button>)}</div>
     <div><span>依据</span><button aria-pressed={basis === "updated"} className={basis === "updated" ? "active" : ""} onClick={() => onBasisChange("updated")}>最新更新</button><button aria-pressed={basis === "occurred"} className={basis === "occurred" ? "active" : ""} onClick={() => onBasisChange("occurred")}>发生时间</button></div>
     <label>观测阶段<select value={phase} onChange={(event) => onPhaseChange(event.target.value as PhaseFilter)}><option value="all">全部阶段</option><option value="forecast">预报候选期</option><option value="golden">黄金观测期</option><option value="followup">后续观测期</option><option value="archive">已归档</option></select></label>
@@ -1064,7 +1156,7 @@ function TimeFilterControl({ windowValue, basis, phase, onWindowChange, onBasisC
 
 function HazardFilters({ selected, onChange, events }: { selected: HazardType | "all"; onChange: (value: HazardType | "all") => void; events: DisasterEvent[] }) {
   const options: Array<HazardType | "all"> = ["all", "earthquake", "tsunami", "wildfire", "flood", "cyclone", "volcano", "landslide", "drought", "dust", "ice"];
-  return <div className="hazard-filters">
+  return <div className="hazard-filters" role="group" aria-label="灾害类型筛选">
     {options.map((id) => {
       const count = id === "all" ? events.length : events.filter((e) => e.hazard === id).length;
       return <button key={id} aria-pressed={selected === id} onClick={() => onChange(id)} className={selected === id ? "active" : ""}>
@@ -1104,7 +1196,7 @@ function EventCard({ event, active, onClick }: { event: DisasterEvent; active: b
   </button>;
 }
 
-function MapView({ scope, events, selected, terrainScreening, activeTask, activeResponseScenario, fleet, detailOpen, layoutKey, obscured, onSelect, onCustomAoiChange, onReturnToTask, onReturnToResponse }: { scope: ScopeId; events: DisasterEvent[]; selected: DisasterEvent | null; terrainScreening?: LandslideTerrainScreening; activeTask: SatelliteTask | null; activeResponseScenario: ResponseScenario | null; fleet: SatelliteFleetState; detailOpen: boolean; layoutKey: string; obscured: boolean; onSelect: (event: DisasterEvent) => void; onCustomAoiChange: (taskId: string, geometry?: CustomAoiGeometry) => void; onReturnToTask: () => void; onReturnToResponse: () => void }) {
+function MapView({ scope, events, selected, terrainScreening, activeTask, activeResponseScenario, fleet, detailOpen, layoutKey, obscured, responsePointPickTarget, onResponsePointPick, onCancelResponsePointPick, onSelect, onCustomAoiChange, onReturnToTask, onReturnToResponse }: { scope: ScopeId; events: DisasterEvent[]; selected: DisasterEvent | null; terrainScreening?: LandslideTerrainScreening; activeTask: SatelliteTask | null; activeResponseScenario: ResponseScenario | null; fleet: SatelliteFleetState; detailOpen: boolean; layoutKey: string; obscured: boolean; responsePointPickTarget: ResponsePointPickTarget | null; onResponsePointPick: (target: ResponsePointPickTarget, longitude: number, latitude: number) => void; onCancelResponsePointPick: () => void; onSelect: (event: DisasterEvent) => void; onCustomAoiChange: (taskId: string, geometry?: CustomAoiGeometry) => void; onReturnToTask: () => void; onReturnToResponse: () => void }) {
   const bbox = scopes[scope].bbox;
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<import("leaflet").Map | null>(null);
@@ -1128,6 +1220,8 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
   const [drawingTaskId, setDrawingTaskId] = useState<string | null>(null);
   const [draftVertices, setDraftVertices] = useState<Array<[number, number]>>([]);
   const [drawingError, setDrawingError] = useState("");
+  const [vertexLongitude, setVertexLongitude] = useState("");
+  const [vertexLatitude, setVertexLatitude] = useState("");
   const [orbitsVisible, setOrbitsVisible] = useState(false);
   const [clusterSelection, setClusterSelection] = useState<DisasterEvent[]>([]);
   const activeTrackingSlice = useMemo(() => {
@@ -1279,6 +1373,19 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
       map.off("click", onMapClick);
     };
   }, [activeDrawing, activeTask, mapReady]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!mapReady || !map || !responsePointPickTarget || activeDrawing) return;
+    const target = responsePointPickTarget;
+    const onMapClick = (event: import("leaflet").LeafletMouseEvent) => onResponsePointPick(target, Number(event.latlng.lng.toFixed(7)), Number(event.latlng.lat.toFixed(7)));
+    map.getContainer().classList.add("response-point-pick-cursor");
+    map.on("click", onMapClick);
+    return () => {
+      map.getContainer().classList.remove("response-point-pick-cursor");
+      map.off("click", onMapClick);
+    };
+  }, [activeDrawing, mapReady, onResponsePointPick, responsePointPickTarget]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -1750,13 +1857,27 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
     setDrawingError("");
   }, [activeDraftVertices, activeTask, onCustomAoiChange]);
 
+  const addVertexByCoordinates = () => {
+    const longitude = Number(vertexLongitude);
+    const latitude = Number(vertexLatitude);
+    if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180 || !Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
+      setDrawingError("请输入有效经纬度：经度 -180～180，纬度 -90～90");
+      return;
+    }
+    setDraftVertices((current) => current.length >= 2000 ? current : [...current, [longitude, latitude]]);
+    setVertexLongitude("");
+    setVertexLatitude("");
+    setDrawingError("");
+  };
+
   const activeResponseRoute = activeResponseScenario?.routes.find((route) => route.routeId === activeResponseScenario.selectedRouteId) ?? activeResponseScenario?.routes[0];
 
-  return <div className="map-stage" inert={obscured ? true : undefined} aria-hidden={obscured || undefined}>
+  return <div className="map-stage" role="region" aria-label="灾害与任务地图" inert={obscured ? true : undefined} aria-hidden={obscured || undefined}>
     <div ref={containerRef} className="leaflet-map" aria-label={`${scopes[scope].label}灾害事件地图`} />
     <div className="map-shade" />
     <div className="map-title"><span>观测视图</span><strong>{scopes[scope].label}</strong><small>{events.length} 个事件 · 行政范围为快速筛选近似边界</small><button className="orbit-toggle" aria-pressed={orbitsVisible} disabled={!fleet.current} onClick={() => setOrbitsVisible((visible) => !visible)}><i />{orbitsVisible ? "隐藏卫星轨道" : "显示卫星轨道"}<b>{fleet.state === "loading" ? "…" : fleet.current}</b></button>{orbitsVisible ? <small className="orbit-disclaimer">TLE/SGP4 外推 · 非星上遥测</small> : null}</div>
     <div className="coordinates">WGS 84 · {viewLabel || "地图初始化中"}</div>
+    {responsePointPickTarget ? <div className="response-point-pick-toolbar" role="status"><strong>点击地图设置{responsePointPickTarget === "origin" ? "起点" : "目的地"}</strong><span>所选位置会写回处置推演表单（WGS 84）</span><button onClick={onCancelResponsePointPick}>取消取点</button></div> : null}
     {clusterSelection.length ? <aside className="cluster-selection" aria-label="选择邻近灾害事件">
       <div><strong>此处有 {clusterSelection.length} 个事件</strong><button onClick={() => setClusterSelection([])} aria-label="关闭邻近事件列表">×</button></div>
       {clusterSelection.map((event) => <button key={event.masterEventId} className={event.severity} onClick={() => { setClusterSelection([]); onSelect(event); }}><span>{hazardMeta[event.hazard].symbol}</span><b>{event.title}</b><small>{severityLabels[event.severity]} · 优先级 {event.priority}</small></button>)}
@@ -1778,6 +1899,7 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
       <button onClick={onReturnToTask}>返回任务单</button>
       {activeTrackingSlice ? <small>蓝色目标为所选卫星机会对应的未来预测位置，不是台风当前实况中心；官方新报次到达后需重新计算。</small> : null}
       {activeDrawing ? <small>在地图依次点击边界顶点，完成后点击“完成当前面”。{activeDraftVertices.length} 个顶点。</small> : null}
+      {activeDrawing ? <div className="aoi-keyboard-vertex"><label>经度<input type="number" min="-180" max="180" step="0.000001" value={vertexLongitude} onChange={(event) => setVertexLongitude(event.target.value)} /></label><label>纬度<input type="number" min="-90" max="90" step="0.000001" value={vertexLatitude} onChange={(event) => setVertexLatitude(event.target.value)} /></label><button onClick={addVertexByCoordinates} disabled={!vertexLongitude || !vertexLatitude}>添加坐标点</button><span aria-live="polite">已添加 {activeDraftVertices.length} 个顶点</span></div> : null}
       {drawingError ? <small className="drawing-error" role="alert">{drawingError}</small> : null}
     </div> : null}
     {!activeTask && activeResponseScenario && activeResponseRoute ? <div className="map-review-toolbar response-review-toolbar" role="group" aria-label="处置推演路线复核">
@@ -1789,16 +1911,33 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
   </div>;
 }
 
-function DetailPanel({ event, nowMs, obscured, dispatchBlocked, locationZh, locationLoading, locationState, onRetryLocation, taskAdded, landslideTemplateCount, terrainScreening, onTerrainChange, aoiConfirmed, onConfirmAoi, onAddTask, onAddLandslideTasks, onResponsePlan, onClose }: { event: DisasterEvent; nowMs: number; obscured: boolean; dispatchBlocked: boolean; locationZh?: string; locationLoading: boolean; locationState?: "resolved" | "fallback" | "error"; onRetryLocation: () => void; taskAdded: boolean; landslideTemplateCount: number; terrainScreening?: LandslideTerrainScreening; onTerrainChange: (terrain?: LandslideTerrainScreening) => void; aoiConfirmed: boolean; onConfirmAoi: (confirmed: boolean) => void; onAddTask: (event: DisasterEvent, operatorConfirmed: boolean) => void; onAddLandslideTasks: (event: DisasterEvent, terrain: LandslideTerrainScreening) => void; onResponsePlan: (event: DisasterEvent) => void; onClose: () => void }) {
+function DetailPanel({ event, nowMs, compact, obscured, dispatchBlocked, locationZh, locationLoading, locationState, onRetryLocation, taskAdded, landslideTemplateCount, terrainScreening, onTerrainChange, aoiConfirmed, onConfirmAoi, onAddTask, onAddLandslideTasks, onResponsePlan, onClose }: { event: DisasterEvent; nowMs: number; compact: boolean; obscured: boolean; dispatchBlocked: boolean; locationZh?: string; locationLoading: boolean; locationState?: "resolved" | "fallback" | "error"; onRetryLocation: () => void; taskAdded: boolean; landslideTemplateCount: number; terrainScreening?: LandslideTerrainScreening; onTerrainChange: (terrain?: LandslideTerrainScreening) => void; aoiConfirmed: boolean; onConfirmAoi: (confirmed: boolean) => void; onAddTask: (event: DisasterEvent, operatorConfirmed: boolean) => void; onAddLandslideTasks: (event: DisasterEvent, terrain: LandslideTerrainScreening) => void; onResponsePlan: (event: DisasterEvent) => void; onClose: () => void }) {
   const isDemo = event.source === "演示数据";
+  const panelRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
-  useEffect(() => { if (window.matchMedia("(max-width: 720px)").matches) closeRef.current?.focus(); }, [event.id]);
+  useEffect(() => {
+    if (!compact) return;
+    closeRef.current?.focus();
+    const onKeyDown = (keyboardEvent: KeyboardEvent) => {
+      if (keyboardEvent.key === "Escape") onClose();
+      if (keyboardEvent.key !== "Tab" || !panelRef.current) return;
+      const focusable = [...panelRef.current.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), [href]')];
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (keyboardEvent.shiftKey && document.activeElement === first) { keyboardEvent.preventDefault(); last.focus(); }
+      else if (!keyboardEvent.shiftKey && document.activeElement === last) { keyboardEvent.preventDefault(); first.focus(); }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [compact, event.id, onClose]);
   const taskWindowValid = Date.parse(event.observationExpiresAt) > nowMs + 3_600_000;
   const cycloneForecastUsable = !event.cycloneForecast || Date.parse(event.cycloneForecast.forecastValidUntil) > nowMs + 3_600_000;
   const needsAoiReview = event.aoiApprovalRequired || !cycloneForecastUsable;
-  const canDispatch = !dispatchBlocked && !isDemo && taskWindowValid && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived" && (!needsAoiReview || aoiConfirmed);
-  const canBuildTerrainTask = !dispatchBlocked && !isDemo && taskWindowValid && event.dispatchEligibility !== "blocked" && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived";
-  return <aside className="detail-panel" aria-labelledby={`detail-title-${event.id}`} inert={obscured ? true : undefined} aria-hidden={obscured || undefined}>
+  const canSaveCandidate = !isDemo && taskWindowValid && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived";
+  const canEnterDispatchReview = !dispatchBlocked && canSaveCandidate && (!needsAoiReview || aoiConfirmed);
+  const canBuildTerrainTask = !isDemo && taskWindowValid && event.dispatchEligibility !== "blocked" && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived";
+  return <aside ref={panelRef} className="detail-panel" role={compact ? "dialog" : "region"} aria-modal={compact ? "true" : undefined} aria-labelledby={`detail-title-${event.id}`} inert={obscured ? true : undefined} aria-hidden={obscured || undefined}>
     <button ref={closeRef} className="detail-close" onClick={onClose} aria-label="关闭详情">×</button>
     <div className={`detail-kicker ${event.severity}`}><span>{hazardMeta[event.hazard].symbol}</span>{event.hazardSubtype ? hazardSubtypeLabels[event.hazardSubtype] : hazardMeta[event.hazard].label} · {severityLabels[event.severity]} · {phenomenonLabels[event.phenomenonStage]}{event.crossBorder ? " · 跨境影响" : ""}</div>
     <h2 id={`detail-title-${event.id}`}>{event.title}</h2>
@@ -1857,7 +1996,8 @@ function DetailPanel({ event, nowMs, obscured, dispatchBlocked, locationZh, loca
     <a className="source-link" href={safeHttpUrl(event.sourceUrl)} target="_blank" rel="noreferrer">查看权威来源 ↗</a>
     <button className="response-plan-button" onClick={() => onResponsePlan(event)}>建立处置推演场景</button>
     {needsAoiReview ? <div className="aoi-approval"><input id={`aoi-confirm-${event.id}`} type="checkbox" checked={aoiConfirmed} onChange={(change) => onConfirmAoi(change.target.checked)} /><label htmlFor={`aoi-confirm-${event.id}`}><strong>人工核对 AOI</strong><small>{!cycloneForecastUsable ? "官方台风报次已不足一小时，不再作为预测 AOI；如需灾后复核，请在地图重新圈定实况 AOI。" : "地图已用绿色虚线显示完整来源几何；确认前请核对目标类型、范围和代表点误差。"}</small></label></div> : null}
-    <button className="task-button" onClick={() => onAddTask(event, aoiConfirmed)} disabled={taskAdded || !canDispatch}>{taskAdded ? "已加入卫星任务候选" : dispatchBlocked ? "非实时/数据库降级状态禁止下发" : isDemo ? "演示事件禁止下发" : !taskWindowValid ? "观测期不足一小时，禁止建立任务" : !canDispatch ? "需先人工核对 AOI" : "加入卫星任务候选"}</button>
+    <button className="task-button" onClick={() => onAddTask(event, aoiConfirmed)} disabled={taskAdded || !canSaveCandidate}>{taskAdded ? "已加入卫星任务候选" : isDemo ? "演示事件不能建立任务" : !taskWindowValid ? "观测期不足一小时，不能建立任务" : canEnterDispatchReview ? "加入卫星任务候选" : "保存为候选草稿"}</button>
+    {!canEnterDispatchReview && canSaveCandidate ? <small className="task-candidate-note">当前可先保存候选草稿；完成 AOI 复核且数据恢复实时后，才能计算、导出或进入下发复核。</small> : null}
   </aside>;
 }
 
@@ -1954,11 +2094,15 @@ function WeatherForecastCard({ latitude, longitude, maximumCloudPercent, compact
   </section>;
 }
 
-function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave, onActivate, onSelectRoute, onRemove, onChooseEvent, onClose }: {
+function ResponsePlanPanel({ open, event, events, scenarios, activeScenarioId, currentUserRole, pickedPoint, onRequestPointPick, onSave, onActivate, onSelectRoute, onRemove, onChooseEvent, onClose }: {
+  open: boolean;
   event: DisasterEvent | null;
   events: DisasterEvent[];
   scenarios: ResponseScenario[];
   activeScenarioId: string | null;
+  currentUserRole: "viewer" | "operator" | "admin";
+  pickedPoint: ResponsePickedPoint | null;
+  onRequestPointPick: (target: ResponsePointPickTarget) => void;
   onSave: (scenario: ResponseScenario) => void;
   onActivate: (scenarioId: string) => void;
   onSelectRoute: (scenarioId: string, routeId: string) => void;
@@ -1983,6 +2127,12 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
   const [planError, setPlanError] = useState("");
   const [roadRoutingState, setRoadRoutingState] = useState<"idle" | "loading" | "ready" | "fallback">("idle");
   const [infrastructureQueryState, setInfrastructureQueryState] = useState<"idle" | InfrastructureAssessment["state"]>("idle");
+  const [eventQuery, setEventQuery] = useState("");
+  const [actionNotice, setActionNotice] = useState("");
+  const matchingEvents = useMemo(() => {
+    const needle = eventQuery.trim().toLowerCase();
+    return events.filter((candidate) => !needle || `${candidate.title} ${candidate.country ?? ""} ${hazardMeta[candidate.hazard].label}`.toLowerCase().includes(needle)).slice(0, 80);
+  }, [eventQuery, events]);
   const effectiveRoadDisruptions = useMemo(() => {
     const combined = new Map<string, RoadDisruption>();
     for (const disruption of [...registryDisruptions, ...roadDisruptions]) combined.set(disruption.disruptionId, disruption);
@@ -2006,6 +2156,7 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
   }, []);
 
   useEffect(() => {
+    if (!open) return;
     closeRef.current?.focus();
     const onKeyDown = (keyboardEvent: KeyboardEvent) => {
       if (keyboardEvent.key === "Escape") onClose();
@@ -2019,7 +2170,7 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  }, [onClose, open]);
 
   useEffect(() => {
     const start = window.setTimeout(() => { void refreshRoadRegistry(); }, 0);
@@ -2045,6 +2196,25 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
     return () => window.clearTimeout(reset);
   }, [event]);
 
+  useEffect(() => {
+    if (!pickedPoint) return;
+    const timer = window.setTimeout(() => {
+      const longitude = pickedPoint.longitude.toFixed(6);
+      const latitude = pickedPoint.latitude.toFixed(6);
+      if (pickedPoint.target === "origin") {
+        setOriginLongitude(longitude);
+        setOriginLatitude(latitude);
+      } else {
+        setDestinationLongitude(longitude);
+        setDestinationLatitude(latitude);
+      }
+      setPlanError("");
+      setRoadRoutingState("idle");
+      setActionNotice(`已从地图设置${pickedPoint.target === "origin" ? "起点" : "目的地"}：${latitude}, ${longitude}`);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [pickedPoint]);
+
   const routeInputs = () => ({
     origin: [Number(originLongitude), Number(originLatitude)] as ResponseCoordinate,
     destination: [Number(destinationLongitude), Number(destinationLatitude)] as ResponseCoordinate,
@@ -2064,6 +2234,7 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
       });
       onSave(scenario);
       setRoadRoutingState("fallback");
+      setActionNotice(`已生成并保存 ${scenario.routes.length} 条直线敏感性估算；请在下方逐条查看影响区相交情况。`);
     } catch (error) {
       setPlanError(error instanceof Error ? error.message : "推演参数无效");
     }
@@ -2107,6 +2278,7 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
       onSave(scenario);
       setInfrastructureQueryState(infrastructure.state);
       setRoadRoutingState("ready");
+      setActionNotice(`已生成并保存 ${scenario.routes.length} 条真实道路候选；请在下方选择路线并打开地图复核。`);
     } catch (error) {
       setRoadRoutingState("idle");
       setInfrastructureQueryState("idle");
@@ -2152,6 +2324,9 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
 
   const reviewRoadReport = async (entry: RoadDisruptionRegistryEntry, action: "verify" | "resolve" | "reject") => {
     if (registryBusyId) return;
+    if (currentUserRole !== "admin") return;
+    const actionLabel = action === "verify" ? "核验并作为路线阻断依据" : action === "resolve" ? "解除这条道路中断" : "驳回这条现场上报";
+    if (!window.confirm(`确认${actionLabel}“${entry.label}”？完成后现有路线需要重新计算。`)) return;
     setRegistryBusyId(entry.disruptionId);
     setDisruptionError("");
     try {
@@ -2164,6 +2339,7 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
       if (!response.ok) throw new Error(result.error || `道路中断核验失败（HTTP ${response.status}）`);
       await refreshRoadRegistry();
       setRoadRoutingState("idle");
+      setActionNotice(`道路中断已${action === "verify" ? "核验" : action === "resolve" ? "解除" : "驳回"}；请重新生成路线候选。`);
     } catch (error) {
       setDisruptionError(error instanceof Error ? error.message : "道路中断核验失败");
     } finally {
@@ -2181,34 +2357,36 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
     window.setTimeout(() => URL.revokeObjectURL(url), 0);
   };
 
-  return <aside ref={panelRef} className="task-panel response-panel" role="dialog" aria-modal="true" aria-labelledby="response-panel-title">
+  return <aside ref={panelRef} className="task-panel response-panel" role="dialog" aria-modal={open ? "true" : undefined} aria-labelledby="response-panel-title" hidden={!open} inert={!open ? true : undefined}>
     <div className="task-panel-heading response-panel-heading">
       <div><span>处置支持</span><h2 id="response-panel-title">处置推演 <b>{scenarios.length}</b></h2><p>真实路网 + 中断台账 + 设施暴露 · WGS 84</p></div>
       <button ref={closeRef} onClick={onClose} aria-label="关闭处置推演">×</button>
     </div>
     <div className="response-panel-body">
       <section className="response-method-note">
-        <strong>真实道路、毁损台账与基础设施暴露第三阶段</strong>
+        <strong>真实路网、道路中断与基础设施复核</strong>
         <p>中国境内支持高德驾车、步行、骑行和电动自行车规划，并用灾害影响场、核验台账及免认证 OSM/Overpass 桥梁、隧道、涉水点三次筛查。OSM 是静态社区地图，不证明设施当前完好；燃油摩托车没有可靠专用接口，暂不冒充驾车路线。</p>
       </section>
       <section className="response-create">
         <h3>建立推演场景</h3>
+        <label>搜索灾害事件<input type="search" value={eventQuery} onChange={(change) => setEventQuery(change.target.value)} placeholder="输入灾种、地点或事件名称" /></label>
         <label>灾害主事件
           <select value={event?.masterEventId ?? ""} onChange={(change) => { const selectedEvent = events.find((candidate) => candidate.masterEventId === change.target.value); if (selectedEvent) onChooseEvent(selectedEvent); }}>
             <option value="">请选择事件</option>
-            {events.slice(0, 250).map((candidate) => <option key={candidate.masterEventId} value={candidate.masterEventId}>{hazardMeta[candidate.hazard].label} · {candidate.title}</option>)}
+            {matchingEvents.map((candidate) => <option key={candidate.masterEventId} value={candidate.masterEventId}>{hazardMeta[candidate.hazard].label} · {candidate.title}</option>)}
           </select>
         </label>
         {event ? <>
           <div className={`response-source-quality ${event.dispatchEligibility}`}><strong>{event.dispatchEligibility === "ready" ? "事件来源已核验" : "事件需要人工复核"}</strong><span>{event.cycloneForecast?.impactField ? `${event.cycloneForecast.impactField.frames.length} 个台风逐时影响场时间片` : `${event.geometry.type} 来源几何`} · 更新 {formatTimeWithYear(event.updatedAt)} UTC+08</span></div>
           <div className="response-fields">
             <label>出行方式<select value={travelMode} onChange={(change) => { const mode = change.target.value as AmapTravelMode; setTravelMode(mode); setFallbackSpeed(mode === "walking" ? "5" : mode === "bicycling" ? "15" : mode === "electrobike" ? "25" : "35"); setRoadRoutingState("idle"); }}>{Object.entries(amapTravelModeLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-            <label>起点经度<input inputMode="decimal" value={originLongitude} onChange={(change) => setOriginLongitude(change.target.value)} /></label>
-            <label>起点纬度<input inputMode="decimal" value={originLatitude} onChange={(change) => setOriginLatitude(change.target.value)} /></label>
-            <label>目的地经度<input inputMode="decimal" value={destinationLongitude} onChange={(change) => setDestinationLongitude(change.target.value)} /></label>
-            <label>目的地纬度<input inputMode="decimal" value={destinationLatitude} onChange={(change) => setDestinationLatitude(change.target.value)} /></label>
+            <label>起点经度<input inputMode="decimal" value={originLongitude} aria-describedby={planError ? "response-plan-error" : undefined} onChange={(change) => setOriginLongitude(change.target.value)} /></label>
+            <label>起点纬度<input inputMode="decimal" value={originLatitude} aria-describedby={planError ? "response-plan-error" : undefined} onChange={(change) => setOriginLatitude(change.target.value)} /></label>
+            <label>目的地经度<input inputMode="decimal" value={destinationLongitude} aria-describedby={planError ? "response-plan-error" : undefined} onChange={(change) => setDestinationLongitude(change.target.value)} /></label>
+            <label>目的地纬度<input inputMode="decimal" value={destinationLatitude} aria-describedby={planError ? "response-plan-error" : undefined} onChange={(change) => setDestinationLatitude(change.target.value)} /></label>
             <label>出发时间（UTC+08）<input type="datetime-local" value={departureAt} onChange={(change) => setDepartureAt(change.target.value)} /></label>
           </div>
+          <div className="response-point-actions" role="group" aria-label="设置推演起终点"><button type="button" onClick={() => onRequestPointPick("origin")}>在地图选起点</button><button type="button" onClick={() => onRequestPointPick("destination")}>在地图选目的地</button><button type="button" onClick={() => { setOriginLongitude(event.longitude.toFixed(6)); setOriginLatitude(event.latitude.toFixed(6)); setRoadRoutingState("idle"); }}>起点使用灾害中心</button><button type="button" onClick={() => { const nextOriginLongitude = destinationLongitude; const nextOriginLatitude = destinationLatitude; setDestinationLongitude(originLongitude); setDestinationLatitude(originLatitude); setOriginLongitude(nextOriginLongitude); setOriginLatitude(nextOriginLatitude); setRoadRoutingState("idle"); }}>交换起终点</button></div>
           <div className="response-disruption-import">
             <div><strong>道路毁损与封闭</strong><span>{registryState === "loading" ? "正在读取中断台账…" : registryState === "public-read-only" ? "公网只读入口不展示内部现场上报" : registryState === "unavailable" ? "台账不可用；本次只能使用临时导入" : `有效台账 ${registryDisruptions.length} 条 · 本次临时导入 ${roadDisruptions.length} 条`}</span></div>
             <label>上传 GeoJSON<input type="file" accept=".geojson,.json,application/geo+json,application/json" onChange={(change) => { const file = change.target.files?.[0]; void importRoadDisruptions(file); change.target.value = ""; }} /></label>
@@ -2219,12 +2397,13 @@ function ResponsePlanPanel({ event, events, scenarios, activeScenarioId, onSave,
           {registryDisruptions.length ? <div className="response-disruption-registry" aria-label="有效道路中断台账">
             {registryDisruptions.slice(0, 12).map((entry) => <article key={entry.disruptionId} className={entry.verification}>
               <div><strong>{roadDisruptionKindLabel(entry.kind)} · {entry.label}</strong><span>{entry.verification === "verified" ? "已核验" : "现场上报待核验"} · {entry.impact === "blocked" ? "完全阻断" : "限制通行"} · v{entry.revision}</span><small>{entry.source || "未提供外部来源"} · 有效至 {entry.validTo ? `${formatTimeWithYear(entry.validTo)} UTC+08` : "未设置"}</small></div>
-              <div>{entry.verification === "reported" ? <><button disabled={registryBusyId === entry.disruptionId} onClick={() => void reviewRoadReport(entry, "verify")}>核验</button><button disabled={registryBusyId === entry.disruptionId} onClick={() => void reviewRoadReport(entry, "reject")}>驳回</button></> : null}<button disabled={registryBusyId === entry.disruptionId} onClick={() => void reviewRoadReport(entry, "resolve")}>解除</button></div>
+              <div>{currentUserRole === "admin" ? <>{entry.verification === "reported" ? <><button disabled={registryBusyId === entry.disruptionId} onClick={() => void reviewRoadReport(entry, "verify")}>核验</button><button disabled={registryBusyId === entry.disruptionId} onClick={() => void reviewRoadReport(entry, "reject")}>驳回</button></> : null}<button disabled={registryBusyId === entry.disruptionId} onClick={() => void reviewRoadReport(entry, "resolve")}>解除</button></> : <small>仅管理员可核验或解除</small>}</div>
             </article>)}
             {registryDisruptions.length > 12 ? <p>另有 {registryDisruptions.length - 12} 条有效记录参与计算；为控制面板长度未全部展开。</p> : null}
           </div> : null}
           {disruptionError ? <div className="response-plan-error" role="alert">{disruptionError}</div> : null}
-          {planError ? <div className="response-plan-error" role="alert">{planError}</div> : null}
+          {planError ? <div id="response-plan-error" className="response-plan-error" role="alert">{planError}</div> : null}
+          {actionNotice ? <div className="response-action-notice" role="status">{actionNotice}</div> : null}
           <div className="response-generate-actions">
             <button className="response-generate" onClick={() => void generateRoad()} disabled={roadRoutingState === "loading"}>{roadRoutingState === "loading" ? "正在连接路网与基础设施…" : "生成真实道路候选"}</button>
           </div>
@@ -2282,6 +2461,9 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
   const [compareRightId, setCompareRightId] = useState("");
   const [copiedTaskId, setCopiedTaskId] = useState<string | null>(null);
   const [exportError, setExportError] = useState("");
+  const [exportScope, setExportScope] = useState<"eligible" | "scheduled" | "selected">("eligible");
+  const [selectedExportTaskIds, setSelectedExportTaskIds] = useState<Set<string>>(new Set());
+  const [expandedTaskIds, setExpandedTaskIds] = useState<Set<string>>(new Set());
   const [aoiImportError, setAoiImportError] = useState<Record<string, string>>({});
   const [weatherTaskId, setWeatherTaskId] = useState<string | null>(activeTaskId);
   const panelRef = useRef<HTMLElement>(null);
@@ -2314,13 +2496,18 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
   useEffect(() => {
     const previous = previousVisibilityInputKeys.current;
     const changed = new Set(Object.keys(visibilityInputKeys).filter((taskId) => previous[taskId] && previous[taskId] !== visibilityInputKeys[taskId]));
-    const removed = Object.keys(previous).some((taskId) => !(taskId in visibilityInputKeys));
-    if (changed.size || removed) {
+    const removed = new Set(Object.keys(previous).filter((taskId) => !(taskId in visibilityInputKeys)));
+    if (changed.size || removed.size) {
       changed.forEach((taskId) => visibilityRequestGeneration.current.set(taskId, (visibilityRequestGeneration.current.get(taskId) ?? 0) + 1));
       setVisibility((current) => Object.fromEntries(Object.entries(current).filter(([taskId]) => taskId in visibilityInputKeys && !changed.has(taskId))));
-      setScheduling({ state: "idle" });
-      setManualRules(emptySchedulingManualRules());
-      setScenarioLibrary((current) => ({ ...current, active: undefined, comparison: undefined, message: undefined }));
+      const invalidTaskIds = new Set([...changed, ...removed]);
+      if (invalidTaskIds.size) {
+        setScheduling((current) => scheduleReferencesAnyTask(current, invalidTaskIds) ? { state: "idle" } : current);
+        setManualRules((current) => removeTaskRules(current, invalidTaskIds));
+        setScenarioLibrary((current) => current.active && planningScenarioReferencesAnyTask(current.active, invalidTaskIds)
+          ? { ...current, active: undefined, comparison: undefined, message: "相关任务条件已变化，旧排程已移出当前工作区；其他任务的机会仍保留。" }
+          : current);
+      }
     }
     previousVisibilityInputKeys.current = visibilityInputKeys;
   }, [visibilityInputKeys]);
@@ -2351,11 +2538,13 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [onClose, open]);
-  const exportableTasks = tasks.filter((task) => validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requirePayload: true, requireProvenance: true }).ok && syncState[task.taskId]?.state === "synced" && ["candidate", "reviewed"].includes(task.status));
   const planningProblems = useMemo(() => tasks
     .map((task) => visibility[task.taskId]?.planningProblem)
     .filter((problem): problem is MissionPlanningProblem => Boolean(problem)), [tasks, visibility]);
   const recommendedSchedule = scheduling.comparison?.recommendedAlgorithm === "priority_greedy_v1" ? scheduling.comparison.greedy : scheduling.comparison?.optimized;
+  const eligibleExportTasks = tasks.filter((task) => validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requirePayload: true, requireProvenance: true }).ok && syncState[task.taskId]?.state === "synced" && ["candidate", "reviewed"].includes(task.status));
+  const scheduledTaskIds = new Set(recommendedSchedule?.assignments.map((assignment) => assignment.taskId) ?? []);
+  const exportableTasks = eligibleExportTasks.filter((task) => exportScope === "eligible" || (exportScope === "scheduled" ? scheduledTaskIds.has(task.taskId) : selectedExportTaskIds.has(task.taskId)));
   const manualRuleCount = manualRules.lockedOpportunityRefs.length + manualRules.excludedOpportunityRefs.length + Object.keys(manualRules.forcedSatelliteByTask).length + Object.keys(manualRules.forcedImagingModeByTask).length;
   const exportableCount = exportableTasks.length;
   const exportable = exportableCount > 0;
@@ -2382,9 +2571,6 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
   const calculateVisibility = async (task: SatelliteTask) => {
     const requestGeneration = (visibilityRequestGeneration.current.get(task.taskId) ?? 0) + 1;
     visibilityRequestGeneration.current.set(task.taskId, requestGeneration);
-    setScheduling({ state: "idle" });
-    setManualRules(emptySchedulingManualRules());
-    setScenarioLibrary((current) => ({ ...current, active: undefined, comparison: undefined, message: undefined }));
     setVisibility((current) => ({ ...current, [task.taskId]: { state: "loading", windows: [] } }));
     try {
       let calculationTask = task;
@@ -2533,11 +2719,12 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
   };
   return <aside ref={panelRef} className="task-panel" role="dialog" aria-modal={open ? "true" : undefined} aria-labelledby="task-panel-title" hidden={!open} inert={!open ? true : undefined}>
     <div className="task-panel-heading">
-      <div><span>仿真系统输入</span><h2 id="task-panel-title">卫星任务候选单 <b>{tasks.length}</b></h2><p>业务数据库 + 本机离线缓存 · WGS 84</p></div>
+      <div><span>卫星任务工作台</span><h2 id="task-panel-title">卫星任务候选单 <b>{tasks.length}</b></h2><p>建立候选 → 复核 AOI → 计算机会 → 联合试排 → 导出</p></div>
       <button ref={closeRef} onClick={onClose} aria-label="关闭卫星任务候选单">×</button>
     </div>
     <div className="task-export-bar">
-      <span>导出任务包</span>
+      <span>导出任务包 · 当前 {exportableCount} 项</span>
+      <select value={exportScope} aria-label="导出任务范围" onChange={(event) => setExportScope(event.target.value as "eligible" | "scheduled" | "selected")}><option value="eligible">全部通过复核</option><option value="scheduled">当前试排结果</option><option value="selected">手动勾选</option></select>
       <button disabled={!exportable} title={exportable ? `导出 ${exportableCount} 个已通过任务` : "没有通过校验且已同步的规划任务"} onClick={() => void exportValidated("json")}>JSON</button>
       <button disabled={!exportable} title={exportable ? `导出 ${exportableCount} 个已通过任务` : "没有通过校验且已同步的规划任务"} onClick={() => void exportValidated("csv")}>CSV</button>
       <button disabled={!exportable} title={exportable ? `导出 ${exportableCount} 个已通过任务` : "没有通过校验且已同步的规划任务"} onClick={() => void exportValidated("geojson")}>GeoJSON</button>
@@ -2605,19 +2792,19 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
     {exportError ? <div className="task-export-error" role="alert">{exportError}</div> : null}
     <div className="task-list">
       {!tasks.length ? <div className="task-empty"><strong>候选单为空</strong><p>从灾害详情中点击“加入卫星任务候选”，即可在这里设置AOI和成像时间窗。</p></div> : null}
-      {tasks.map((task, index) => <article className={`task-item ${activeTaskId === task.taskId ? "active" : ""}`} key={task.taskId}>
+      {tasks.map((task, index) => <article className={`task-item ${activeTaskId === task.taskId ? "active" : ""} ${expandedTaskIds.has(task.taskId) ? "expanded" : "collapsed"}`} key={task.taskId}>
         <div className="task-item-title">
           <i>{String(index + 1).padStart(2, "0")}</i>
-          <div><h3>{task.title}</h3><p>{hazardMeta[task.hazard].label} · 优先级 {task.priority} · {observationPhaseLabels[task.observationPhase]}</p><time>事件参考时间 · {formatTimeWithYear(task.eventOccurredAt)}</time><button className="show-aoi" onClick={() => onActivate(task.taskId)}>在地图显示 AOI</button></div>
+          <div><label className="task-export-select"><input type="checkbox" checked={selectedExportTaskIds.has(task.taskId)} onChange={(event) => setSelectedExportTaskIds((current) => { const next = new Set(current); if (event.target.checked) next.add(task.taskId); else next.delete(task.taskId); return next; })} />选入手动导出</label><h3>{task.title}</h3><p>{hazardMeta[task.hazard].label} · 优先级 {task.priority} · {observationPhaseLabels[task.observationPhase]}</p><time>事件参考时间 · {formatTimeWithYear(task.eventOccurredAt)}</time><div className="task-card-actions"><button onClick={() => setExpandedTaskIds((current) => { const next = new Set(current); if (next.has(task.taskId)) next.delete(task.taskId); else next.add(task.taskId); return next; })} aria-expanded={expandedTaskIds.has(task.taskId)}>{expandedTaskIds.has(task.taskId) ? "收起参数" : "展开规划"}</button><button className="show-aoi" onClick={() => onActivate(task.taskId)}>在地图显示 AOI</button></div></div>
           {canTransitionTask(task.status, "cancelled") || ["submitted", "cancel_rejected"].includes(task.status) ? <button onClick={() => onRemove(task.taskId)} aria-label={`取消${task.title}`}>{task.status === "submitted" || task.status === "cancel_rejected" ? "申请取消" : task.revision > 0 ? "取消" : "删除草稿"}</button> : null}
         </div>
         <div className="task-coordinates"><span>中心坐标</span><code>{task.latitude.toFixed(6)}, {task.longitude.toFixed(6)}</code><button onClick={() => void copyCoordinates(task).then((copied) => { if (copied) { setCopiedTaskId(task.taskId); window.setTimeout(() => setCopiedTaskId((current) => current === task.taskId ? null : current), 1800); } })}>{copiedTaskId === task.taskId ? "已复制" : "复制"}</button></div>
-        <div className={`task-quality ${task.aoiApproval}`}><span>{locationQualityLabels[task.locationQuality]} · ±{task.locationAccuracyKm} km</span><b>{task.aoiApproval === "source_verified" ? "来源可下发" : "已人工核对"}</b><small>{task.evidenceCount} 条证据 · {task.masterEventId}</small></div>
+        <div className={`task-quality ${task.aoiApproval}`}><span>{locationQualityLabels[task.locationQuality]} · ±{task.locationAccuracyKm} km</span><b>{task.aoiApproval === "source_verified" ? "来源几何已核验" : task.aoiApproval === "operator_confirmed" ? "操作员已复核 AOI" : "AOI 待复核"}</b><small>{task.evidenceCount} 条证据 · {task.masterEventId}</small>{task.aoiApproval === "review_required" ? <button onClick={() => onUpdate(task.taskId, { aoiApproval: "operator_confirmed", approvedAt: new Date().toISOString(), approvedBy: "当前操作员", approvalReason: "操作员已在地图核对当前 AOI、位置误差和观测目标" })}>确认当前 AOI</button> : null}</div>
         <WeatherForecastCard latitude={task.latitude} longitude={task.longitude} maximumCloudPercent={task.maximumCloudPercent} compact enabled={weatherTaskId === task.taskId} onRequest={() => setWeatherTaskId(task.taskId)} />
         {task.cycloneForecast ? <div className="task-forecast-summary"><strong>官方预报已随任务保存 · 动态跟踪</strong><span>{task.cycloneForecast.track.length} 个官方中心节点{task.cycloneForecast.impactField ? ` · ${task.cycloneForecast.impactField.frames.length} 个逐时时间片` : ""} · 至 {formatTimeWithYear(task.cycloneForecast.forecastValidUntil)} UTC+08</span><small>计算时按每次卫星过境时刻匹配对应预测片；官方新报次到达后必须重新计算机会。</small></div> : null}
         {task.hazard === "landslide" && task.orbitDirectionPreference ? <div className="task-landslide-summary"><strong>{task.orbitDirectionPreference === "ascending" ? "升轨" : task.orbitDirectionPreference === "descending" ? "降轨" : "任一轨向"} SAR 滑坡模板</strong><span>{task.referenceAcquisitionRequired ? "要求灾前参考影像" : "未要求灾前参考影像"} · {task.revisitCount} 次重访</span><small>地形格网是操作员确认的筛查 AOI，不是滑坡实况边界；成像机会仍需验证轨向、入射角及地形阴影/叠掩。</small></div> : null}
         <div className={`task-sync ${syncState[task.taskId]?.state ?? "local"}`} role="status">{syncState[task.taskId]?.state === "saving" ? "正在同步…" : syncState[task.taskId]?.state === "synced" ? (syncState[task.taskId]?.message ?? "已同步到业务数据库") : syncState[task.taskId]?.state === "error" ? <>同步失败：{syncState[task.taskId]?.message ?? "请重试"} <button onClick={() => void onRetry(task)}>重试同步</button></> : "仅保存在本机"}</div>
-    <div className="aoi-type-selector" aria-label="AOI目标类型">
+    <div className="aoi-type-selector" role="group" aria-label="AOI 目标类型">
           {aoiOptions.filter((option) => option.id !== "source" || task.sourceGeometry).map((option) => <button key={option.id} aria-pressed={task.aoiType === option.id} className={task.aoiType === option.id ? "active" : ""} onClick={() => onUpdate(task.taskId, {
             aoiType: option.id,
             ...customGeometryPatch(task.customGeometry, option.id),
@@ -2671,11 +2858,11 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
           {task.hazard === "landslide" ? <><label>SAR 轨向偏好<select value={task.orbitDirectionPreference ?? "either"} onChange={(event) => onUpdate(task.taskId, { orbitDirectionPreference: event.target.value as SatelliteTask["orbitDirectionPreference"] })}><option value="ascending">升轨</option><option value="descending">降轨</option><option value="either">任一轨向</option></select></label><label>SAR 分析模式<select value={task.sarAnalysisMode ?? "amplitude_change_and_insar_pair"} onChange={(event) => onUpdate(task.taskId, { sarAnalysisMode: event.target.value as SatelliteTask["sarAnalysisMode"] })}><option value="amplitude_change_and_insar_pair">幅度变化 + InSAR 对比</option><option value="amplitude_change">幅度变化</option><option value="insar_pair">InSAR 配对</option></select></label><label className="task-checkbox-field"><input type="checkbox" checked={Boolean(task.referenceAcquisitionRequired)} onChange={(event) => onUpdate(task.taskId, { referenceAcquisitionRequired: event.target.checked })} />要求灾前参考影像</label></> : null}
         </div>
         <div className="task-targets">观测目标：{task.observationTargets.join(" · ")}</div>
-        {(() => { const validation = validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requirePayload: true, requireProvenance: true }); return validation.ok ? null : <div className="task-validation" role="alert">{validation.errors.join("；")}</div>; })()}
+        {(() => { const validation = validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requirePayload: true, requireProvenance: true }); return validation.ok ? null : <div className="task-validation" role="alert"><strong>还不能计算卫星机会</strong><ul>{validation.errors.map((error) => <li key={error}>{humanizeTaskValidationError(error)}</li>)}</ul></div>; })()}
         <div className={`visibility-box ${visibility[task.taskId]?.state ?? "idle"}`}>
-          <button onClick={() => void calculateVisibility(task)} disabled={visibility[task.taskId]?.state === "loading"}>{visibility[task.taskId]?.state === "loading" ? "正在计算轨道机会…" : task.hazard === "cyclone" && task.timeIndexedAoi?.length ? "计算台风动态跟踪机会" : "计算卫星任务机会"}</button>
+          {(() => { const ready = validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requirePayload: true, requireProvenance: true }).ok; return <button onClick={() => void calculateVisibility(task)} disabled={visibility[task.taskId]?.state === "loading" || !ready || fleet.current === 0}>{visibility[task.taskId]?.state === "loading" ? "正在计算轨道机会…" : fleet.current === 0 ? "暂无可用轨道，暂不能计算" : !ready ? "请先完成上方必填项" : task.hazard === "cyclone" && task.timeIndexedAoi?.length ? "计算台风动态跟踪机会" : "计算卫星任务机会"}</button>; })()}
           {visibility[task.taskId]?.message ? <p>{visibility[task.taskId].message}</p> : null}
-          {visibility[task.taskId]?.planningSummary ? <p className="planning-summary">规划约束：{visibility[task.taskId].planningSummary!.eligible + visibility[task.taskId].planningSummary!.conditional} 个可进入试排 · {visibility[task.taskId].planningSummary!.conditional} 个待补工程约束 · {visibility[task.taskId].planningSummary!.dispatchable} 个可直接下发</p> : null}
+          {visibility[task.taskId]?.planningSummary ? <p className="planning-summary">规划约束：{visibility[task.taskId].planningSummary!.eligible + visibility[task.taskId].planningSummary!.conditional} 个可进入试排 · {visibility[task.taskId].planningSummary!.conditional} 个待补工程约束 · {visibility[task.taskId].planningSummary!.dispatchable} 个可进入下发复核</p> : null}
           {task.opportunityId ? <p className="selected-opportunity">已选机会：{task.satelliteId} · {task.opportunityId} · {task.simulationLevel === "orbit_only" ? `轨道级粗筛${task.minimumGroundTrackDistanceKm == null ? "" : ` · 最近 ${task.minimumGroundTrackDistanceKm} km`}` : task.simulationLevel === "assumed_sensor" ? "假设传感器试算" : "传感器级仿真"}</p> : null}
           {visibility[task.taskId]?.windows.map((window, windowIndex) => <div key={window.opportunityId || `${window.start}-${windowIndex}`}>
             <strong>{window.satelliteLabel || window.satelliteId || `窗口 ${windowIndex + 1}`}{window.simulationLevel === "orbit_only" ? " · 轨道近接候选" : window.simulationLevel === "assumed_sensor" ? ` · ${window.imagingMode ?? "假设传感器"}` : ""}</strong>
@@ -2829,12 +3016,52 @@ function remainingObservationTime(value: string) {
   return `${Math.ceil(minutes / 1_440)}天`;
 }
 
+function humanizeTaskValidationError(error: string) {
+  if (/尚未通过 AOI 审批|AOI 审批状态/.test(error)) return "请先在地图核对范围，然后点击“确认当前 AOI”。";
+  if (/载荷|sensors|SAR 分析模式/.test(error)) return "请至少选择一种载荷；选择 SAR 后还需保留一种成像方式。";
+  if (/事件版本指纹|AOI 指纹|revision/.test(error)) return "任务版本信息尚未同步，请先点击“重试同步”。";
+  if (/成像窗口|imaging/.test(error)) return "请检查最早、最晚成像时间，确保时间顺序正确且仍在灾害观测期内。";
+  if (/交付期限/.test(error)) return "最迟交付时间不能早于成像窗口结束。";
+  if (/入射角/.test(error)) return "请检查 SAR 入射角范围，最大值不能小于最小值。";
+  if (/AOI 参数|来源几何|自定义/.test(error)) return "当前观测范围不完整，请重新绘制、导入或选择有效的 AOI。";
+  if (/台风/.test(error)) return `台风动态目标需要更新：${error}`;
+  return error.replace(/revision/gi, "任务版本").replace(/AOI/g, "观测范围（AOI）");
+}
+
+function opportunityReferenceBelongsToTask(reference: string, taskIds: Set<string>) {
+  try {
+    const [problemId] = JSON.parse(reference) as [string];
+    return [...taskIds].some((taskId) => problemId === taskId || problemId.startsWith(`${taskId}:`));
+  } catch {
+    return false;
+  }
+}
+
+function removeTaskRules(rules: SchedulingManualRules, taskIds: Set<string>): SchedulingManualRules {
+  return {
+    lockedOpportunityRefs: rules.lockedOpportunityRefs.filter((reference) => !opportunityReferenceBelongsToTask(reference, taskIds)),
+    excludedOpportunityRefs: rules.excludedOpportunityRefs.filter((reference) => !opportunityReferenceBelongsToTask(reference, taskIds)),
+    forcedSatelliteByTask: Object.fromEntries(Object.entries(rules.forcedSatelliteByTask).filter(([taskId]) => !taskIds.has(taskId))),
+    forcedImagingModeByTask: Object.fromEntries(Object.entries(rules.forcedImagingModeByTask).filter(([taskId]) => !taskIds.has(taskId))),
+  };
+}
+
+function scheduleReferencesAnyTask(state: JointSchedulingState, taskIds: Set<string>) {
+  if (!state.comparison) return false;
+  const schedules = [state.comparison.greedy, state.comparison.optimized];
+  return schedules.some((schedule) => schedule.assignments.some((assignment) => taskIds.has(assignment.taskId))
+    || schedule.unassigned.some((entry) => taskIds.has(entry.taskId)));
+}
+
+function planningScenarioReferencesAnyTask(scenario: PlanningScenarioRecord, taskIds: Set<string>) {
+  return scenario.problemIds.some((problemId) => [...taskIds].some((taskId) => problemId === taskId || problemId.startsWith(`${taskId}:`)));
+}
+
 function createSatelliteTask(event: DisasterEvent, operatorConfirmed: boolean): SatelliteTask {
   const now = Date.now();
   const forecastEnd = event.cycloneForecast ? Date.parse(event.cycloneForecast.forecastValidUntil) : Number.POSITIVE_INFINITY;
   const cycloneForecastUsable = !event.cycloneForecast || forecastEnd > now + 3_600_000;
   const sourceVerified = event.dispatchEligibility === "ready" && cycloneForecastUsable;
-  if (!sourceVerified && !operatorConfirmed) throw new Error("AOI 尚未完成人工核对");
   const requestedStart = event.phenomenonStage === "forecast" || event.phenomenonStage === "warning"
     ? Math.max(now, Date.parse(event.validFrom ?? event.issuedAt))
     : now;
@@ -2886,10 +3113,10 @@ function createSatelliteTask(event: DisasterEvent, operatorConfirmed: boolean): 
     locationQuality: event.locationQuality,
     locationAccuracyKm: event.locationAccuracyKm,
     evidenceCount: event.evidenceCount,
-    aoiApproval: sourceVerified ? "source_verified" : "operator_confirmed",
-    approvedAt: new Date(now).toISOString(),
-    approvedBy: sourceVerified ? event.source : "当前操作员",
-    approvalReason: sourceVerified ? undefined : "已在事件详情地图核对来源几何、位置误差和观测目标",
+    aoiApproval: sourceVerified ? "source_verified" : operatorConfirmed ? "operator_confirmed" : "review_required",
+    approvedAt: sourceVerified || operatorConfirmed ? new Date(now).toISOString() : undefined,
+    approvedBy: sourceVerified ? event.source : operatorConfirmed ? "当前操作员" : undefined,
+    approvalReason: sourceVerified ? undefined : operatorConfirmed ? "已在事件详情地图核对来源几何、位置误差和观测目标" : undefined,
     createdAt: new Date(now).toISOString(),
     updatedAt: new Date(now).toISOString(),
     status: "candidate",
@@ -3023,7 +3250,7 @@ function migrateSatelliteTask(task: Partial<SatelliteTask>): SatelliteTask {
     locationQuality: task.locationQuality ?? "unknown",
     locationAccuracyKm: task.locationAccuracyKm ?? 100,
     evidenceCount: task.evidenceCount ?? 1,
-    aoiApproval: task.aoiApproval ?? "operator_confirmed",
+    aoiApproval: task.aoiApproval ?? "review_required",
     approvedAt: task.approvedAt,
     approvedBy: task.approvedBy,
     createdAt: task.createdAt ?? now,
