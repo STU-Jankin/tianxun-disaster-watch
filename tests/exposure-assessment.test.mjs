@@ -7,6 +7,7 @@ import {
   exposureRiskInput,
   parseOverpassExposure,
   parseWorldPopTask,
+  partitionExposureGeometry,
   prepareOverpassExposureQuery,
   worldPopRequestPlan,
 } from "../lib/exposure-assessment.ts";
@@ -52,12 +53,29 @@ test("uses official polygon geometry when available and enforces provider area l
   const aoi = buildExposureAoi(event);
   assert.equal(aoi.basis, "official_event_geometry");
   assert.ok(aoi.areaKm2 > 100);
-  const oversized = { ...aoi, areaKm2: 50_001 };
-  assert.equal(worldPopRequestPlan(oversized, 2026).state, "skipped");
   assert.equal(prepareOverpassExposureQuery({ ...aoi, areaKm2: 2_501 }).state, "skipped");
   const chinaPlan = prepareOverpassExposureQuery({ ...aoi, areaKm2: 31_326 }, { maximumAreaKm2: 50_000, serviceLabel: "中国 OSM 日更镜像", queryTimeoutSeconds: 45 });
   assert.equal(chinaPlan.state, "ready");
   assert.match(chinaPlan.query, /\[timeout:45\]/);
+});
+
+test("partitions a large official impact polygon without changing its total area", () => {
+  const event = pointEvent({
+    geometryType: "Polygon",
+    geometry: { type: "Polygon", coordinates: [[[100, 20], [104, 20], [104, 23], [100, 23], [100, 20]]] },
+  });
+  const aoi = buildExposureAoi(event);
+  assert.ok(aoi.areaKm2 > 100_000);
+  const worldPopPlan = worldPopRequestPlan(aoi, 2026);
+  assert.equal(worldPopPlan.state, "ready");
+  assert.ok(worldPopPlan.chunks.length >= 3);
+  assert.ok(worldPopPlan.chunks.every((chunk) => chunk.areaKm2 <= 50_000));
+  const chunks = partitionExposureGeometry(aoi.geometry, 45_000);
+  assert.ok(chunks.length >= 3);
+  const plans = chunks.map((geometry) => buildExposureAoi(pointEvent({ geometryType: geometry.type, geometry })));
+  assert.ok(plans.every((chunk) => chunk.areaKm2 <= 45_000));
+  const combinedArea = plans.reduce((sum, chunk) => sum + chunk.areaKm2, 0);
+  assert.ok(Math.abs(combinedArea - aoi.areaKm2) / aoi.areaKm2 < 0.005);
 });
 
 test("parses ordered Overpass counts and classifies locatable key facilities", () => {

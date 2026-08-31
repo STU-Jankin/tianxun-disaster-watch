@@ -2,8 +2,9 @@ import type { DisasterEvent, EventGeometry, HazardType } from "./disasters.ts";
 import { aoiFingerprint, eventRevisionFingerprint } from "./event-integrity.ts";
 import { normalizeAntimeridianGeometry, validateGeoGeometry } from "./geo-geometry.ts";
 import type { OverpassCacheStatus, OverpassProfile } from "./overpass-runtime.ts";
+import polygonClipping, { type MultiPolygon as ClippingMultiPolygon, type Polygon as ClippingPolygon } from "polygon-clipping";
 
-export const exposureAssessmentModelVersion = "tianxun-exposure-screening-v1" as const;
+export const exposureAssessmentModelVersion = "tianxun-exposure-screening-v2" as const;
 export const maximumWorldPopAreaKm2 = 50_000;
 export const maximumOverpassAreaKm2 = 2_500;
 
@@ -38,7 +39,28 @@ export type PopulationExposure = {
   populationDensityPerKm2?: number;
   dataSource?: string;
   processingTimeMs?: number;
+  completedParts?: number;
+  totalParts?: number;
+  parts?: PopulationExposurePart[];
   message: string;
+};
+
+export type PopulationExposurePart = {
+  chunkId: string;
+  areaKm2: number;
+  state: "ready" | "pending" | "unavailable";
+  taskId?: string;
+  totalPopulation?: number;
+  populationDensityPerKm2?: number;
+  dataSource?: string;
+  processingTimeMs?: number;
+  message: string;
+};
+
+export type WorldPopRequestChunk = {
+  chunkId: string;
+  areaKm2: number;
+  payload: { geojson: EventGeometry; year: number; resolution: "100m" | "1km" };
 };
 
 export type OsmExposure = {
@@ -126,11 +148,30 @@ export function exposureAssessmentIdentity(event: DisasterEvent) {
   return { aoi, eventRevision: eventRevisionFingerprint(event), aoiHash: aoiFingerprint(aoi.geometry) };
 }
 
-export function worldPopRequestPlan(aoi: ExposureAoi, requestedYear = new Date().getUTCFullYear()) {
+export function worldPopRequestPlan(aoi: ExposureAoi, requestedYear = new Date().getUTCFullYear(), maximumAreaKm2 = maximumWorldPopAreaKm2) {
   const year = Math.max(2015, Math.min(2030, Math.round(requestedYear)));
   const resolution = aoi.areaKm2 <= 10_000 ? "100m" as const : "1km" as const;
   if (aoi.crossesAntimeridian) return { state: "skipped" as const, year, resolution, message: "范围跨越日期变更线，未向 WorldPop 提交可能改变面积的查询" };
-  if (aoi.areaKm2 > maximumWorldPopAreaKm2) return { state: "skipped" as const, year, resolution, message: `范围 ${Math.round(aoi.areaKm2).toLocaleString()} km² 超过 WorldPop 单次 50,000 km² 上限` };
+  const safeMaximumAreaKm2 = Math.max(1_000, Math.min(500_000, maximumAreaKm2));
+  if (aoi.areaKm2 > safeMaximumAreaKm2) {
+    const geometries = partitionExposureGeometry(aoi.geometry, safeMaximumAreaKm2 * 0.9);
+    const chunks: WorldPopRequestChunk[] = geometries.map((geometry) => {
+      const validation = validateGeoGeometry(geometry, { maximumAreaKm2: safeMaximumAreaKm2, maximumVertices: 20_000, maximumRingVertices: 5_000, allowOverlappingMultiPolygon: true });
+      if (!validation.ok) throw new Error(validation.reason || "WorldPop 分块几何无效");
+      return {
+        chunkId: aoiFingerprint(geometry),
+        areaKm2: validation.areaKm2,
+        payload: { geojson: geometry, year, resolution: "1km" as const },
+      };
+    });
+    return {
+      state: "ready" as const,
+      year,
+      resolution: "1km" as const,
+      chunks,
+      message: `范围 ${Math.round(aoi.areaKm2).toLocaleString()} km² 将按 ${chunks.length} 个安全分块计算 WorldPop 人口`,
+    };
+  }
   return { state: "ready" as const, year, resolution, payload: { geojson: aoi.geometry, year, resolution } };
 }
 
@@ -140,7 +181,7 @@ export function prepareOverpassExposureQuery(aoi: ExposureAoi, options: { maximu
   if (aoi.crossesAntimeridian) return { state: "skipped" as const, message: `范围跨越日期变更线，${serviceLabel}矩形查询未执行` };
   if (aoi.areaKm2 > maximumAreaKm2) return {
     state: "skipped" as const,
-    message: `范围 ${Math.round(aoi.areaKm2).toLocaleString()} km²，超过${serviceLabel}单次 ${Math.round(maximumAreaKm2).toLocaleString()} km² 的保守查询范围，已安全跳过 OSM；人口模型仍可独立使用`,
+    message: `范围 ${Math.round(aoi.areaKm2).toLocaleString()} km²，超过${serviceLabel}单次 ${Math.round(maximumAreaKm2).toLocaleString()} km² 的保守查询范围，已安全跳过 OSM；人口统计请以 WorldPop 状态为准`,
   };
   const polygons = outerPolygonRings(aoi.geometry);
   const polygonVertexCount = polygons.reduce((sum, ring) => sum + ring.length, 0);
@@ -203,7 +244,7 @@ export function parseWorldPopTask(payload: unknown, year: number, resolution: "1
       message: "人口为 WorldPop 指定年份模型估计，不是实时人口或现场普查",
     };
   }
-  if (["failed", "error", "cancelled", "canceled"].includes(status)) throw new Error(textValue(value.message) || "WorldPop 任务失败");
+  if (["failed", "failure", "error", "cancelled", "canceled"].includes(status)) throw new Error(textValue(value.message) || textValue(value.error) || "WorldPop 任务失败");
   if (!taskId) throw new Error("WorldPop 响应未返回 task_id 或人口结果");
   return { state: "pending", provider: "WorldPop", year, resolution, taskId, message: "WorldPop 正在计算；稍后点击继续查询，不会重复提交任务" };
 }
@@ -275,6 +316,58 @@ function outerPolygonRings(geometry: EventGeometry): Array<Array<[number, number
   if (geometry.type === "Polygon") return [(geometry.coordinates as Array<Array<[number, number]>>)[0] ?? []];
   if (geometry.type === "MultiPolygon") return (geometry.coordinates as Array<Array<Array<[number, number]>>>).map((polygon) => polygon[0] ?? []);
   return [];
+}
+
+export function partitionExposureGeometry(geometry: EventGeometry, maximumAreaKm2: number): EventGeometry[] {
+  if (geometry.type !== "Polygon" && geometry.type !== "MultiPolygon") throw new Error("WorldPop 分块仅支持 Polygon/MultiPolygon");
+  const targetAreaKm2 = Math.max(1_000, maximumAreaKm2);
+  const queue: EventGeometry[] = [geometry];
+  const completed: EventGeometry[] = [];
+  let splits = 0;
+  while (queue.length) {
+    const current = queue.shift()!;
+    const validation = validateGeoGeometry(current, { maximumAreaKm2: 25_000_000, maximumVertices: 20_000, maximumRingVertices: 5_000, allowOverlappingMultiPolygon: true });
+    if (!validation.ok) throw new Error(validation.reason || "WorldPop 分块前几何无效");
+    if (validation.areaKm2 <= targetAreaKm2) {
+      completed.push(current);
+      continue;
+    }
+    if (splits >= 64) throw new Error("WorldPop 范围分块过多，请缩小 AOI");
+    splits += 1;
+    const bbox = geometryBbox(current);
+    const centerLatitude = (bbox[1] + bbox[3]) / 2;
+    const widthKm = (bbox[2] - bbox[0]) * 111.32 * Math.max(0.1, Math.cos(centerLatitude * Math.PI / 180));
+    const heightKm = (bbox[3] - bbox[1]) * 110.57;
+    const vertical = widthKm >= heightKm;
+    const midpoint = vertical ? (bbox[0] + bbox[2]) / 2 : (bbox[1] + bbox[3]) / 2;
+    const boxes: Array<[number, number, number, number]> = vertical
+      ? [[bbox[0], bbox[1], midpoint, bbox[3]], [midpoint, bbox[1], bbox[2], bbox[3]]]
+      : [[bbox[0], bbox[1], bbox[2], midpoint], [bbox[0], midpoint, bbox[2], bbox[3]]];
+    const children = boxes.flatMap((box) => intersectGeometryWithBbox(current, box));
+    if (children.length < 2) throw new Error("WorldPop 范围无法安全分块，请缩小 AOI");
+    queue.push(...children);
+  }
+  return completed.sort((left, right) => {
+    const leftBox = geometryBbox(left);
+    const rightBox = geometryBbox(right);
+    return leftBox[1] - rightBox[1] || leftBox[0] - rightBox[0];
+  });
+}
+
+function intersectGeometryWithBbox(geometry: EventGeometry, bbox: [number, number, number, number]): EventGeometry[] {
+  const subject = geometry.type === "Polygon"
+    ? geometry.coordinates as ClippingPolygon
+    : geometry.coordinates as ClippingMultiPolygon;
+  const [west, south, east, north] = bbox;
+  const clip: ClippingPolygon = [[[west, south], [east, south], [east, north], [west, north], [west, south]]];
+  const clipped = polygonClipping.intersection(subject, clip);
+  if (!clipped.length) return [];
+  const candidate: EventGeometry = clipped.length === 1
+    ? { type: "Polygon", coordinates: clipped[0] }
+    : { type: "MultiPolygon", coordinates: clipped };
+  const normalized = normalizeAntimeridianGeometry(candidate) ?? candidate;
+  const validation = validateGeoGeometry(normalized, { maximumAreaKm2: 25_000_000, maximumVertices: 20_000, maximumRingVertices: 5_000, allowOverlappingMultiPolygon: true });
+  return validation.ok && validation.areaKm2 > 0.01 ? [normalized] : [];
 }
 
 function overpassFacility(element: Record<string, unknown>): ExposureFacility[] {

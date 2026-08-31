@@ -12,6 +12,8 @@ import {
   type ExposureAssessment,
   type OsmExposure,
   type PopulationExposure,
+  type PopulationExposurePart,
+  type WorldPopRequestChunk,
 } from "../../../lib/exposure-assessment.ts";
 import { overpassCacheKey, overpassFreshUntil, resolveOverpassRuntimeConfig, type OverpassRuntimeConfig } from "../../../lib/overpass-runtime.ts";
 
@@ -30,7 +32,7 @@ export async function GET(request: Request) {
     ]);
     if (!canonical) throw new ApiInputError("主事件不存在、已结束或缺少有效证据", 404);
     const identity = exposureAssessmentIdentity(canonical.event);
-    const stale = Boolean(assessment && (assessment.eventRevision !== identity.eventRevision || assessment.aoiHash !== identity.aoiHash));
+    const stale = Boolean(assessment && (assessment.eventRevision !== identity.eventRevision || assessment.aoiHash !== identity.aoiHash || assessment.modelVersion !== exposureAssessmentModelVersion));
     return Response.json({ assessment: stale ? null : assessment, stale }, { headers: privateHeaders(stale ? "stale" : "read") });
   } catch (error) {
     return errorResponse(error);
@@ -54,7 +56,7 @@ export async function POST(request: Request) {
     const identity = exposureAssessmentIdentity(canonical.event);
     const cached = await getEventExposureAssessment(masterEventId);
     const overpassConfig = resolveOverpassRuntimeConfig();
-    const sameInput = cached?.eventRevision === identity.eventRevision && cached.aoiHash === identity.aoiHash;
+    const sameInput = cached?.eventRevision === identity.eventRevision && cached.aoiHash === identity.aoiHash && cached.modelVersion === exposureAssessmentModelVersion;
     const sameOsmProfile = cached?.osm.dataProfile === overpassConfig.profile;
     const fresh = sameInput && sameOsmProfile && Date.parse(cached!.expiresAt) > Date.now();
     if (!force && fresh && cached!.status !== "pending") return Response.json({ assessment: cached }, { headers: privateHeaders("hit") });
@@ -100,8 +102,9 @@ export async function POST(request: Request) {
 }
 
 async function fetchPopulation(aoi: ReturnType<typeof exposureAssessmentIdentity>["aoi"], year: number, pending?: PopulationExposure): Promise<PopulationExposure> {
-  const plan = worldPopRequestPlan(aoi, year);
+  const plan = worldPopRequestPlan(aoi, year, process.env.WORLDPOP_API_KEY?.trim() ? 500_000 : 50_000);
   if (plan.state === "skipped") return { state: "skipped", provider: "WorldPop", year: plan.year, resolution: plan.resolution, message: plan.message };
+  if ("chunks" in plan && plan.chunks) return fetchPartitionedPopulation(plan.chunks, aoi.areaKm2, plan.year, plan.resolution, pending);
   try {
     const endpoint = worldPopEndpoint();
     let population: PopulationExposure;
@@ -128,6 +131,83 @@ async function fetchPopulation(aoi: ReturnType<typeof exposureAssessmentIdentity
       resolution: plan.resolution,
       taskId: pending?.taskId,
       message: safeUpstreamMessage(error, "WorldPop 当前不可用"),
+    };
+  }
+}
+
+async function fetchPartitionedPopulation(chunks: WorldPopRequestChunk[], totalAreaKm2: number, year: number, resolution: "100m" | "1km", pending?: PopulationExposure): Promise<PopulationExposure> {
+  const endpoint = worldPopEndpoint();
+  const previous = new Map((pending?.parts ?? []).map((part) => [part.chunkId, part]));
+  const parts = await Promise.all(chunks.map((chunk) => fetchPopulationPart(endpoint, chunk, year, resolution, previous.get(chunk.chunkId))));
+  const ready = parts.filter((part) => part.state === "ready" && part.totalPopulation !== undefined);
+  const completedParts = ready.length;
+  if (completedParts === chunks.length) {
+    const totalPopulation = ready.reduce((sum, part) => sum + (part.totalPopulation ?? 0), 0);
+    const sources = [...new Set(ready.map((part) => part.dataSource).filter((value): value is string => Boolean(value)))];
+    return {
+      state: "ready",
+      provider: "WorldPop",
+      year,
+      resolution,
+      totalPopulation,
+      populationDensityPerKm2: totalAreaKm2 > 0 ? totalPopulation / totalAreaKm2 : undefined,
+      dataSource: sources.length ? sources.join("；") : undefined,
+      processingTimeMs: ready.reduce((sum, part) => sum + (part.processingTimeMs ?? 0), 0) || undefined,
+      completedParts,
+      totalParts: chunks.length,
+      parts,
+      message: `已完成 ${chunks.length}/${chunks.length} 个安全分块；人口为 WorldPop ${year} 年模型估计，不是实时人口或现场普查`,
+    };
+  }
+  const active = parts.some((part) => part.state === "pending");
+  return {
+    state: "pending",
+    provider: "WorldPop",
+    year,
+    resolution,
+    completedParts,
+    totalParts: chunks.length,
+    parts,
+    message: `${active ? "WorldPop 正在分块计算" : "WorldPop 部分分块暂时失败"}；已完成 ${completedParts}/${chunks.length}，系统会保留已完成结果，重试时不会重复提交`,
+  };
+}
+
+async function fetchPopulationPart(endpoint: URL, chunk: WorldPopRequestChunk, year: number, resolution: "100m" | "1km", prior?: PopulationExposurePart): Promise<PopulationExposurePart> {
+  if (prior?.state === "ready" && prior.totalPopulation !== undefined) return prior;
+  try {
+    let population: PopulationExposure;
+    if (prior?.state === "pending" && prior.taskId) {
+      population = await requestWorldPopTask(endpoint, prior.taskId, year, resolution);
+    } else {
+      const response = await boundedFetch(new URL("population", endpoint).toString(), {
+        method: "POST",
+        headers: worldPopHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify(chunk.payload),
+      }, 12_000, 512 * 1024);
+      population = parseWorldPopTask(JSON.parse(response), year, resolution);
+    }
+    for (let attempt = 0; population.state === "pending" && population.taskId && attempt < 4; attempt += 1) {
+      await delay(700 + attempt * 250);
+      population = await requestWorldPopTask(endpoint, population.taskId, year, resolution);
+    }
+    return {
+      chunkId: chunk.chunkId,
+      areaKm2: chunk.areaKm2,
+      state: population.state === "ready" ? "ready" : "pending",
+      taskId: population.taskId,
+      totalPopulation: population.totalPopulation,
+      populationDensityPerKm2: population.populationDensityPerKm2,
+      dataSource: population.dataSource,
+      processingTimeMs: population.processingTimeMs,
+      message: population.message,
+    };
+  } catch (error) {
+    return {
+      chunkId: chunk.chunkId,
+      areaKm2: chunk.areaKm2,
+      state: "unavailable",
+      taskId: prior?.taskId,
+      message: safeUpstreamMessage(error, "WorldPop 分块暂时不可用"),
     };
   }
 }

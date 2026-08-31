@@ -2138,7 +2138,10 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
   const [error, setError] = useState("");
   const [stale, setStale] = useState(false);
   const onChangeRef = useRef(onChange);
+  const automaticPollsRef = useRef(0);
+  const canCompute = !historicalReadOnly && (currentUser?.role === "operator" || currentUser?.role === "admin");
   useEffect(() => { onChangeRef.current = onChange; }, [onChange]);
+  useEffect(() => { automaticPollsRef.current = 0; }, [event.masterEventId]);
   useEffect(() => {
     if (historicalReadOnly) return;
     const controller = new AbortController();
@@ -2157,7 +2160,7 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
     return () => controller.abort();
   }, [event, historicalReadOnly]);
 
-  const compute = async () => {
+  const compute = useCallback(async () => {
     if (historicalReadOnly || computing) return;
     setComputing(true);
     setError("");
@@ -2181,9 +2184,17 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
     } finally {
       setComputing(false);
     }
-  };
+  }, [assessment, computing, event, historicalReadOnly]);
 
-  const canCompute = !historicalReadOnly && (currentUser?.role === "operator" || currentUser?.role === "admin");
+  useEffect(() => {
+    if (!canCompute || computing || assessment?.status !== "pending" || automaticPollsRef.current >= 3) return;
+    const timer = window.setTimeout(() => {
+      automaticPollsRef.current += 1;
+      void compute();
+    }, 20_000);
+    return () => window.clearTimeout(timer);
+  }, [assessment?.computedAt, assessment?.status, canCompute, compute, computing]);
+
   const population = assessment?.population;
   const osm = assessment?.osm;
   return <section className="exposure-card" aria-labelledby={`exposure-title-${event.id}`}>
@@ -2212,11 +2223,11 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
       {assessment.riskInput ? <p className="exposure-risk-basis"><strong>自动指数依据：</strong>{assessment.riskInput.basis}</p> : null}
       {population ? <p className={`exposure-source-state ${population.state}`}>WorldPop：{population.message}</p> : null}
       {osm ? <p className={`exposure-source-state ${osm.state}`}>OSM：{osm.message}</p> : null}
-      {osm?.state === "skipped" ? <p className="exposure-source-guidance">当前范围超过已配置 OSM 服务的单次安全阈值。可缩小 AOI；中国日更镜像接通后能扩大筛查范围，但仍不应把全国建筑和道路作为一次查询。高德 POI 只能补充设施位置，不能替代建筑和道路存量统计。</p> : null}
+      {osm?.state === "skipped" ? <p className="exposure-source-guidance">当前范围超过已配置 OSM 服务的单次安全阈值；这不会阻塞 WorldPop 分块人口统计和基础暴露度指数。若需大范围建筑和道路存量，应使用自建 OSM 数据库离线汇总；高德 POI 只能补充设施位置。</p> : null}
       <details className="exposure-limitations"><summary>查看口径与限制</summary>{assessment.limitations.map((item) => <p key={item}>{item}</p>)}<p>自动暴露度只参与初筛排序；没有脆弱性模型时，系统仍不会生成综合影响风险分数。</p></details>
       <div className="exposure-links"><a href="https://api.worldpop.org/v2/" target="_blank" rel="noreferrer">WorldPop API ↗</a><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors ↗</a></div>
     </> : !loading && !historicalReadOnly ? <p className="exposure-empty">尚未计算。系统会按事件范围查询人口模型，并筛查已映射的建筑、道路和关键设施。</p> : null}
-    {canCompute ? <button className="exposure-compute" disabled={computing} onClick={() => void compute()}>{computing ? "正在查询外部数据…" : assessment?.status === "pending" ? "继续查询人口任务" : assessment ? "重新计算暴露度" : "计算暴露度并叠加地图"}</button> : !historicalReadOnly ? <small className="exposure-readonly">当前账号可查看已有结果；计算需要操作员权限。</small> : null}
+    {canCompute ? <button className="exposure-compute" disabled={computing} onClick={() => void compute()}>{computing ? "正在查询外部数据…" : assessment?.status === "pending" ? population?.totalParts ? `继续查询人口分块（${population.completedParts ?? 0}/${population.totalParts}）` : "继续查询人口任务" : assessment ? "重新计算暴露度" : "计算暴露度并叠加地图"}</button> : !historicalReadOnly ? <small className="exposure-readonly">当前账号可查看已有结果；计算需要操作员权限。</small> : null}
     {error ? <p className="exposure-error" role="alert">{error}</p> : null}
   </section>;
 }
