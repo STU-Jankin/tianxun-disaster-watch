@@ -13,7 +13,9 @@ test("returns the persisted master id and safely rebinds an unsynced task by uni
       id, masterEventId, entityKey: "cyclone:2026:cp:1", hazard: "cyclone", title: "HU Lala", lifecycleStatus: "active",
       severity: "red", geometryType: "Polygon", latitude: 20.6, longitude: -168.7, locationQuality: "precise",
       locationAccuracyKm: 5, confidenceScore: 90, occurredAt: "2026-08-18T03:00:00Z", updatedAt,
-      observationExpiresAt: "2026-08-30T00:00:00Z", evidenceCount: 1,
+      // This test covers canonical identity rebinding, not lifecycle expiry.
+      // Keep the synthetic event active so the assertion does not depend on wall-clock date.
+      observationExpiresAt: "2099-08-30T00:00:00Z", evidenceCount: 1,
       evidence: [{ source: "NOAA NHC", sourceUrl: "https://example.test/advisory", sourceEventId: "CP012026", observedAt: updatedAt, role: "forecast" }],
     });
     const first = await persistCanonicalEvents([event("ME-original", "nhc-old", "2026-08-18T03:00:00Z")]);

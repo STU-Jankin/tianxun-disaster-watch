@@ -37,7 +37,11 @@ test("engine API token is forwarded to backend collection requests", async () =>
 });
 
 const config = {
+  minSeverity: "orange",
   minPriority: 65,
+  notifyYellowExceptions: true,
+  yellowExceptionPriority: 80,
+  yellowExceptionScopes: ["wuxi", "jiangsu"],
   cycloneMoveKm: 150,
   notifyPhaseTransition: true,
 };
@@ -59,6 +63,8 @@ function event(overrides = {}) {
     sourceUrl: "https://example.com/event-1",
     evidenceCount: 1,
     updateCount: 1,
+    confidenceScore: 85,
+    confidenceLevel: "high",
     locationQuality: "estimated",
     locationAccuracyKm: 50,
     dispatchEligibility: "review_required",
@@ -81,9 +87,29 @@ test("generic Hermes signature is raw HMAC-SHA256 hex", () => {
   );
 });
 
-test("new events below the threshold are silent", () => {
+test("new yellow and blue events stay silent while red and orange are reported", () => {
   assert.deepEqual(changeNotifications(null, event(), config), []);
-  assert.equal(changeNotifications(null, event({ priority: 70 }), config)[0].type, "new");
+  assert.deepEqual(changeNotifications(null, event({ priority: 70 }), config), []);
+  assert.equal(changeNotifications(null, event({ severity: "orange", priority: 40 }), config)[0].type, "new");
+  assert.equal(changeNotifications(null, event({ severity: "red", priority: 30 }), config)[0].type, "new");
+});
+
+test("yellow focus-area exceptions are explicit and configurable", () => {
+  const focused = changeNotifications(null, event({ scope: "wuxi", priority: 82 }), config);
+  assert.equal(focused[0].type, "new");
+  assert.match(focused[0].label, /黄色事件条件触发.*重点区域/);
+  assert.deepEqual(changeNotifications(null, event({ scope: "wuxi", priority: 82 }), { ...config, notifyYellowExceptions: false }), []);
+});
+
+test("a normal yellow event reports immediately when it becomes orange", () => {
+  const changes = changeNotifications(event(), event({ severity: "orange", priority: 62 }), config);
+  assert.equal(changes[0].type, "severity");
+  assert.match(changes[0].label, /黄色 → 橙色/);
+});
+
+test("yellow same-level evidence and location changes remain silent", () => {
+  const current = event({ evidenceCount: 3, locationQuality: "precise", dispatchEligibility: "ready", aoiApprovalRequired: false });
+  assert.deepEqual(changeNotifications(event(), current, config), []);
 });
 
 test("ordinary source updates do not duplicate a continuing process", () => {
@@ -109,16 +135,16 @@ test("material upgrades and task-readiness create notifications", () => {
 test("cyclone movement is measured and significant movement is reported", () => {
   assert.ok(distanceKm(20, 120, 22, 120) > 200);
   const changes = changeNotifications(
-    event(),
-    event({ latitude: 22, updatedAt: "2026-08-12T06:00:00.000Z" }),
+    event({ severity: "orange", priority: 70 }),
+    event({ severity: "orange", priority: 70, latitude: 22, updatedAt: "2026-08-12T06:00:00.000Z" }),
     config,
   );
   assert.equal(changes.at(-1).type, "track");
 });
 
 test("a new official cyclone forecast advisory is reported", () => {
-  const previous = event({ cycloneForecast: { issuedAt: "2026-08-12T00:00:00Z", source: "JMA" } });
-  const current = event({ priority: 70, cycloneForecast: { issuedAt: "2026-08-12T06:00:00Z", source: "JMA" } });
+  const previous = event({ severity: "orange", priority: 70, cycloneForecast: { issuedAt: "2026-08-12T00:00:00Z", source: "JMA" } });
+  const current = event({ severity: "orange", priority: 70, cycloneForecast: { issuedAt: "2026-08-12T06:00:00Z", source: "JMA" } });
   assert.equal(changeNotifications(previous, current, config).at(-1).type, "forecast");
 });
 
@@ -131,6 +157,21 @@ test("Feishu message includes task-planning fields and coordinates", () => {
   assert.match(message, /事件编号/);
   assert.match(message, /官方预报：JMA · 3 个中心节点/);
   assert.match(message, /当前强风警戒域/);
+});
+
+test("low-confidence red and orange signals are marked for verification", () => {
+  const lowConfidence = event({ severity: "red", confidenceScore: 55, confidenceLevel: "low" });
+  assert.match(changeNotifications(null, lowConfidence, config)[0].label, /待核验/);
+  assert.match(buildEventMessage(lowConfidence, "发现待核验的高等级灾害信号"), /不得写成已确认灾害/);
+});
+
+test("default notification policy is orange-red with bounded yellow exceptions", () => {
+  const policy = defaultConfig({});
+  assert.equal(policy.minSeverity, "orange");
+  assert.equal(policy.notifyYellowExceptions, true);
+  assert.equal(policy.yellowExceptionPriority, 80);
+  assert.deepEqual(policy.yellowExceptionScopes, ["wuxi", "jiangsu"]);
+  assert.equal(policy.notifyPhaseTransition, false);
 });
 
 test("end-to-end baseline is delivered once and only material changes repeat", async (context) => {

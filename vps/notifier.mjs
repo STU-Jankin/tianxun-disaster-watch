@@ -52,17 +52,23 @@ export function signPayload(secret, body, timestamp = "") {
 export function changeNotifications(previous, event, config) {
   const changes = [];
   if (!previous) {
-    if (isAlertable(event, config)) changes.push({ type: "new", label: event.phenomenonStage === "observed" ? "发现新的灾害实况" : event.phenomenonStage === "warning" ? "收到新的权威预警" : "收到新的灾害预报" });
+    if (isAlertable(event, config)) changes.push({ type: "new", label: newEventLabel(event, config) });
     return changes;
   }
 
-  if (severityRank(event.severity) > severityRank(previous.severity)) {
-    changes.push({ type: "severity", label: `等级升级：${severityLabel(previous.severity)} → ${severityLabel(event.severity)}` });
+  const alertable = isAlertable(event, config);
+  if (alertable && severityRank(event.severity) > severityRank(previous.severity)) {
+    const verification = isLowConfidenceHighSeverity(event) ? "（低可信高等级信号，待核验）" : "";
+    changes.push({ type: "severity", label: `等级升级：${severityLabel(previous.severity)} → ${severityLabel(event.severity)}${verification}` });
   }
+  // 黄、蓝事件仍进入状态基线，但普通同级变化不打扰值守人员。
+  // 一旦升至红/橙或命中明确的黄色重点例外，再汇报本轮实质变化。
+  if (!alertable) return changes;
+
   if (Number(previous.priority) < config.minPriority && Number(event.priority) >= config.minPriority) {
     changes.push({ type: "priority", label: `优先级升至 ${number(event.priority, 0)}` });
   }
-  if (sourceEvidenceCount(event) > sourceEvidenceCount(previous) && Number(event.priority) >= config.minPriority - 10) {
+  if (sourceEvidenceCount(event) > sourceEvidenceCount(previous)) {
     changes.push({ type: "evidence", label: `新增独立来源，现有 ${number(sourceEvidenceCount(event), 0)} 个来源` });
   }
   if (locationRank(event.locationQuality) > locationRank(previous.locationQuality)) {
@@ -78,7 +84,7 @@ export function changeNotifications(previous, event, config) {
     }
     const previousForecastAt = Date.parse(String(previous.cycloneForecast?.issuedAt ?? ""));
     const forecastAt = Date.parse(String(event.cycloneForecast?.issuedAt ?? ""));
-    if (Number.isFinite(forecastAt) && (!Number.isFinite(previousForecastAt) || forecastAt > previousForecastAt) && Number(event.priority) >= config.minPriority - 10) {
+    if (Number.isFinite(forecastAt) && (!Number.isFinite(previousForecastAt) || forecastAt > previousForecastAt)) {
       changes.push({ type: "forecast", label: `收到${clean(event.cycloneForecast.source, 60)}新一期官方路径/风圈` });
     }
   }
@@ -111,6 +117,9 @@ export function buildEventMessage(event, changeLabel, publicUrl = "") {
     ? "请在系统中核对事件位置和观测范围，再建立卫星任务候选。"
     : "可进入系统查看详情，并建立卫星任务候选后进行机会计算。";
   const systemLink = safeUrl(publicUrl) ? `- 打开系统：[查看事件与规划任务](${safeUrl(publicUrl)})` : "";
+  const confidenceWarning = isLowConfidenceHighSeverity(event)
+    ? "- 核验提示：⚠️ 当前为低可信高等级信号，不得写成已确认灾害；请等待权威来源或独立证据复核。"
+    : "";
 
   return [
     `${SEVERITY_EMOJI[event.severity] ?? "⚪"} **${markdownText(changeLabel, 160)}｜${markdownText(event.title, 220)}**`,
@@ -125,6 +134,7 @@ export function buildEventMessage(event, changeLabel, publicUrl = "") {
     forecast,
     `- 可选载荷：${sensors}`,
     `- 证据/来源：${number(sourceEvidenceCount(event), 0)} 个独立来源，过程公告 ${number(event.bulletinCount ?? event.updateCount, 0)} 期 · ${source}`,
+    confidenceWarning,
     `- 事件编号：\`${clean(event.entityKey || event.masterEventId || event.id, 180)}\``,
     `- 建议下一步：${nextStep}`,
     systemLink,
@@ -140,14 +150,18 @@ export function defaultConfig(env = process.env) {
     webhookUrl: env.HERMES_WEBHOOK_URL || "http://127.0.0.1:8644/webhooks/tianxun-alerts",
     webhookSecret: env.HERMES_WEBHOOK_SECRET || "",
     webhookSignatureVersion: normalizeSignatureVersion(env.HERMES_SIGNATURE_VERSION),
+    minSeverity: normalizeSeverityThreshold(env.MIN_NOTIFY_SEVERITY),
     minPriority: boundedNumber(env.MIN_NOTIFY_PRIORITY, 0, 100, 65),
+    notifyYellowExceptions: booleanValue(env.NOTIFY_YELLOW_EXCEPTIONS, true),
+    yellowExceptionPriority: boundedNumber(env.YELLOW_NOTIFY_MIN_PRIORITY, 0, 100, 80),
+    yellowExceptionScopes: csvValues(env.YELLOW_NOTIFY_SCOPES || "wuxi,jiangsu"),
     cycloneMoveKm: boundedNumber(env.CYCLONE_MOVE_ALERT_KM, 10, 2000, 150),
     sourceFailureThreshold: boundedNumber(env.SOURCE_FAILURE_THRESHOLD, 1, 20, 3),
     maxDeliveryAttempts: boundedNumber(env.MAX_DELIVERY_ATTEMPTS, 1, 30, 8),
     maxBatchSize: boundedNumber(env.MAX_ALERT_BATCH_SIZE, 1, 10, 5),
     requestTimeoutMs: boundedNumber(env.REQUEST_TIMEOUT_MS, 1000, 120000, 45000),
     bootstrapNotify: booleanValue(env.BOOTSTRAP_NOTIFY, true),
-    notifyPhaseTransition: booleanValue(env.NOTIFY_PHASE_TRANSITION, true),
+    notifyPhaseTransition: booleanValue(env.NOTIFY_PHASE_TRANSITION, false),
     publicUrl: safeUrl(env.TIANXUN_PUBLIC_URL || ""),
   };
 }
@@ -391,10 +405,10 @@ function processEvents(db, events, payload, config) {
           message: [
             "✅ **天巡灾害后台已建立运行基线**",
             `- 当前有效主事件：${actionable} 个`,
-            `- 达到通知阈值：${high} 个（首次启动只记录现状，不逐条发送旧事件）`,
+            `- 红橙及黄色重点例外：${high} 个（首次启动只记录现状，不逐条发送旧事件）`,
             `- 在线数据源：${online}/${(payload.sourceStatus || []).length}`,
             `- 首次采集：${formatTime(payload.fetchedAt || now)}`,
-            "- 后续仅推送新事件、等级升级、证据增强、定位改善、重要台风位移及系统故障。",
+            "- 后续仅推送红橙新事件、升至红橙、黄色重点例外、重大态势变化及系统故障。",
           ].join("\n"),
         });
       }
@@ -576,7 +590,42 @@ function getMeta(db, key) {
 
 function isAlertable(event, config) {
   if (event.observationStatus === "expired" || event.dispatchEligibility === "blocked") return false;
-  return Number(event.priority) >= config.minPriority || ["red", "orange"].includes(event.severity);
+  const minimumRank = severityRank(config.minSeverity || "orange");
+  if (severityRank(event.severity) >= minimumRank) return true;
+  return Boolean(yellowExceptionReason(event, config));
+}
+
+function yellowExceptionReason(event, config) {
+  if (event.severity !== "yellow" || config.notifyYellowExceptions === false) return "";
+  const scopes = Array.isArray(config.yellowExceptionScopes) && config.yellowExceptionScopes.length
+    ? config.yellowExceptionScopes
+    : ["wuxi", "jiangsu"];
+  const focusScope = scopes.includes(String(event.scope));
+  const priorityThreshold = Number.isFinite(Number(config.yellowExceptionPriority)) ? Number(config.yellowExceptionPriority) : 80;
+  if (Number(event.priority) >= priorityThreshold) return focusScope ? "重点区域且任务优先级较高" : "任务优先级达到黄色例外阈值";
+  const confidence = Number(event.confidenceScore);
+  const sufficientlyTrusted = Number.isFinite(confidence) ? confidence >= 70 : event.confidenceLevel !== "low";
+  if (focusScope && sufficientlyTrusted && ["warning", "forecast"].includes(event.phenomenonStage)) {
+    return "重点区域的权威预警或预报，需保留灾前观测机会";
+  }
+  return "";
+}
+
+function newEventLabel(event, config) {
+  const yellowReason = yellowExceptionReason(event, config);
+  if (yellowReason) return `黄色事件条件触发：${yellowReason}`;
+  if (isLowConfidenceHighSeverity(event)) return "发现待核验的高等级灾害信号";
+  return event.phenomenonStage === "observed"
+    ? "发现新的红橙灾害实况"
+    : event.phenomenonStage === "warning"
+      ? "收到新的红橙权威预警"
+      : "收到新的红橙灾害预报";
+}
+
+function isLowConfidenceHighSeverity(event) {
+  if (!["red", "orange"].includes(event.severity)) return false;
+  const score = Number(event.confidenceScore);
+  return event.confidenceLevel === "low" || (Number.isFinite(score) && score < 70);
 }
 
 function validEvent(event) {
@@ -672,6 +721,15 @@ function boundedNumber(value, min, max, fallback) {
 function normalizeSignatureVersion(value) {
   const normalized = String(value || "auto").trim().toLowerCase();
   return ["auto", "v1", "v2"].includes(normalized) ? normalized : "auto";
+}
+
+function normalizeSeverityThreshold(value) {
+  const normalized = String(value || "orange").trim().toLowerCase();
+  return ["blue", "yellow", "orange", "red"].includes(normalized) ? normalized : "orange";
+}
+
+function csvValues(value) {
+  return [...new Set(String(value || "").split(",").map((item) => item.trim().toLowerCase()).filter(Boolean))];
 }
 
 function booleanValue(value, fallback) {
