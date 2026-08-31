@@ -28,6 +28,18 @@ test("keeps a transparent assessed-risk result separate from source severity", (
   assert.match(result.limitations, /初筛指标/);
 });
 
+test("uses a hazard-specific quantitative proxy and exposes uncertainty", () => {
+  const result = assessImpactRisk({
+    hazard: "earthquake", magnitude: 7.1, magnitudeUnit: "Mw", severity: "orange", confidenceScore: 90,
+    geometryType: "Point", locationQuality: "precise", exposure: { index: 70, basis: "人口栅格" }, vulnerability: { index: 55, basis: "建筑脆弱性曲线" },
+  });
+  assert.equal(result.modelVersion, "tianxun-impact-screening-v2");
+  assert.equal(result.hazardModel.modelId, "earthquake-magnitude-screening-v1");
+  assert.equal(result.hazardModel.quantitative, true);
+  assert.ok(result.scoreRange.min <= result.score && result.score <= result.scoreRange.max);
+  assert.ok(result.uncertainty.hazardIndexMin < result.uncertainty.hazardIndexMax);
+});
+
 test("source governance has explicit latency and strips secrets from archived URLs", () => {
   const governance = sourceGovernance("NASA FIRMS", "第一优先级", "事件");
   assert.equal(governance.pollIntervalMinutes, 10);

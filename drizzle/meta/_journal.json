@@ -57,6 +57,13 @@
       "when": 1788307200000,
       "tag": "0007_event_exposure_assessments",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1788393600000,
+      "tag": "0008_mission_products_and_aoi_work_packages",
+      "breakpoints": true
     }
   ]
 }

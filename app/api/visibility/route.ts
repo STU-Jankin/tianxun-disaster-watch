@@ -15,6 +15,7 @@ import {
   type CycloneTrackingTarget,
 } from "../../../lib/cyclone-tracking-opportunities";
 import { annotatePlanningWindows } from "../../../lib/mission-planning";
+import { loadVisibilityServiceCapabilities } from "../../../lib/visibility-service-capabilities";
 
 export const dynamic = "force-dynamic";
 
@@ -200,17 +201,18 @@ export async function POST(request: Request) {
       return Response.json({ state: "error", mode: "orbit_only", windows: [], message: error instanceof Error ? error.message : "本地 TLE 轨道粗筛失败" }, { status: 503 });
     }
   }
-  if (dynamicCycloneTracking) {
-    return Response.json({ state: "error", windows: [], message: "已配置的外部仿真接口尚未声明支持逐时移动 AOI；为防止把静态风圈误当成台风跟踪结果，本次计算已停止" }, { status: 501 });
-  }
   try {
     const serviceUrl = validateSimulationEndpoint(endpoint);
+    const capabilities = await loadVisibilityServiceCapabilities();
+    if (dynamicCycloneTracking && !capabilities?.supportsMovingAoi) {
+      return Response.json({ state: "error", windows: [], message: "外部仿真服务未通过能力接口声明支持逐时移动 AOI；为防止把静态风圈误当成台风跟踪结果，本次计算已停止" }, { status: 501 });
+    }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15_000);
     const upstream = await fetch(serviceUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ schemaVersion: "tianxun.visibility.v1", task: { ...task, aoi } }),
+      body: JSON.stringify({ schemaVersion: dynamicCycloneTracking ? "tianxun.visibility.v2" : "tianxun.visibility.v1", task: { ...task, aoi } }),
       signal: controller.signal,
       redirect: "manual",
     }).finally(() => clearTimeout(timeout));
@@ -223,7 +225,7 @@ export async function POST(request: Request) {
     const windows = result.windows.map((window) => normalizeWindow(window, task, orbitVersion, computedAt)).filter((window): window is NonNullable<typeof window> => window !== null);
     if (result.windows.length && !windows.length) throw new Error("仿真服务没有返回有效的 UTC 可见窗口");
     const planning = annotatePlanningWindows(task, windows, computedAt);
-    return Response.json({ schemaVersion: "tianxun.visibility.v3", mode: "sensor_model", orbitVersion, computedAt, windows: planning.windows, planningProblem: planning.problem, planningSummary: planning.summary, state: "ready", message: "已由外部传感器级仿真服务返回可见窗口；仍需按任务约束复核后方可排程。" });
+    return Response.json({ schemaVersion: "tianxun.visibility.v3", mode: "sensor_model", orbitVersion, computedAt, windows: planning.windows, planningProblem: planning.problem, planningSummary: planning.summary, state: "ready", engine: capabilities ? { engines: capabilities.engines, precisionClass: capabilities.precisionClass, verifiedConstraints: capabilities.verifiedConstraints, serviceVersion: capabilities.serviceVersion, movingAoi: capabilities.supportsMovingAoi } : { engines: ["custom"], precisionClass: "sensor_model", verifiedConstraints: [], serviceVersion: "undeclared", movingAoi: false }, message: capabilities ? "已由声明能力的外部仿真服务返回可见窗口；仍需按任务约束复核后方可排程。" : "已由外部传感器级仿真服务返回可见窗口；服务未提供能力清单，工程约束一律视为未验证。" });
   } catch (error) {
     return Response.json({ state: "error", windows: [], message: error instanceof Error ? error.message : "可见性计算失败" }, { status: 502 });
   }

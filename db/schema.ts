@@ -287,3 +287,82 @@ export const eventExposureAssessments = sqliteTable("event_exposure_assessments"
   index("event_exposure_assessments_expiry_idx").on(table.expiresAt, table.computedAt),
   index("event_exposure_assessments_status_idx").on(table.status, table.computedAt),
 ]);
+
+export const missionExecutionReceipts = sqliteTable("mission_execution_receipts", {
+  receiptId: text("receipt_id").primaryKey(),
+  taskId: text("task_id").notNull(),
+  masterEventId: text("master_event_id").notNull(),
+  owner: text("owner").notNull(),
+  provider: text("provider").notNull(),
+  externalTaskId: text("external_task_id").notNull(),
+  fromStatus: text("from_status").notNull(),
+  toStatus: text("to_status").notNull(),
+  taskRevision: integer("task_revision").notNull(),
+  occurredAt: text("occurred_at").notNull(),
+  receivedAt: text("received_at").notNull(),
+  actor: text("actor").notNull(),
+  note: text("note").notNull().default(""),
+  payloadJson: text("payload_json").notNull(),
+}, (table) => [
+  index("mission_execution_receipts_task_time_idx").on(table.taskId, table.occurredAt),
+  index("mission_execution_receipts_provider_external_idx").on(table.provider, table.externalTaskId),
+]);
+
+export const observationProducts = sqliteTable("observation_products", {
+  itemId: text("item_id").primaryKey(),
+  taskId: text("task_id").notNull(),
+  masterEventId: text("master_event_id").notNull(),
+  owner: text("owner").notNull(),
+  collectionId: text("collection_id").notNull(),
+  productLevel: text("product_level").notNull(),
+  qualityStatus: text("quality_status").notNull(),
+  acquiredAt: text("acquired_at").notNull(),
+  geometryJson: text("geometry_json").notNull(),
+  bboxJson: text("bbox_json").notNull(),
+  stacJson: text("stac_json").notNull(),
+  revision: integer("revision").notNull().default(1),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  index("observation_products_task_time_idx").on(table.taskId, table.acquiredAt),
+  index("observation_products_event_time_idx").on(table.masterEventId, table.acquiredAt),
+  index("observation_products_owner_quality_idx").on(table.owner, table.qualityStatus),
+]);
+
+export const aoiWorkPackages = sqliteTable("aoi_work_packages", {
+  packageId: text("package_id").primaryKey(),
+  masterEventId: text("master_event_id").notNull(),
+  sourceTaskId: text("source_task_id").notNull(),
+  owner: text("owner").notNull(),
+  title: text("title").notNull(),
+  geometryJson: text("geometry_json").notNull(),
+  aoiHash: text("aoi_hash").notNull(),
+  status: text("status").notNull(),
+  assignee: text("assignee").notNull().default(""),
+  reviewer: text("reviewer").notNull().default(""),
+  priority: integer("priority").notNull(),
+  reviewNote: text("review_note").notNull().default(""),
+  revision: integer("revision").notNull().default(1),
+  payloadJson: text("payload_json").notNull(),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  index("aoi_work_packages_task_status_idx").on(table.sourceTaskId, table.status),
+  index("aoi_work_packages_owner_status_idx").on(table.owner, table.status),
+  index("aoi_work_packages_assignee_status_idx").on(table.assignee, table.status),
+]);
+
+export const aoiWorkPackageHistory = sqliteTable("aoi_work_package_history", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  packageId: text("package_id").notNull(),
+  revision: integer("revision").notNull(),
+  actor: text("actor").notNull(),
+  action: text("action").notNull(),
+  fromStatus: text("from_status"),
+  toStatus: text("to_status").notNull(),
+  payloadJson: text("payload_json").notNull(),
+  changedAt: text("changed_at").notNull(),
+}, (table) => [
+  uniqueIndex("aoi_work_package_history_revision_uidx").on(table.packageId, table.revision),
+  index("aoi_work_package_history_time_idx").on(table.packageId, table.changedAt),
+]);

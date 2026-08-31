@@ -1,6 +1,7 @@
 import { getPlanningScenario, listPlanningScenarioSummaries, savePlanningScenario } from "../../../../db/operational";
 import { ApiInputError, apiActor, authorizeApiRequest, enforceRateLimit, readJsonObject, rejectCrossOriginBrowserWrite } from "../../../../lib/api-security";
-import { normalizeMissionPlanningProblem, runSchedulingComparison } from "../../../../lib/mission-scheduler";
+import { normalizeMissionPlanningProblem } from "../../../../lib/mission-scheduler";
+import { runSchedulingComparisonWithAdapter } from "../../../../lib/mission-engine-adapter";
 
 export const dynamic = "force-dynamic";
 
@@ -40,7 +41,7 @@ export async function POST(request: Request) {
     const options: { transitionBufferSeconds?: number; maxSearchNodes?: number; maxSearchCandidates?: number; manualRules?: unknown } = { manualRules: body.manualRules };
     if (body.transitionBufferSeconds !== undefined) options.transitionBufferSeconds = finiteNumber(body.transitionBufferSeconds, "转换缓冲时间");
     const problems = body.problems.map(normalizeMissionPlanningProblem);
-    const comparison = runSchedulingComparison(problems, options);
+    const comparison = await runSchedulingComparisonWithAdapter(problems, options);
     const scenario = await savePlanningScenario({
       scenarioId: `scenario-${crypto.randomUUID()}`,
       seriesId,

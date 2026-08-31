@@ -103,6 +103,20 @@ test("exposes a versioned human review workflow with evidence-bound risk inputs"
   assert.match(route, /只有当前红色或橙色告警需要值守确认/);
 });
 
+test("closes the satellite mission loop with execution receipts, STAC products, and independent AOI review", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  const schema = await readFile(new URL("../db/schema.ts", import.meta.url), "utf8");
+  const executionRoute = await readFile(new URL("../app/api/execution/receipts/route.ts", import.meta.url), "utf8");
+  const productRoute = await readFile(new URL("../app/api/products/route.ts", import.meta.url), "utf8");
+  const workRoute = await readFile(new URL("../app/api/aoi-work-packages/route.ts", import.meta.url), "utf8");
+  for (const phrase of ["任务闭环与覆盖复核", "执行回执", "STAC 产品", "领取人与复核人必须是不同账号", "按场景网格生成"]) assert.ok(dashboard.includes(phrase));
+  for (const table of ["mission_execution_receipts", "observation_products", "aoi_work_packages", "aoi_work_package_history"]) assert.ok(schema.includes(table));
+  assert.match(executionRoute, /authorizeApiRequest\(request, "executor"\)/);
+  assert.match(productRoute, /stacVersion: "1\.0\.0"/);
+  assert.match(workRoute, /separationOfDuties/);
+});
+
 test("adds a bounded and evidence-labelled population and infrastructure exposure workflow", async () => {
   const { readFile } = await import("node:fs/promises");
   const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");

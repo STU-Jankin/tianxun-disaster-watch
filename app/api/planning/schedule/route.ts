@@ -1,5 +1,6 @@
 import { ApiInputError, authorizeApiRequest, enforceRateLimit, readJsonObject, rejectCrossOriginBrowserWrite } from "../../../../lib/api-security";
-import { normalizeMissionPlanningProblem, runSchedulingComparison } from "../../../../lib/mission-scheduler";
+import { normalizeMissionPlanningProblem } from "../../../../lib/mission-scheduler";
+import { runSchedulingComparisonWithAdapter } from "../../../../lib/mission-engine-adapter";
 
 export const dynamic = "force-dynamic";
 
@@ -16,7 +17,7 @@ export async function POST(request: Request) {
     if (body.transitionBufferSeconds !== undefined) options.transitionBufferSeconds = finiteNumber(body.transitionBufferSeconds, "转换缓冲时间");
     if (body.maxSearchNodes !== undefined) options.maxSearchNodes = finiteNumber(body.maxSearchNodes, "搜索节点上限");
     if (body.maxSearchCandidates !== undefined) options.maxSearchCandidates = finiteNumber(body.maxSearchCandidates, "搜索候选上限");
-    const comparison = runSchedulingComparison(body.problems.map(normalizeMissionPlanningProblem), options);
+    const comparison = await runSchedulingComparisonWithAdapter(body.problems.map(normalizeMissionPlanningProblem), options);
     return Response.json(comparison, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     const message = error instanceof Error ? error.message : "联合试排请求无效";

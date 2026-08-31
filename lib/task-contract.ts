@@ -44,6 +44,8 @@ const allowedTaskFields = new Set([
   "orbitDirectionPreference", "referenceAcquisitionRequired", "sarAnalysisMode",
   "dispatchId", "dispatchAcceptedAt", "acquisitionId", "acquiredAt", "productIds", "completedAt",
   "cancellationRequestId", "cancellationRequestedAt", "cancellationAcknowledgedAt", "externalStatusReason",
+  "executionProvider", "externalTaskId", "lastExecutionReceiptAt", "scheduledAt", "scheduleId",
+  "cancellationRejectedAt", "cancellationRejectionReason", "failedAt", "failureCode", "failureReason",
 ]);
 
 export function unknownTaskFields(task: Record<string, unknown>) {

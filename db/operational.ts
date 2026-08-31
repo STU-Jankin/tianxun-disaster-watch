@@ -9,6 +9,10 @@ import { evidenceReassignmentSql } from "../lib/operational-sql.ts";
 import type { SourceGovernance, SourceRole, SourceTier } from "../lib/source-governance.ts";
 import { canTransitionEventReview, eventReviewStatuses, type EventReviewHistoryEntry, type EventReviewRecord, type EventReviewStatus, type ReviewRiskInput } from "../lib/event-review.ts";
 import type { ExposureAssessment } from "../lib/exposure-assessment.ts";
+import { taskPatchFromExecutionReceipt, type MissionExecutionReceipt, type NormalizedExecutionReceiptInput } from "../lib/mission-execution.ts";
+import { buildStacItem, geometryBbox, type ObservationProduct, type ObservationProductInput } from "../lib/stac-products.ts";
+import { partitionAoiGeometry, transitionAoiWorkPackage, type AoiWorkPackage, type AoiWorkPackageAction } from "../lib/aoi-work-packages.ts";
+import { buildTaskAoi, type GeoGeometry } from "../lib/task-aoi.ts";
 
 type TaskRecord = Record<string, unknown> & {
   taskId: string;
@@ -328,6 +332,20 @@ export function ensureOperationalSchema() {
     `CREATE TABLE IF NOT EXISTS event_exposure_assessments (master_event_id TEXT PRIMARY KEY NOT NULL, event_revision TEXT NOT NULL, aoi_hash TEXT NOT NULL, status TEXT NOT NULL, payload_json TEXT NOT NULL, computed_at TEXT NOT NULL, expires_at TEXT NOT NULL, updated_by TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS event_exposure_assessments_expiry_idx ON event_exposure_assessments (expires_at, computed_at)`,
     `CREATE INDEX IF NOT EXISTS event_exposure_assessments_status_idx ON event_exposure_assessments (status, computed_at)`,
+    `CREATE TABLE IF NOT EXISTS mission_execution_receipts (receipt_id TEXT PRIMARY KEY NOT NULL, task_id TEXT NOT NULL, master_event_id TEXT NOT NULL, owner TEXT NOT NULL, provider TEXT NOT NULL, external_task_id TEXT NOT NULL, from_status TEXT NOT NULL, to_status TEXT NOT NULL, task_revision INTEGER NOT NULL, occurred_at TEXT NOT NULL, received_at TEXT NOT NULL, actor TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', payload_json TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS mission_execution_receipts_task_time_idx ON mission_execution_receipts (task_id, occurred_at)`,
+    `CREATE INDEX IF NOT EXISTS mission_execution_receipts_provider_external_idx ON mission_execution_receipts (provider, external_task_id)`,
+    `CREATE TABLE IF NOT EXISTS observation_products (item_id TEXT PRIMARY KEY NOT NULL, task_id TEXT NOT NULL, master_event_id TEXT NOT NULL, owner TEXT NOT NULL, collection_id TEXT NOT NULL, product_level TEXT NOT NULL, quality_status TEXT NOT NULL, acquired_at TEXT NOT NULL, geometry_json TEXT NOT NULL, bbox_json TEXT NOT NULL, stac_json TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS observation_products_task_time_idx ON observation_products (task_id, acquired_at)`,
+    `CREATE INDEX IF NOT EXISTS observation_products_event_time_idx ON observation_products (master_event_id, acquired_at)`,
+    `CREATE INDEX IF NOT EXISTS observation_products_owner_quality_idx ON observation_products (owner, quality_status)`,
+    `CREATE TABLE IF NOT EXISTS aoi_work_packages (package_id TEXT PRIMARY KEY NOT NULL, master_event_id TEXT NOT NULL, source_task_id TEXT NOT NULL, owner TEXT NOT NULL, title TEXT NOT NULL, geometry_json TEXT NOT NULL, aoi_hash TEXT NOT NULL, status TEXT NOT NULL, assignee TEXT NOT NULL DEFAULT '', reviewer TEXT NOT NULL DEFAULT '', priority INTEGER NOT NULL, review_note TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 1, payload_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS aoi_work_packages_task_status_idx ON aoi_work_packages (source_task_id, status)`,
+    `CREATE INDEX IF NOT EXISTS aoi_work_packages_owner_status_idx ON aoi_work_packages (owner, status)`,
+    `CREATE INDEX IF NOT EXISTS aoi_work_packages_assignee_status_idx ON aoi_work_packages (assignee, status)`,
+    `CREATE TABLE IF NOT EXISTS aoi_work_package_history (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, package_id TEXT NOT NULL, revision INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, from_status TEXT, to_status TEXT NOT NULL, payload_json TEXT NOT NULL, changed_at TEXT NOT NULL)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS aoi_work_package_history_revision_uidx ON aoi_work_package_history (package_id, revision)`,
+    `CREATE INDEX IF NOT EXISTS aoi_work_package_history_time_idx ON aoi_work_package_history (package_id, changed_at)`,
   ];
   schemaReady = database().then(async (db) => {
     await db.batch(statements.map((statement) => db.prepare(statement)));
@@ -1161,6 +1179,218 @@ export async function savePlanningScenario(input: {
     throw error;
   }
   return record;
+}
+
+export async function listMissionExecutionReceipts(filters: { taskId?: string; masterEventId?: string; limit?: number }, owner?: string) {
+  await ensureOperationalSchema();
+  const db = await database();
+  const limit = Math.max(1, Math.min(200, Math.trunc(filters.limit ?? 100)));
+  const result = await db.prepare(`SELECT payload_json FROM mission_execution_receipts
+      WHERE (?='' OR task_id=?) AND (?='' OR master_event_id=?) AND (?='' OR owner=?)
+      ORDER BY occurred_at DESC, received_at DESC LIMIT ?`)
+    .bind(filters.taskId ?? "", filters.taskId ?? "", filters.masterEventId ?? "", filters.masterEventId ?? "", owner ?? "", owner ?? "", limit)
+    .all<{ payload_json: string }>();
+  return result.results.flatMap((row) => parseJsonRecord<MissionExecutionReceipt>(row.payload_json));
+}
+
+export async function recordMissionExecutionReceipt(input: NormalizedExecutionReceiptInput, actor: string, allowAllOwners = false): Promise<MissionExecutionReceipt> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const current = await db.prepare(`SELECT task_id, master_event_id, owner, status, revision, payload_json FROM satellite_tasks WHERE task_id=?`)
+    .bind(input.taskId).first<{ task_id: string; master_event_id: string; owner: string; status: string; revision: number; payload_json: string }>();
+  if (!current) throw new Error("卫星任务不存在");
+  if (!allowAllOwners && current.owner !== actor) throw new Error("任务不属于当前执行身份");
+  if (Number(current.revision) !== input.expectedRevision) throw new Error(`任务版本冲突：当前为 ${current.revision}，请求为 ${input.expectedRevision}`);
+  let currentPayload: Record<string, unknown>;
+  try { currentPayload = JSON.parse(current.payload_json) as Record<string, unknown>; } catch { throw new Error("任务载荷损坏，禁止写入执行回执"); }
+  const receivedAt = new Date().toISOString();
+  const receiptId = input.receiptId ?? `receipt-${crypto.randomUUID()}`;
+  const duplicate = await db.prepare(`SELECT payload_json FROM mission_execution_receipts WHERE receipt_id=?`).bind(receiptId).first<{ payload_json: string }>();
+  if (duplicate) {
+    const existing = parseJsonRecord<MissionExecutionReceipt>(duplicate.payload_json)[0];
+    if (existing && existing.taskId === input.taskId && existing.provider === input.provider && existing.externalTaskId === input.externalTaskId && existing.toStatus === input.toStatus && existing.occurredAt === input.occurredAt) return existing;
+    throw new Error("执行回执 ID 已被其他记录使用");
+  }
+  const nextPayload = taskPatchFromExecutionReceipt({ ...currentPayload, status: current.status }, input);
+  const revision = Number(current.revision) + 1;
+  const taskPayload = { ...nextPayload, revision, updatedAt: receivedAt };
+  const receipt: MissionExecutionReceipt = {
+    receiptId,
+    taskId: input.taskId,
+    masterEventId: current.master_event_id,
+    owner: current.owner,
+    provider: input.provider,
+    externalTaskId: input.externalTaskId,
+    fromStatus: current.status as MissionExecutionReceipt["fromStatus"],
+    toStatus: input.toStatus,
+    taskRevision: revision,
+    occurredAt: input.occurredAt,
+    receivedAt,
+    actor,
+    note: input.note,
+    payload: input.payload,
+  };
+  const receiptJson = JSON.stringify(receipt);
+  const [result] = await db.batch([
+    db.prepare(`UPDATE satellite_tasks SET status=?, revision=?, payload_json=?, updated_at=? WHERE task_id=? AND status=? AND revision=?`)
+      .bind(input.toStatus, revision, JSON.stringify(taskPayload), receivedAt, input.taskId, current.status, current.revision),
+    db.prepare(`INSERT INTO mission_execution_receipts (receipt_id, task_id, master_event_id, owner, provider, external_task_id, from_status, to_status, task_revision, occurred_at, received_at, actor, note, payload_json)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM satellite_tasks WHERE task_id=? AND revision=? AND status=?)`)
+      .bind(receipt.receiptId, receipt.taskId, receipt.masterEventId, receipt.owner, receipt.provider, receipt.externalTaskId, receipt.fromStatus, receipt.toStatus, revision, receipt.occurredAt, receipt.receivedAt, receipt.actor, receipt.note, receiptJson, input.taskId, revision, input.toStatus),
+    db.prepare(`INSERT INTO task_revision_history (task_id, revision, owner, actor, from_status, to_status, reason, payload_json, changed_at)
+      SELECT task_id, revision, owner, ?, ?, status, 'executor receipt', payload_json, updated_at FROM satellite_tasks WHERE task_id=? AND revision=?`)
+      .bind(actor, current.status, input.taskId, revision),
+    db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at)
+      SELECT ?, 'task_execution_receipt', ?, ?, ? WHERE EXISTS (SELECT 1 FROM mission_execution_receipts WHERE receipt_id=?)`)
+      .bind(`task_execution_receipt:${receipt.receiptId}`, receipt.masterEventId, receiptJson, receivedAt, receipt.receiptId),
+  ]);
+  if (affectedRows(result) === 0) throw new Error("任务已被其他执行回执更新，请刷新版本后重试");
+  return receipt;
+}
+
+export async function listObservationProducts(filters: { taskId?: string; masterEventId?: string; limit?: number }, owner?: string): Promise<ObservationProduct[]> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const limit = Math.max(1, Math.min(200, Math.trunc(filters.limit ?? 100)));
+  const result = await db.prepare(`SELECT item_id, task_id, master_event_id, owner, collection_id, product_level, quality_status, acquired_at, geometry_json, bbox_json, stac_json, revision, created_at, updated_at
+      FROM observation_products WHERE (?='' OR task_id=?) AND (?='' OR master_event_id=?) AND (?='' OR owner=?)
+      ORDER BY acquired_at DESC, item_id LIMIT ?`)
+    .bind(filters.taskId ?? "", filters.taskId ?? "", filters.masterEventId ?? "", filters.masterEventId ?? "", owner ?? "", owner ?? "", limit)
+    .all<{ item_id: string; task_id: string; master_event_id: string; owner: string; collection_id: string; product_level: string; quality_status: ObservationProduct["qualityStatus"]; acquired_at: string; geometry_json: string; bbox_json: string; stac_json: string; revision: number; created_at: string; updated_at: string }>();
+  return result.results.flatMap((row) => {
+    try {
+      return [{
+        itemId: row.item_id, taskId: row.task_id, masterEventId: row.master_event_id, owner: row.owner,
+        collectionId: row.collection_id, productLevel: row.product_level, qualityStatus: row.quality_status,
+        acquiredAt: row.acquired_at, geometry: JSON.parse(row.geometry_json) as GeoGeometry,
+        bbox: JSON.parse(row.bbox_json) as [number, number, number, number], stac: JSON.parse(row.stac_json) as Record<string, unknown>,
+        revision: Number(row.revision), createdAt: row.created_at, updatedAt: row.updated_at,
+      }];
+    } catch { return []; }
+  });
+}
+
+export async function upsertObservationProduct(input: ObservationProductInput, actor: string, allowAllOwners = false): Promise<ObservationProduct> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const task = await db.prepare(`SELECT master_event_id, owner, status, payload_json FROM satellite_tasks WHERE task_id=?`)
+    .bind(input.taskId).first<{ master_event_id: string; owner: string; status: string; payload_json: string }>();
+  if (!task) throw new Error("产品关联的卫星任务不存在");
+  if (!allowAllOwners && task.owner !== actor) throw new Error("任务不属于当前执行身份");
+  if (!['acquired', 'completed'].includes(task.status)) throw new Error("只有已成像或已完成任务可以登记产品");
+  const existing = await db.prepare(`SELECT owner, revision, created_at FROM observation_products WHERE item_id=?`)
+    .bind(input.itemId).first<{ owner: string; revision: number; created_at: string }>();
+  if (existing && !allowAllOwners && existing.owner !== actor) throw new Error("产品不属于当前执行身份");
+  if (existing && input.expectedRevision !== existing.revision) throw new Error(`产品版本冲突：当前为 ${existing.revision}，请求为 ${input.expectedRevision ?? 0}`);
+  if (!existing && input.expectedRevision !== undefined) throw new Error("新产品不得携带 expectedRevision");
+  const now = new Date().toISOString();
+  const revision = Number(existing?.revision ?? 0) + 1;
+  const stac = buildStacItem(input, { taskId: input.taskId, masterEventId: task.master_event_id });
+  const product: ObservationProduct = {
+    itemId: input.itemId, taskId: input.taskId, masterEventId: task.master_event_id, owner: task.owner,
+    collectionId: input.collectionId, productLevel: input.productLevel, qualityStatus: input.qualityStatus,
+    acquiredAt: input.acquiredAt, geometry: input.geometry, bbox: geometryBbox(input.geometry), stac,
+    revision, createdAt: existing?.created_at ?? now, updatedAt: now,
+  };
+  const [result] = await db.batch([
+    db.prepare(`INSERT INTO observation_products (item_id, task_id, master_event_id, owner, collection_id, product_level, quality_status, acquired_at, geometry_json, bbox_json, stac_json, revision, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(item_id) DO UPDATE SET collection_id=excluded.collection_id, product_level=excluded.product_level, quality_status=excluded.quality_status, acquired_at=excluded.acquired_at, geometry_json=excluded.geometry_json, bbox_json=excluded.bbox_json, stac_json=excluded.stac_json, revision=excluded.revision, updated_at=excluded.updated_at
+      WHERE observation_products.revision=?`)
+      .bind(product.itemId, product.taskId, product.masterEventId, product.owner, product.collectionId, product.productLevel, product.qualityStatus, product.acquiredAt, JSON.stringify(product.geometry), JSON.stringify(product.bbox), JSON.stringify(product.stac), product.revision, product.createdAt, product.updatedAt, existing?.revision ?? -1),
+    db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at)
+      SELECT ?, 'observation_product_registered', ?, ?, ? WHERE EXISTS (SELECT 1 FROM observation_products WHERE item_id=? AND revision=?)`)
+      .bind(`observation_product_registered:${product.itemId}:${product.revision}`, product.masterEventId, JSON.stringify({ itemId: product.itemId, taskId: product.taskId, qualityStatus: product.qualityStatus, revision: product.revision }), now, product.itemId, product.revision),
+  ]);
+  if (affectedRows(result) === 0) throw new Error("产品已被其他请求更新，请刷新后重试");
+  return product;
+}
+
+export async function listAoiWorkPackages(filters: { taskId?: string; masterEventId?: string; includeCancelled?: boolean; limit?: number }, owner?: string): Promise<AoiWorkPackage[]> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const limit = Math.max(1, Math.min(500, Math.trunc(filters.limit ?? 200)));
+  const result = await db.prepare(`SELECT payload_json FROM aoi_work_packages
+      WHERE (?='' OR source_task_id=?) AND (?='' OR master_event_id=?) AND (?='' OR owner=?) AND (?=1 OR status!='cancelled')
+      ORDER BY priority DESC, updated_at DESC LIMIT ?`)
+    .bind(filters.taskId ?? "", filters.taskId ?? "", filters.masterEventId ?? "", filters.masterEventId ?? "", owner ?? "", owner ?? "", filters.includeCancelled ? 1 : 0, limit)
+    .all<{ payload_json: string }>();
+  return result.results.flatMap((row) => parseJsonRecord<AoiWorkPackage>(row.payload_json));
+}
+
+export async function createAoiWorkPackagesFromTask(input: { taskId: string; widthKm: number; heightKm: number; maximumPackages?: number }, actor: string, allowAllOwners = false): Promise<AoiWorkPackage[]> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const task = await db.prepare(`SELECT master_event_id, owner, title, priority, payload_json FROM satellite_tasks WHERE task_id=? AND status!='cancelled'`)
+    .bind(input.taskId).first<{ master_event_id: string; owner: string; title: string; priority: number; payload_json: string }>();
+  if (!task) throw new Error("用于分块的卫星任务不存在");
+  if (!allowAllOwners && task.owner !== actor) throw new Error("任务不属于当前操作员");
+  let taskPayload: Record<string, unknown>;
+  try { taskPayload = JSON.parse(task.payload_json) as Record<string, unknown>; } catch { throw new Error("任务载荷损坏，无法生成 AOI 分块"); }
+  const sourceGeometry = taskPayload.opportunityFootprint && typeof taskPayload.opportunityFootprint === "object"
+    ? taskPayload.opportunityFootprint as GeoGeometry
+    : buildTaskAoi(taskPayload);
+  if (!sourceGeometry) throw new Error("任务缺少可分块的 AOI 几何");
+  const geometries = partitionAoiGeometry(sourceGeometry, input);
+  const now = new Date().toISOString();
+  const packages: AoiWorkPackage[] = [];
+  for (let index = 0; index < geometries.length; index += 1) {
+    const geometry = geometries[index];
+    const aoiHash = await sha256Hex(JSON.stringify(geometry));
+    const packageId = `aoi-${(await sha256Hex(`${input.taskId}|${aoiHash}`)).slice(0, 40)}`;
+    const existing = await db.prepare(`SELECT payload_json FROM aoi_work_packages WHERE package_id=?`).bind(packageId).first<{ payload_json: string }>();
+    if (existing) { packages.push(...parseJsonRecord<AoiWorkPackage>(existing.payload_json)); continue; }
+    const record: AoiWorkPackage = {
+      packageId, masterEventId: task.master_event_id, sourceTaskId: input.taskId, owner: task.owner,
+      title: `${task.title} · 分块 ${index + 1}/${geometries.length}`, geometry, aoiHash, status: "open",
+      assignee: "", reviewer: "", priority: Number(task.priority), reviewNote: "", revision: 1, createdAt: now, updatedAt: now,
+    };
+    const payload = JSON.stringify(record);
+    await db.batch([
+      db.prepare(`INSERT OR IGNORE INTO aoi_work_packages (package_id, master_event_id, source_task_id, owner, title, geometry_json, aoi_hash, status, assignee, reviewer, priority, review_note, revision, payload_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'open', '', '', ?, '', 1, ?, ?, ?)`)
+        .bind(record.packageId, record.masterEventId, record.sourceTaskId, record.owner, record.title, JSON.stringify(record.geometry), record.aoiHash, record.priority, payload, now, now),
+      db.prepare(`INSERT OR IGNORE INTO aoi_work_package_history (package_id, revision, actor, action, from_status, to_status, payload_json, changed_at) VALUES (?, 1, ?, 'create', NULL, 'open', ?, ?)`)
+        .bind(record.packageId, actor, payload, now),
+    ]);
+    packages.push(record);
+  }
+  return packages;
+}
+
+export async function transitionStoredAoiWorkPackage(packageId: string, expectedRevision: number, action: AoiWorkPackageAction, actor: string, note: string, allowAllOwners = false): Promise<AoiWorkPackage> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const row = await db.prepare(`SELECT owner, revision, payload_json FROM aoi_work_packages WHERE package_id=?`).bind(packageId)
+    .first<{ owner: string; revision: number; payload_json: string }>();
+  if (!row) throw new Error("AOI 分块不存在");
+  if (!allowAllOwners && row.owner !== actor) throw new Error("AOI 分块不属于当前操作员");
+  if (Number(row.revision) !== expectedRevision) throw new Error(`AOI 分块版本冲突：当前为 ${row.revision}，请求为 ${expectedRevision}`);
+  const current = parseJsonRecord<AoiWorkPackage>(row.payload_json)[0];
+  if (!current) throw new Error("AOI 分块记录损坏");
+  const next = transitionAoiWorkPackage(current, action, actor, note);
+  const payload = JSON.stringify(next);
+  const [result] = await db.batch([
+    db.prepare(`UPDATE aoi_work_packages SET status=?, assignee=?, reviewer=?, review_note=?, revision=?, payload_json=?, updated_at=? WHERE package_id=? AND revision=?`)
+      .bind(next.status, next.assignee, next.reviewer, next.reviewNote, next.revision, payload, next.updatedAt, packageId, expectedRevision),
+    db.prepare(`INSERT INTO aoi_work_package_history (package_id, revision, actor, action, from_status, to_status, payload_json, changed_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM aoi_work_packages WHERE package_id=? AND revision=?)`)
+      .bind(packageId, next.revision, actor, action, current.status, next.status, payload, next.updatedAt, packageId, next.revision),
+    db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at)
+      SELECT ?, 'aoi_work_package_transition', ?, ?, ? WHERE EXISTS (SELECT 1 FROM aoi_work_packages WHERE package_id=? AND revision=?)`)
+      .bind(`aoi_work_package_transition:${packageId}:${next.revision}`, next.masterEventId, JSON.stringify({ packageId, action, actor, fromStatus: current.status, toStatus: next.status, revision: next.revision }), next.updatedAt, packageId, next.revision),
+  ]);
+  if (affectedRows(result) === 0) throw new Error("AOI 分块已被其他操作员更新，请刷新后重试");
+  return next;
+}
+
+function parseJsonRecord<T>(value: string): T[] {
+  try { const parsed = JSON.parse(value) as T; return parsed ? [parsed] : []; } catch { return []; }
+}
+
+async function sha256Hex(value: string) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((item) => item.toString(16).padStart(2, "0")).join("");
 }
 
 export async function listRoadDisruptions(options: { includeInactive?: boolean; activeAt?: string } = {}): Promise<RoadDisruptionRegistryEntry[]> {

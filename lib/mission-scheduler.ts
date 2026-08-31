@@ -4,7 +4,7 @@ import {
   type PlanningOpportunityInput,
 } from "./mission-planning.ts";
 
-export type SchedulingAlgorithmId = "priority_greedy_v1" | "bounded_constraint_search_v1";
+export type SchedulingAlgorithmId = "priority_greedy_v1" | "bounded_constraint_search_v1" | "external_or_tools_cp_sat_v1";
 
 export type SchedulingScore = {
   priority: number;
@@ -123,6 +123,32 @@ export function runSchedulingComparison(problems: MissionPlanningProblem[], opti
     recommendedAlgorithm: optimized.objectiveScore >= greedy.objectiveScore ? "bounded_constraint_search_v1" : "priority_greedy_v1",
     note: "结果仅用于仿真比较；转换缓冲不是卫星真实姿态机动参数，条件机会不得据此自动下发。",
   };
+}
+
+export function buildExternallySelectedSchedule(
+  problems: MissionPlanningProblem[],
+  selectedOpportunityRefs: string[],
+  options: { transitionBufferSeconds?: number; manualRules?: unknown; generatedAt?: string; optimality?: MultiTaskSchedule["optimality"]; nodesEvaluated?: number } = {},
+): MultiTaskSchedule {
+  validateProblemCollection(problems);
+  const transitionBufferSeconds = boundedInteger(options.transitionBufferSeconds, 0, 900, 120);
+  const manualRules = normalizeSchedulingManualRules(options.manualRules, problems);
+  const allCandidates = planningCandidates(problems);
+  const candidates = applyManualRules(allCandidates, manualRules);
+  const knownRefs = new Set(candidates.map((candidate) => schedulingOpportunityRef(candidate.problem.problemId, candidate.opportunity.opportunityId)));
+  const selectedRefs = [...new Set(selectedOpportunityRefs)];
+  if (selectedRefs.length > 500 || selectedRefs.some((reference) => typeof reference !== "string" || !knownRefs.has(reference))) throw new Error("外部优化器返回未知、被排除或不可试排的机会");
+  const requiredLocked = new Set(manualRules.lockedOpportunityRefs);
+  if ([...requiredLocked].some((reference) => !selectedRefs.includes(reference))) throw new Error("外部优化器遗漏了人工锁定机会");
+  const selectionRules = { ...manualRules, lockedOpportunityRefs: selectedRefs };
+  const selected = lockedCandidates(allCandidates, candidates, selectionRules, transitionBufferSeconds);
+  return buildSchedule(problems, allCandidates, candidates, selected, manualRules, {
+    generatedAt: options.generatedAt ?? new Date().toISOString(),
+    algorithm: "external_or_tools_cp_sat_v1",
+    optimality: options.optimality ?? "bounded",
+    nodesEvaluated: boundedInteger(options.nodesEvaluated, 0, 10_000_000, 0),
+    transitionBufferSeconds,
+  });
 }
 
 export function schedulingOpportunityRef(problemId: string, opportunityId: string) {
@@ -403,7 +429,7 @@ function buildSchedule(problems: MissionPlanningProblem[], allCandidates: Candid
     algorithm: {
       id: metadata.algorithm,
       version: "1",
-      label: metadata.algorithm === "priority_greedy_v1" ? "优先级贪心基线" : "有界约束搜索",
+      label: metadata.algorithm === "priority_greedy_v1" ? "优先级贪心基线" : metadata.algorithm === "bounded_constraint_search_v1" ? "有界约束搜索" : "外部 OR-Tools CP-SAT",
     },
     optimality: metadata.optimality,
     state: assignments.length ? "feasible" : "infeasible",
@@ -412,7 +438,7 @@ function buildSchedule(problems: MissionPlanningProblem[], allCandidates: Candid
     transitionBufferSeconds: metadata.transitionBufferSeconds,
     assumptions: [
       `同一卫星相邻任务暂按 ${metadata.transitionBufferSeconds} 秒转换缓冲检查冲突。`,
-      "当前未建模真实姿态角速度、加速度、稳定时间、功耗、存储、热控、下传和模式切换。",
+      metadata.algorithm === "external_or_tools_cp_sat_v1" ? "外部求解器的选择已由本系统重新校验任务重访次数、人工规则及同星时间冲突。" : "当前未建模真实姿态角速度、加速度、稳定时间、功耗、存储、热控、下传和模式切换。",
       "conditional 机会只允许进入试排，不具备自动下发资格。",
     ],
     summary: {

@@ -39,6 +39,9 @@ import { emptySchedulingManualRules, schedulingOpportunityRef, type MultiTaskSch
 import { planningScenarioMatchesProblems, planningScenarioSummary, type PlanningScenarioRecord, type PlanningScenarioSummary } from "../lib/planning-scenarios";
 import { eventReviewStatusLabel, reviewImpactRisk, type EventReviewHistoryEntry, type EventReviewStatus, type EventReviewSummary, type ReviewRiskInput } from "../lib/event-review";
 import { exposureFacilityKindLabel, type ExposureAssessment, type ExposureFacilityKind } from "../lib/exposure-assessment";
+import type { MissionExecutionReceipt } from "../lib/mission-execution";
+import type { ObservationProduct } from "../lib/stac-products";
+import type { AoiWorkPackage, AoiWorkPackageAction } from "../lib/aoi-work-packages";
 
 type ApiResponse = {
   events: DisasterEvent[];
@@ -275,7 +278,7 @@ type VisibilityState = {
 
 type JointSchedulingState = {
   state: "idle" | "loading" | "ready" | "error";
-  comparison?: SchedulingComparison;
+  comparison?: SchedulingComparison & { engine?: { mode: "external" | "local_fallback" | "local"; engineId: string; fallbackReason?: string } };
   message?: string;
 };
 
@@ -2079,11 +2082,11 @@ function DetailPanel({ event, exposureAssessment, onExposureChange, currentUser,
     </div>
     <div className="classification-grid" aria-label="事件分级与任务排序">
       <div className={`official-severity ${event.severity}`}><span>来源/官方告警等级</span><strong>{severityLabels[event.severity]}</strong><small>来源原始表述：{event.sourceSeverity}</small></div>
-      <div className={`impact-risk ${effectiveImpactRisk?.level ?? "undetermined"}`}><span>影响风险</span><strong>{effectiveImpactRisk?.status === "assessed" ? `${impactRiskLabel(effectiveImpactRisk.level)} · ${effectiveImpactRisk.score}` : "待评估"}</strong><small>{effectiveImpactRisk?.status === "assessed" ? "危险性、暴露度和脆弱性初筛" : `危险性 ${effectiveImpactRisk?.hazardIndex ?? "—"}/100；待补 ${effectiveImpactRisk?.missingInputs.join("、") || "必要输入"}`}</small></div>
+      <div className={`impact-risk ${effectiveImpactRisk?.level ?? "undetermined"}`}><span>影响风险</span><strong>{effectiveImpactRisk?.status === "assessed" ? `${impactRiskLabel(effectiveImpactRisk.level)} · ${effectiveImpactRisk.score}${effectiveImpactRisk.scoreRange ? `（${effectiveImpactRisk.scoreRange.min}–${effectiveImpactRisk.scoreRange.max}）` : ""}` : "待评估"}</strong><small>{effectiveImpactRisk?.status === "assessed" ? `${effectiveImpactRisk.hazardModel.quantitative ? "分灾种强度" : "官方等级代理"}、暴露度和脆弱性初筛` : `危险性 ${effectiveImpactRisk?.hazardIndex ?? "—"}/100；待补 ${effectiveImpactRisk?.missingInputs.join("、") || "必要输入"}`}</small></div>
       <div className="satellite-priority"><span>卫星观测优先级</span><strong>{event.priority}</strong><small>用于候选任务排序，不等于灾害影响风险</small></div>
     </div>
     <details className="priority-method"><summary>查看卫星优先级构成</summary><p>官方等级 {event.priorityBreakdown.severity} · 重点区域 {event.priorityBreakdown.scope} · 遥感可观测性 {event.priorityBreakdown.observability} · 时效 {event.priorityBreakdown.time} · 数据可信度 {event.priorityBreakdown.confidence ?? 0}</p></details>
-    {effectiveImpactRisk ? <section className="impact-risk-method"><h3>影响风险说明</h3><p>{effectiveImpactRisk.limitations}</p>{effectiveImpactRisk.missingInputs.length ? <small>待补数据：{effectiveImpactRisk.missingInputs.join("、")}</small> : null}</section> : null}
+    {effectiveImpactRisk ? <section className="impact-risk-method"><h3>影响风险说明</h3><p>{effectiveImpactRisk.limitations}</p><small>模型：{effectiveImpactRisk.hazardModel.modelId} · 强度依据：{effectiveImpactRisk.hazardModel.intensityProxy} · 危险性区间 {effectiveImpactRisk.uncertainty.hazardIndexMin}–{effectiveImpactRisk.uncertainty.hazardIndexMax}</small>{effectiveImpactRisk.missingInputs.length ? <small>待补数据：{effectiveImpactRisk.missingInputs.join("、")}</small> : null}</section> : null}
     <ExposureAssessmentCard event={event} assessment={exposureAssessment} currentUser={currentUser} historicalReadOnly={historicalReadOnly} onChange={onExposureChange} />
     <EventReviewCard
       key={`${event.masterEventId}:${reviewState.review?.revision ?? 0}:${historicalReadOnly ? "history" : "live"}`}
@@ -2971,7 +2974,7 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ problems: planningProblems, transitionBufferSeconds: 120, manualRules }),
       });
-      const result = await response.json() as SchedulingComparison & { error?: string };
+      const result = await response.json() as SchedulingComparison & { error?: string; engine?: { mode: "external" | "local_fallback" | "local"; engineId: string; fallbackReason?: string } };
       if (!response.ok) throw new Error(result.error || `联合试排失败（HTTP ${response.status}）`);
       setScheduling({ state: "ready", comparison: result });
     } catch (error) {
@@ -3074,7 +3077,7 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
   };
   return <aside ref={panelRef} className="task-panel" role="dialog" aria-modal={open ? "true" : undefined} aria-labelledby="task-panel-title" hidden={!open} inert={!open ? true : undefined}>
     <div className="task-panel-heading">
-      <div><span>卫星任务工作台</span><h2 id="task-panel-title">卫星任务候选单 <b>{tasks.length}</b></h2><p>建立候选 → 复核 AOI → 计算机会 → 联合试排 → 导出</p></div>
+      <div><span>卫星任务工作台</span><h2 id="task-panel-title">卫星任务候选单 <b>{tasks.length}</b></h2><p>候选 → AOI 复核 → 机会 → 排程 → 执行回执 → 成像产品</p></div>
       <button ref={closeRef} onClick={onClose} aria-label="关闭卫星任务候选单">×</button>
     </div>
     <div className="task-export-bar">
@@ -3089,7 +3092,7 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
         <div><strong id="joint-schedule-title">多任务联合试排</strong><span>{planningProblems.length}/{tasks.length} 个任务已有机会</span></div>
         <button disabled={!planningProblems.length || scheduling.state === "loading"} onClick={() => void runJointScheduling()}>{scheduling.state === "loading" ? "正在比较算法…" : "运行试排"}</button>
       </div>
-      <small>比较优先级贪心与有界约束搜索；同星任务预留 120 秒转换缓冲。结果仅用于仿真，不改任务状态、不自动下发。</small>
+      <small>默认比较优先级贪心与有界约束搜索；配置 OR-Tools 服务后会校验外部选择。结果仅用于仿真，不改任务状态、不自动下发。</small>
       {planningProblems.length ? <details className="joint-manual-rules">
         <summary>人工规则 <b>{manualRuleCount}</b><span>锁定、排除或限定任务</span></summary>
         <div className="joint-task-rules">{planningProblems.map((problem) => {
@@ -3104,9 +3107,10 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
       {scheduling.comparison && recommendedSchedule ? <div className="joint-schedule-result">
         <div className="schedule-score-row">
           <span>贪心 <b>{scheduling.comparison.greedy.objectiveScore}</b></span>
-          <span>有界搜索 <b>{scheduling.comparison.optimized.objectiveScore}</b></span>
-          <span>采用 <b>{scheduling.comparison.recommendedAlgorithm === "bounded_constraint_search_v1" ? "有界搜索" : "贪心"}</b></span>
+          <span>{scheduling.comparison.optimized.algorithm.id === "external_or_tools_cp_sat_v1" ? "OR-Tools" : "有界搜索"} <b>{scheduling.comparison.optimized.objectiveScore}</b></span>
+          <span>采用 <b>{scheduling.comparison.recommendedAlgorithm === "external_or_tools_cp_sat_v1" ? "OR-Tools" : scheduling.comparison.recommendedAlgorithm === "bounded_constraint_search_v1" ? "有界搜索" : "贪心"}</b></span>
         </div>
+        {scheduling.comparison.engine ? <p className={`planning-engine-state ${scheduling.comparison.engine.mode}`}>{scheduling.comparison.engine.mode === "external" ? "外部 OR-Tools 已返回并通过本地约束复核" : scheduling.comparison.engine.mode === "local_fallback" ? `外部优化不可用，已降级为本地有界搜索：${scheduling.comparison.engine.fallbackReason ?? "原因未返回"}` : "当前使用本地有界约束搜索"}</p> : null}
         <p>{recommendedSchedule.summary.assignmentCount}/{recommendedSchedule.summary.requestedAssignments} 次观测已排入 · {recommendedSchedule.summary.scheduledTaskCount}/{recommendedSchedule.summary.taskCount} 个任务覆盖 · {recommendedSchedule.summary.conditionalAssignmentCount} 个条件机会</p>
         <ScheduleTimeline schedule={recommendedSchedule} onActivate={onActivate} />
         {recommendedSchedule.assignments.length ? <div className="schedule-assignments">{recommendedSchedule.assignments.slice(0, 12).map((assignment) => <button key={assignment.assignmentId} onClick={() => onActivate(assignment.taskId)} title="设为当前任务并在地图查看">
@@ -3256,11 +3260,97 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
             }}>{task.opportunityId === window.opportunityId ? "已选择 · 查看拍摄位置" : window.simulationLevel === "orbit_only" ? "选择并查看轨道粗筛位置" : window.simulationLevel === "assumed_sensor" ? "选择并查看试算位置" : "选择并在地图查看"}</button>
           </div>)}
         </div>
+        {expandedTaskIds.has(task.taskId) ? <MissionLifecyclePanel task={task} enabled={storageMode === "operational-database" && syncState[task.taskId]?.state === "synced"} /> : null}
       </article>)}
     </div>
     <footer>导出字段包括灾害发生时间、任务时间窗、WGS 84坐标、多类型AOI、台风官方路径/风圈、载荷与 SAR 成像方式、目标、优先级与权威来源。</footer>
   </aside>;
 }
+
+type MissionLifecycleState = {
+  state: "idle" | "loading" | "ready" | "saving" | "error";
+  receipts: MissionExecutionReceipt[];
+  products: ObservationProduct[];
+  packages: AoiWorkPackage[];
+  message?: string;
+};
+
+function MissionLifecyclePanel({ task, enabled }: { task: SatelliteTask; enabled: boolean }) {
+  const defaultWidth = Math.max(1, Math.round(task.opportunitySceneCrossTrackKm ?? 25));
+  const defaultHeight = Math.max(1, Math.round(task.opportunitySceneAlongTrackKm ?? defaultWidth));
+  const [widthKm, setWidthKm] = useState(defaultWidth);
+  const [heightKm, setHeightKm] = useState(defaultHeight);
+  const [reviewNote, setReviewNote] = useState("");
+  const [state, setState] = useState<MissionLifecycleState>({ state: "idle", receipts: [], products: [], packages: [] });
+
+  const load = useCallback(async () => {
+    if (!enabled) return;
+    setState((current) => ({ ...current, state: "loading", message: undefined }));
+    try {
+      const taskId = encodeURIComponent(task.taskId);
+      const [receiptResponse, productResponse, packageResponse] = await Promise.all([
+        fetch(`/api/execution/receipts?taskId=${taskId}`, { cache: "no-store" }),
+        fetch(`/api/products?taskId=${taskId}`, { cache: "no-store" }),
+        fetch(`/api/aoi-work-packages?taskId=${taskId}`, { cache: "no-store" }),
+      ]);
+      const [receiptResult, productResult, packageResult] = await Promise.all([
+        receiptResponse.json() as Promise<{ receipts?: MissionExecutionReceipt[]; error?: string }>,
+        productResponse.json() as Promise<{ products?: ObservationProduct[]; error?: string }>,
+        packageResponse.json() as Promise<{ packages?: AoiWorkPackage[]; error?: string }>,
+      ]);
+      const failed = [[receiptResponse, receiptResult.error], [productResponse, productResult.error], [packageResponse, packageResult.error]].find(([response]) => !(response as Response).ok);
+      if (failed) throw new Error(String(failed[1] || `闭环记录读取失败（HTTP ${(failed[0] as Response).status}）`));
+      setState({ state: "ready", receipts: receiptResult.receipts ?? [], products: productResult.products ?? [], packages: packageResult.packages ?? [] });
+    } catch (error) {
+      setState((current) => ({ ...current, state: "error", message: error instanceof Error ? error.message : "任务闭环记录读取失败" }));
+    }
+  }, [enabled, task.taskId]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const generate = async () => {
+    setState((current) => ({ ...current, state: "saving", message: undefined }));
+    try {
+      const response = await fetch("/api/aoi-work-packages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "generate", taskId: task.taskId, widthKm, heightKm, maximumPackages: 100 }) });
+      const result = await response.json() as { packages?: AoiWorkPackage[]; error?: string };
+      if (!response.ok) throw new Error(result.error || `AOI 分块失败（HTTP ${response.status}）`);
+      setState((current) => ({ ...current, state: "ready", packages: result.packages ?? [], message: `已生成或复用 ${result.packages?.length ?? 0} 个覆盖复核分块` }));
+    } catch (error) { setState((current) => ({ ...current, state: "error", message: error instanceof Error ? error.message : "AOI 分块失败" })); }
+  };
+
+  const act = async (workPackage: AoiWorkPackage, action: AoiWorkPackageAction) => {
+    setState((current) => ({ ...current, state: "saving", message: undefined }));
+    try {
+      const response = await fetch("/api/aoi-work-packages", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ packageId: workPackage.packageId, expectedRevision: workPackage.revision, action, note: action === "request_changes" ? reviewNote : "" }) });
+      const result = await response.json() as { package?: AoiWorkPackage; error?: string };
+      if (!response.ok || !result.package) throw new Error(result.error || `分块状态更新失败（HTTP ${response.status}）`);
+      setState((current) => ({ ...current, state: "ready", packages: current.packages.map((item) => item.packageId === result.package!.packageId ? result.package! : item), message: "分块状态已更新" }));
+      if (action === "request_changes") setReviewNote("");
+    } catch (error) {
+      setState((current) => ({ ...current, state: "error", message: error instanceof Error ? error.message : "分块状态更新失败" }));
+      void load();
+    }
+  };
+
+  const counts = Object.fromEntries(["open", "claimed", "submitted", "in_review", "changes_requested", "approved"].map((status) => [status, state.packages.filter((item) => item.status === status).length]));
+  return <details className={`mission-lifecycle ${state.state}`} open={Boolean(state.receipts.length || state.products.length || state.packages.length)}>
+    <summary><span>任务闭环与覆盖复核</span><b>{taskStatusLabel(task.status)}</b></summary>
+    {!enabled ? <p>任务同步到业务数据库后，才能生成复核分块并读取执行回执与产品。</p> : <>
+      <div className="mission-lifecycle-head"><span>执行回执 {state.receipts.length}</span><span>STAC 产品 {state.products.length}</span><span>AOI 分块 {state.packages.length}</span><button onClick={() => void load()} disabled={state.state === "loading" || state.state === "saving"}>刷新</button></div>
+      <div className="aoi-work-generator"><label>横轨宽度 km<input type="number" min="1" max="1000" value={widthKm} onChange={(event) => setWidthKm(clampNumber(event.target.value, 1, 1000))} /></label><label>沿轨长度 km<input type="number" min="1" max="1000" value={heightKm} onChange={(event) => setHeightKm(clampNumber(event.target.value, 1, 1000))} /></label><button onClick={() => void generate()} disabled={state.state === "saving"}>按场景网格生成</button></div>
+      <small>优先采用已选机会足迹；没有足迹时按任务 AOI 分块。领取人与复核人必须是不同账号。</small>
+      {state.packages.length ? <div className="aoi-work-summary"><span>待领取 {counts.open ?? 0}</span><span>作业中 {(counts.claimed ?? 0) + (counts.changes_requested ?? 0)}</span><span>待复核 {(counts.submitted ?? 0) + (counts.in_review ?? 0)}</span><span>已通过 {counts.approved ?? 0}</span></div> : null}
+      {state.packages.slice(0, 20).map((workPackage) => <div className={`aoi-work-row ${workPackage.status}`} key={workPackage.packageId}><div><b>{workPackage.title}</b><span>{aoiWorkStatusLabel(workPackage.status)} · v{workPackage.revision}</span>{workPackage.assignee ? <small>领取：{workPackage.assignee}{workPackage.reviewer ? ` · 复核：${workPackage.reviewer}` : ""}</small> : null}</div><div>{workPackage.status === "open" || workPackage.status === "changes_requested" ? <button onClick={() => void act(workPackage, "claim")}>领取</button> : null}{workPackage.status === "claimed" ? <><button onClick={() => void act(workPackage, "submit")}>提交复核</button><button onClick={() => void act(workPackage, "release")}>释放</button></> : null}{["submitted", "in_review"].includes(workPackage.status) ? <><button onClick={() => void act(workPackage, "approve")}>独立通过</button><button onClick={() => void act(workPackage, "request_changes")} disabled={reviewNote.trim().length < 3}>退回</button></> : null}</div></div>)}
+      {state.packages.some((item) => ["submitted", "in_review"].includes(item.status)) ? <label className="aoi-review-note">退回原因（至少3字）<input value={reviewNote} maxLength={1000} onChange={(event) => setReviewNote(event.target.value)} /></label> : null}
+      {state.receipts.slice(0, 6).map((receipt) => <div className="mission-record" key={receipt.receiptId}><b>{taskStatusLabel(receipt.fromStatus)} → {taskStatusLabel(receipt.toStatus)}</b><span>{receipt.provider} · {formatTimeWithYear(receipt.occurredAt)} UTC+08</span><small>{receipt.externalTaskId}</small></div>)}
+      {state.products.slice(0, 6).map((product) => <div className="mission-record product" key={product.itemId}><b>{product.productLevel} · {productQualityLabel(product.qualityStatus)}</b><span>{formatTimeWithYear(product.acquiredAt)} UTC+08</span><small>{product.itemId} · STAC 1.0.0</small></div>)}
+      {state.message ? <p role={state.state === "error" ? "alert" : "status"}>{state.message}</p> : null}
+    </>}
+  </details>;
+}
+
+function aoiWorkStatusLabel(status: AoiWorkPackage["status"]) { return ({ open: "待领取", claimed: "已领取", submitted: "待复核", in_review: "复核中", changes_requested: "退回修改", approved: "已通过", cancelled: "已取消" } as const)[status]; }
+function productQualityLabel(status: ObservationProduct["qualityStatus"]) { return ({ pending: "待质检", passed: "质检通过", conditional: "有条件通过", rejected: "已驳回" } as const)[status]; }
 
 function ScheduleTimeline({ schedule, onActivate }: { schedule: MultiTaskSchedule; onActivate: (taskId: string) => void }) {
   if (!schedule.assignments.length) return null;
