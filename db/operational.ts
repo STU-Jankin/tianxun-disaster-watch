@@ -7,7 +7,6 @@ import { canTransitionTask } from "../lib/task-contract.ts";
 import { compareEventVersionFreshness, eventHasInvalidIdentity, isValidSourceEventId } from "../lib/event-integrity.ts";
 import { evidenceReassignmentSql } from "../lib/operational-sql.ts";
 import type { SourceGovernance, SourceRole, SourceTier } from "../lib/source-governance.ts";
-import { canTransitionEventReview, eventReviewStatuses, type EventReviewHistoryEntry, type EventReviewRecord, type EventReviewStatus, type ReviewRiskInput } from "../lib/event-review.ts";
 import type { ExposureAssessment } from "../lib/exposure-assessment.ts";
 import { taskPatchFromExecutionReceipt, type MissionExecutionReceipt, type NormalizedExecutionReceiptInput } from "../lib/mission-execution.ts";
 import { buildStacItem, geometryBbox, type ObservationProduct, type ObservationProductInput } from "../lib/stac-products.ts";
@@ -85,24 +84,6 @@ export type IngestionSnapshotRecord = {
   payload: Record<string, unknown>;
 };
 
-type EventReviewRow = {
-  master_event_id: string;
-  status: string;
-  assignee: string;
-  conclusion: string;
-  exposure_index: number | null;
-  exposure_basis: string | null;
-  vulnerability_index: number | null;
-  vulnerability_basis: string | null;
-  alert_acknowledged_at: string | null;
-  alert_acknowledged_by: string | null;
-  alert_acknowledged_version: string | null;
-  event_revision: string;
-  revision: number;
-  updated_at: string;
-  updated_by: string;
-};
-
 type EventExposureAssessmentRow = {
   master_event_id: string;
   event_revision: string;
@@ -114,18 +95,24 @@ type EventExposureAssessmentRow = {
   updated_by: string;
 };
 
-export type EventReviewSaveInput = {
-  masterEventId: string;
-  status: EventReviewStatus;
-  assignee: string;
-  conclusion: string;
-  exposure: ReviewRiskInput | null;
-  vulnerability: ReviewRiskInput | null;
-  acknowledgeAlert: boolean;
-  alertVersion: string;
-  eventRevision: string;
-  expectedRevision: number;
-  actor: string;
+export type OsmQueryCacheRecord<T = unknown> = {
+  cacheKey: string;
+  queryKind: "exposure" | "infrastructure";
+  dataProfile: "public" | "china_daily";
+  payload: T;
+  fetchedAt: string;
+  expiresAt: string;
+  osmBaseTimestamp?: string;
+};
+
+type OsmQueryCacheRow = {
+  cache_key: string;
+  query_kind: string;
+  data_profile: string;
+  payload_json: string;
+  fetched_at: string;
+  expires_at: string;
+  osm_base_timestamp: string | null;
 };
 
 let schemaReady: Promise<void> | null = null;
@@ -332,6 +319,9 @@ export function ensureOperationalSchema() {
     `CREATE TABLE IF NOT EXISTS event_exposure_assessments (master_event_id TEXT PRIMARY KEY NOT NULL, event_revision TEXT NOT NULL, aoi_hash TEXT NOT NULL, status TEXT NOT NULL, payload_json TEXT NOT NULL, computed_at TEXT NOT NULL, expires_at TEXT NOT NULL, updated_by TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS event_exposure_assessments_expiry_idx ON event_exposure_assessments (expires_at, computed_at)`,
     `CREATE INDEX IF NOT EXISTS event_exposure_assessments_status_idx ON event_exposure_assessments (status, computed_at)`,
+    `CREATE TABLE IF NOT EXISTS osm_query_cache (cache_key TEXT PRIMARY KEY NOT NULL, query_kind TEXT NOT NULL, data_profile TEXT NOT NULL, payload_json TEXT NOT NULL, fetched_at TEXT NOT NULL, expires_at TEXT NOT NULL, osm_base_timestamp TEXT)`,
+    `CREATE INDEX IF NOT EXISTS osm_query_cache_kind_profile_idx ON osm_query_cache (query_kind, data_profile, fetched_at)`,
+    `CREATE INDEX IF NOT EXISTS osm_query_cache_expiry_idx ON osm_query_cache (expires_at)`,
     `CREATE TABLE IF NOT EXISTS mission_execution_receipts (receipt_id TEXT PRIMARY KEY NOT NULL, task_id TEXT NOT NULL, master_event_id TEXT NOT NULL, owner TEXT NOT NULL, provider TEXT NOT NULL, external_task_id TEXT NOT NULL, from_status TEXT NOT NULL, to_status TEXT NOT NULL, task_revision INTEGER NOT NULL, occurred_at TEXT NOT NULL, received_at TEXT NOT NULL, actor TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', payload_json TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS mission_execution_receipts_task_time_idx ON mission_execution_receipts (task_id, occurred_at)`,
     `CREATE INDEX IF NOT EXISTS mission_execution_receipts_provider_external_idx ON mission_execution_receipts (provider, external_task_id)`,
@@ -545,101 +535,6 @@ export async function listIngestionSnapshots(limit = 24) {
   return rows.results;
 }
 
-export async function listEventReviews(masterEventIds: string[] = []): Promise<EventReviewRecord[]> {
-  await ensureOperationalSchema();
-  const db = await database();
-  if (masterEventIds.length) {
-    const ids = [...new Set(masterEventIds.map((item) => item.trim()).filter(Boolean))].slice(0, 300);
-    if (!ids.length) return [];
-    const placeholders = ids.map(() => "?").join(",");
-    const rows = await db.prepare(`SELECT * FROM event_reviews WHERE master_event_id IN (${placeholders}) ORDER BY updated_at DESC`).bind(...ids).all<EventReviewRow>();
-    return rows.results.map(eventReviewFromRow);
-  }
-  const rows = await db.prepare(`SELECT * FROM event_reviews ORDER BY updated_at DESC LIMIT 500`).all<EventReviewRow>();
-  return rows.results.map(eventReviewFromRow);
-}
-
-export async function getEventReview(masterEventId: string): Promise<EventReviewRecord | null> {
-  await ensureOperationalSchema();
-  const db = await database();
-  const row = await db.prepare(`SELECT * FROM event_reviews WHERE master_event_id = ?`).bind(masterEventId).first<EventReviewRow>();
-  return row ? eventReviewFromRow(row) : null;
-}
-
-export async function listEventReviewHistory(masterEventId: string, limit = 30): Promise<EventReviewHistoryEntry[]> {
-  await ensureOperationalSchema();
-  const db = await database();
-  const boundedLimit = Math.max(1, Math.min(100, Math.floor(limit)));
-  const rows = await db.prepare(`SELECT revision, actor, action, from_status, to_status, payload_json, changed_at FROM event_review_history WHERE master_event_id = ? ORDER BY revision DESC LIMIT ?`)
-    .bind(masterEventId, boundedLimit).all<{ revision: number; actor: string; action: string; from_status: string | null; to_status: string; payload_json: string; changed_at: string }>();
-  return rows.results.flatMap((row) => {
-    try {
-      if (!eventReviewStatuses.includes(row.to_status as EventReviewStatus) || (row.from_status && !eventReviewStatuses.includes(row.from_status as EventReviewStatus))) return [];
-      return [{
-        revision: row.revision,
-        actor: row.actor,
-        action: row.action,
-        fromStatus: row.from_status as EventReviewStatus | null,
-        toStatus: row.to_status as EventReviewStatus,
-        changedAt: row.changed_at,
-        snapshot: JSON.parse(row.payload_json) as EventReviewRecord,
-      }];
-    } catch {
-      return [];
-    }
-  });
-}
-
-export async function saveEventReview(input: EventReviewSaveInput): Promise<EventReviewRecord> {
-  await ensureOperationalSchema();
-  const db = await database();
-  const existingRow = await db.prepare(`SELECT * FROM event_reviews WHERE master_event_id = ?`).bind(input.masterEventId).first<EventReviewRow>();
-  const existing = existingRow ? eventReviewFromRow(existingRow) : null;
-  if (input.expectedRevision !== (existing?.revision ?? 0)) throw new Error(`研判版本冲突：当前为 ${existing?.revision ?? 0}，请求为 ${input.expectedRevision}`);
-  if (!canTransitionEventReview(existing?.status ?? null, input.status)) throw new Error(`不允许的研判状态转换：${existing?.status ?? "new"} -> ${input.status}`);
-  const updatedAt = new Date().toISOString();
-  const revision = (existing?.revision ?? 0) + 1;
-  const alertAcknowledgedAt = input.acknowledgeAlert ? updatedAt : existing?.alertAcknowledgedAt ?? null;
-  const alertAcknowledgedBy = input.acknowledgeAlert ? input.actor : existing?.alertAcknowledgedBy ?? null;
-  const alertAcknowledgedVersion = input.acknowledgeAlert ? input.alertVersion : existing?.alertAcknowledgedVersion ?? null;
-  const record: EventReviewRecord = {
-    masterEventId: input.masterEventId,
-    status: input.status,
-    assignee: input.assignee,
-    conclusion: input.conclusion,
-    exposure: input.exposure,
-    vulnerability: input.vulnerability,
-    alertAcknowledgedAt,
-    alertAcknowledgedBy,
-    alertAcknowledgedVersion,
-    eventRevision: input.eventRevision,
-    revision,
-    updatedAt,
-    updatedBy: input.actor,
-  };
-  const values = [
-    record.status, record.assignee, record.conclusion,
-    record.exposure?.index ?? null, record.exposure?.basis ?? null,
-    record.vulnerability?.index ?? null, record.vulnerability?.basis ?? null,
-    record.alertAcknowledgedAt, record.alertAcknowledgedBy, record.alertAcknowledgedVersion,
-    record.eventRevision, record.revision, record.updatedAt, record.updatedBy,
-  ];
-  const save = existing
-    ? db.prepare(`UPDATE event_reviews SET status=?, assignee=?, conclusion=?, exposure_index=?, exposure_basis=?, vulnerability_index=?, vulnerability_basis=?, alert_acknowledged_at=?, alert_acknowledged_by=?, alert_acknowledged_version=?, event_revision=?, revision=?, updated_at=?, updated_by=? WHERE master_event_id=? AND revision=?`)
-      .bind(...values, input.masterEventId, existing.revision)
-    : db.prepare(`INSERT INTO event_reviews (status, assignee, conclusion, exposure_index, exposure_basis, vulnerability_index, vulnerability_basis, alert_acknowledged_at, alert_acknowledged_by, alert_acknowledged_version, event_revision, revision, updated_at, updated_by, master_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .bind(...values, input.masterEventId);
-  const action = input.acknowledgeAlert && !existing?.alertAcknowledgedAt
-    ? "acknowledge_and_review"
-    : existing ? existing.status === input.status ? "update_review" : "transition_review" : "create_review";
-  const audit = db.prepare(`INSERT OR IGNORE INTO event_review_history (master_event_id, revision, actor, action, from_status, to_status, payload_json, changed_at)
-    SELECT master_event_id, revision, updated_by, ?, ?, status, ?, updated_at FROM event_reviews WHERE master_event_id=? AND revision=?`)
-    .bind(action, existing?.status ?? null, JSON.stringify(record), input.masterEventId, revision);
-  const [result] = await db.batch([save, audit]);
-  if (affectedRows(result) === 0) throw new Error("研判记录已被其他操作员更新，请刷新后重试");
-  return record;
-}
-
 export async function getEventExposureAssessment(masterEventId: string): Promise<ExposureAssessment | null> {
   await ensureOperationalSchema();
   const db = await database();
@@ -663,6 +558,42 @@ export async function upsertEventExposureAssessment(assessment: ExposureAssessme
     .bind(assessment.masterEventId, assessment.eventRevision, assessment.aoiHash, assessment.status, JSON.stringify(assessment), assessment.computedAt, assessment.expiresAt, assessment.updatedBy).run();
   await db.prepare(`DELETE FROM event_exposure_assessments WHERE expires_at < ?`).bind(new Date(Date.now() - 30 * 24 * 60 * 60_000).toISOString()).run();
   return assessment;
+}
+
+export async function getOsmQueryCache<T = unknown>(cacheKey: string, queryKind: "exposure" | "infrastructure"): Promise<OsmQueryCacheRecord<T> | null> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const row = await db.prepare(`SELECT * FROM osm_query_cache WHERE cache_key = ? AND query_kind = ?`).bind(cacheKey, queryKind).first<OsmQueryCacheRow>();
+  if (!row || !["public", "china_daily"].includes(row.data_profile)) return null;
+  try {
+    return {
+      cacheKey: row.cache_key,
+      queryKind,
+      dataProfile: row.data_profile as OsmQueryCacheRecord["dataProfile"],
+      payload: JSON.parse(row.payload_json) as T,
+      fetchedAt: row.fetched_at,
+      expiresAt: row.expires_at,
+      osmBaseTimestamp: row.osm_base_timestamp ?? undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function upsertOsmQueryCache<T>(record: OsmQueryCacheRecord<T>): Promise<void> {
+  const payloadJson = JSON.stringify(record.payload);
+  if (payloadJson.length > 2 * 1024 * 1024) return;
+  await ensureOperationalSchema();
+  const db = await database();
+  await db.prepare(`INSERT INTO osm_query_cache (cache_key, query_kind, data_profile, payload_json, fetched_at, expires_at, osm_base_timestamp)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(cache_key) DO UPDATE SET query_kind=excluded.query_kind, data_profile=excluded.data_profile, payload_json=excluded.payload_json, fetched_at=excluded.fetched_at, expires_at=excluded.expires_at, osm_base_timestamp=excluded.osm_base_timestamp`)
+    .bind(record.cacheKey, record.queryKind, record.dataProfile, payloadJson, record.fetchedAt, record.expiresAt, record.osmBaseTimestamp ?? null).run();
+  const retentionCutoff = new Date(Date.now() - 30 * 24 * 60 * 60_000).toISOString();
+  await db.batch([
+    db.prepare(`DELETE FROM osm_query_cache WHERE expires_at < ?`).bind(retentionCutoff),
+    db.prepare(`DELETE FROM osm_query_cache WHERE cache_key IN (SELECT cache_key FROM osm_query_cache ORDER BY fetched_at DESC LIMIT -1 OFFSET 500)`),
+  ]);
 }
 
 export function collapseCanonicalEventsByMasterId(events: DisasterEvent[]) {
@@ -1632,27 +1563,6 @@ async function quarantineInvalidOperationalRecords(db: DatabaseLike) {
 function affectedRows(result: unknown) {
   const value = result as { changes?: number; meta?: { changes?: number } } | null;
   return value?.changes ?? value?.meta?.changes ?? 1;
-}
-
-function eventReviewFromRow(row: EventReviewRow): EventReviewRecord {
-  if (!eventReviewStatuses.includes(row.status as EventReviewStatus)) throw new Error("研判记录状态无效");
-  const exposure = row.exposure_index === null || !row.exposure_basis ? null : { index: row.exposure_index, basis: row.exposure_basis };
-  const vulnerability = row.vulnerability_index === null || !row.vulnerability_basis ? null : { index: row.vulnerability_index, basis: row.vulnerability_basis };
-  return {
-    masterEventId: row.master_event_id,
-    status: row.status as EventReviewStatus,
-    assignee: row.assignee,
-    conclusion: row.conclusion,
-    exposure,
-    vulnerability,
-    alertAcknowledgedAt: row.alert_acknowledged_at,
-    alertAcknowledgedBy: row.alert_acknowledged_by,
-    alertAcknowledgedVersion: row.alert_acknowledged_version,
-    eventRevision: row.event_revision,
-    revision: row.revision,
-    updatedAt: row.updated_at,
-    updatedBy: row.updated_by,
-  };
 }
 
 function distinctEvidenceSources(evidence: Array<{ source: string }>) {

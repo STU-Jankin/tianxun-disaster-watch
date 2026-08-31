@@ -288,6 +288,19 @@ export const eventExposureAssessments = sqliteTable("event_exposure_assessments"
   index("event_exposure_assessments_status_idx").on(table.status, table.computedAt),
 ]);
 
+export const osmQueryCache = sqliteTable("osm_query_cache", {
+  cacheKey: text("cache_key").primaryKey(),
+  queryKind: text("query_kind").notNull(),
+  dataProfile: text("data_profile").notNull(),
+  payloadJson: text("payload_json").notNull(),
+  fetchedAt: text("fetched_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  osmBaseTimestamp: text("osm_base_timestamp"),
+}, (table) => [
+  index("osm_query_cache_kind_profile_idx").on(table.queryKind, table.dataProfile, table.fetchedAt),
+  index("osm_query_cache_expiry_idx").on(table.expiresAt),
+]);
+
 export const missionExecutionReceipts = sqliteTable("mission_execution_receipts", {
   receiptId: text("receipt_id").primaryKey(),
   taskId: text("task_id").notNull(),

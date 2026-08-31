@@ -117,8 +117,8 @@ export function assessImpactRisk(input: AssessmentInput): ImpactRiskAssessment {
     scoreRange: { min: compute(hazardIndexMin), max: compute(hazardIndexMax) },
     ...common,
     limitations: intensity.quantitative
-      ? "该结果使用分灾种强度初筛曲线，仅用于任务排序和人工研判；未经本地标定，不能替代正式损失评估。"
-      : "该结果仍使用官方等级代理危险性，仅是用于排序和人工研判的初筛指标；补齐分灾种强度后必须重新计算。",
+      ? "该结果使用分灾种强度初筛曲线，仅用于演示任务排序；未经本地标定，不能替代正式损失评估。"
+      : "该结果仍使用官方等级代理危险性，仅是用于演示排序的初筛指标；补齐分灾种强度后必须重新计算。",
   };
 }
 

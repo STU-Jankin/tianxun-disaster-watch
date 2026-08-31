@@ -31,6 +31,18 @@ test("persists one current exposure assessment with its event and AOI versions",
     assert.equal(updated.eventRevision, "event-v2");
     assert.equal(updated.status, "complete");
     assert.equal(updated.updatedBy, "operator-b");
+
+    const osmCache = {
+      cacheKey: "china_daily:exposure:aoi-v1",
+      queryKind: "exposure",
+      dataProfile: "china_daily",
+      payload: { state: "ready", mappedBuildingCount: 120 },
+      fetchedAt: "2026-08-31T00:00:00.000Z",
+      expiresAt: "2026-09-01T02:00:00.000Z",
+      osmBaseTimestamp: "2026-08-30T20:00:00.000Z",
+    };
+    await database.upsertOsmQueryCache(osmCache);
+    assert.deepEqual(await database.getOsmQueryCache(osmCache.cacheKey, "exposure"), osmCache);
   } finally {
     await rm(directory, { recursive: true, force: true }).catch((error) => { if (error?.code !== "EBUSY") throw error; });
   }

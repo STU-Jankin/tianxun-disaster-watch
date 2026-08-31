@@ -37,8 +37,8 @@ import { cycloneTrackingGeometry, cycloneTrackingSliceAt, nearestCycloneFrameInd
 import type { MissionPlanningProblem, MissionPlanningSummary, PlanningConstraintAssessment } from "../lib/mission-planning";
 import { emptySchedulingManualRules, schedulingOpportunityRef, type MultiTaskSchedule, type SchedulingComparison, type SchedulingManualRules } from "../lib/mission-scheduler";
 import { planningScenarioMatchesProblems, planningScenarioSummary, type PlanningScenarioRecord, type PlanningScenarioSummary } from "../lib/planning-scenarios";
-import { eventReviewStatusLabel, reviewImpactRisk, type EventReviewHistoryEntry, type EventReviewStatus, type EventReviewSummary, type ReviewRiskInput } from "../lib/event-review";
 import { exposureFacilityKindLabel, type ExposureAssessment, type ExposureFacilityKind } from "../lib/exposure-assessment";
+import { assessImpactRisk } from "../lib/impact-risk";
 import type { MissionExecutionReceipt } from "../lib/mission-execution";
 import type { ObservationProduct } from "../lib/stac-products";
 import type { AoiWorkPackage, AoiWorkPackageAction } from "../lib/aoi-work-packages";
@@ -1273,7 +1273,6 @@ function EventCard({ event, active, onClick }: { event: DisasterEvent; active: b
         <span className={`confidence-tag ${event.confidenceLevel}`}>{confidenceLabels[event.confidenceLevel]} · {event.independentSourceCount ?? new Set(event.evidence.map((item) => item.source.split(" · ")[0])).size}源</span>
         <span className="time-weight-tag">时效 +{event.priorityBreakdown.time}</span>
         <span className={`impact-risk-tag ${event.impactRisk?.level ?? "undetermined"}`}>{event.impactRisk?.status === "assessed" ? `影响风险 ${impactRiskLabel(event.impactRisk.level)} ${event.impactRisk.score}` : `影响风险待评估 · 危险性 ${event.impactRisk?.hazardIndex ?? "—"}`}</span>
-        <span className={`review-tag ${event.review?.status ?? "pending"}`}>研判 {eventReviewStatusLabel(event.review?.status ?? "pending")}{event.review?.stale ? " · 待复核" : ""}</span>
         <span>{event.observable === "direct" ? "直接可观测" : event.observable === "consequence" ? "灾后可观测" : "条件可观测"}</span>
       </div>
     </div>
@@ -2030,22 +2029,6 @@ function DetailPanel({ event, exposureAssessment, onExposureChange, currentUser,
   const isDemo = event.source === "演示数据";
   const panelRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
-  const [reviewState, setReviewState] = useState<{ state: "loading" | "ready" | "error"; review: EventReviewSummary | null; history: EventReviewHistoryEntry[]; message?: string }>({ state: historicalReadOnly ? "ready" : "loading", review: event.review ?? null, history: [] });
-  useEffect(() => {
-    if (historicalReadOnly) return;
-    const controller = new AbortController();
-    void fetch(`/api/reviews?masterEventId=${encodeURIComponent(event.masterEventId)}`, { cache: "no-store", signal: controller.signal })
-      .then(async (response) => {
-        const result = await response.json().catch(() => ({})) as { review?: EventReviewSummary | null; history?: EventReviewHistoryEntry[]; error?: string };
-        if (!response.ok) throw new Error(result.error || `研判记录读取失败（HTTP ${response.status}）`);
-        setReviewState({ state: "ready", review: result.review ?? null, history: result.history ?? [] });
-      })
-      .catch((error) => {
-        if (controller.signal.aborted) return;
-        setReviewState((current) => ({ ...current, state: "error", message: error instanceof Error ? error.message : "研判记录读取失败" }));
-      });
-    return () => controller.abort();
-  }, [event.masterEventId, event.review, historicalReadOnly]);
   useEffect(() => {
     if (!compact) return;
     closeRef.current?.focus();
@@ -2068,7 +2051,10 @@ function DetailPanel({ event, exposureAssessment, onExposureChange, currentUser,
   const canSaveCandidate = !historicalReadOnly && !isDemo && taskWindowValid && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived";
   const canEnterDispatchReview = !dispatchBlocked && canSaveCandidate && (!needsAoiReview || aoiConfirmed);
   const canBuildTerrainTask = !historicalReadOnly && !isDemo && taskWindowValid && event.dispatchEligibility !== "blocked" && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived";
-  const effectiveImpactRisk = reviewImpactRisk({ ...event, exposureAssessment }, reviewState.review);
+  const effectiveImpactRisk = assessImpactRisk({
+    ...event,
+    exposure: exposureAssessment?.riskInput ?? undefined,
+  });
   return <aside ref={panelRef} className="detail-panel" role={compact ? "dialog" : "region"} aria-modal={compact ? "true" : undefined} aria-labelledby={`detail-title-${event.id}`} inert={obscured ? true : undefined} aria-hidden={obscured || undefined}>
     <button ref={closeRef} className="detail-close" onClick={onClose} aria-label="关闭详情">×</button>
     <div className={`detail-kicker ${event.severity}`}><span>{hazardMeta[event.hazard].symbol}</span>{event.hazardSubtype ? hazardSubtypeLabels[event.hazardSubtype] : hazardMeta[event.hazard].label} · {severityLabels[event.severity]} · {phenomenonLabels[event.phenomenonStage]}{event.crossBorder ? " · 跨境影响" : ""}</div>
@@ -2088,17 +2074,6 @@ function DetailPanel({ event, exposureAssessment, onExposureChange, currentUser,
     <details className="priority-method"><summary>查看卫星优先级构成</summary><p>官方等级 {event.priorityBreakdown.severity} · 重点区域 {event.priorityBreakdown.scope} · 遥感可观测性 {event.priorityBreakdown.observability} · 时效 {event.priorityBreakdown.time} · 数据可信度 {event.priorityBreakdown.confidence ?? 0}</p></details>
     {effectiveImpactRisk ? <section className="impact-risk-method"><h3>影响风险说明</h3><p>{effectiveImpactRisk.limitations}</p><small>模型：{effectiveImpactRisk.hazardModel.modelId} · 强度依据：{effectiveImpactRisk.hazardModel.intensityProxy} · 危险性区间 {effectiveImpactRisk.uncertainty.hazardIndexMin}–{effectiveImpactRisk.uncertainty.hazardIndexMax}</small>{effectiveImpactRisk.missingInputs.length ? <small>待补数据：{effectiveImpactRisk.missingInputs.join("、")}</small> : null}</section> : null}
     <ExposureAssessmentCard event={event} assessment={exposureAssessment} currentUser={currentUser} historicalReadOnly={historicalReadOnly} onChange={onExposureChange} />
-    <EventReviewCard
-      key={`${event.masterEventId}:${reviewState.review?.revision ?? 0}:${historicalReadOnly ? "history" : "live"}`}
-      event={event}
-      review={reviewState.review}
-      history={reviewState.history}
-      loading={reviewState.state === "loading"}
-      loadError={reviewState.state === "error" ? reviewState.message : undefined}
-      currentUser={currentUser}
-      historicalReadOnly={historicalReadOnly}
-      onSaved={(review, history) => setReviewState({ state: "ready", review, history })}
-    />
     <div className={`event-integrity ${event.dispatchEligibility}`}>
       <div><strong>{confidenceLabels[event.confidenceLevel]} {event.confidenceScore}</strong><span>{event.independentSourceCount ?? new Set(event.evidence.map((item) => item.source.split(" · ")[0])).size} 个独立来源 · {event.bulletinCount ?? event.updateCount} 期公告</span></div>
       {event.peakSeverity && event.peakSeverity !== event.severity ? <p><b>当前{severityLabels[event.severity]}</b> · 历史峰值{severityLabels[event.peakSeverity]}</p> : null}
@@ -2213,7 +2188,7 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
   const osm = assessment?.osm;
   return <section className="exposure-card" aria-labelledby={`exposure-title-${event.id}`}>
     <div className="exposure-heading">
-      <div><h3 id={`exposure-title-${event.id}`}>人口与承灾体暴露</h3><small>WorldPop 人口模型 · OpenStreetMap 已映射要素</small></div>
+      <div><h3 id={`exposure-title-${event.id}`}>人口与承灾体暴露</h3><small>WorldPop 人口模型 · OpenStreetMap 已映射要素（非实时设施状态）</small></div>
       <span className={`exposure-status ${assessment?.status ?? "unavailable"}`}>{loading ? "读取中" : exposureStatusLabel(assessment?.status)}</span>
     </div>
     {historicalReadOnly ? <p className="exposure-notice">历史重演不读取当前暴露度数据；只有随快照保存的结果才能用于历史复盘。</p> : null}
@@ -2228,13 +2203,16 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
       {osm?.state === "ready" && Object.keys(osm.facilityCounts).length ? <div className="exposure-facility-summary">{(Object.entries(osm.facilityCounts) as Array<[ExposureFacilityKind, number]>).map(([kind, count]) => <span key={kind}><i style={{ background: exposureFacilityColor(kind) }} />{exposureFacilityKindLabel(kind)} {count}</span>)}</div> : null}
       <dl className="exposure-provenance">
         <div><dt>筛查范围</dt><dd>{assessment.aoi.label} · {Math.round(assessment.aoi.areaKm2).toLocaleString()} km²</dd></div>
-        <div><dt>自动指数</dt><dd>{assessment.riskInput ? `${assessment.riskInput.index}/100（可由人工研判覆盖）` : "未生成"}</dd></div>
+        <div><dt>自动指数</dt><dd>{assessment.riskInput ? `${assessment.riskInput.index}/100（仅用于演示初筛）` : "未生成"}</dd></div>
         <div><dt>计算时间</dt><dd>{formatTimeWithYear(assessment.computedAt)} UTC+08</dd></div>
         {osm?.osmBaseTimestamp ? <div><dt>OSM 数据时点</dt><dd>{formatTimeWithYear(osm.osmBaseTimestamp)} UTC+08</dd></div> : null}
+        {osm?.dataProfile ? <div><dt>OSM 更新方式</dt><dd>{osm.dataProfile === "china_daily" ? "中国日更镜像（非实时）" : "公共 Overpass 上游"}</dd></div> : null}
+        {osm?.state === "ready" && osm.fetchedAt ? <div><dt>OSM 查询缓存</dt><dd>{overpassCacheStatusLabel(osm.cacheStatus)} · 查询于 {formatTimeWithYear(osm.fetchedAt)} UTC+08</dd></div> : null}
       </dl>
       {assessment.riskInput ? <p className="exposure-risk-basis"><strong>自动指数依据：</strong>{assessment.riskInput.basis}</p> : null}
       {population ? <p className={`exposure-source-state ${population.state}`}>WorldPop：{population.message}</p> : null}
       {osm ? <p className={`exposure-source-state ${osm.state}`}>OSM：{osm.message}</p> : null}
+      {osm?.state === "skipped" ? <p className="exposure-source-guidance">当前范围超过已配置 OSM 服务的单次安全阈值。可缩小 AOI；中国日更镜像接通后能扩大筛查范围，但仍不应把全国建筑和道路作为一次查询。高德 POI 只能补充设施位置，不能替代建筑和道路存量统计。</p> : null}
       <details className="exposure-limitations"><summary>查看口径与限制</summary>{assessment.limitations.map((item) => <p key={item}>{item}</p>)}<p>自动暴露度只参与初筛排序；没有脆弱性模型时，系统仍不会生成综合影响风险分数。</p></details>
       <div className="exposure-links"><a href="https://api.worldpop.org/v2/" target="_blank" rel="noreferrer">WorldPop API ↗</a><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors ↗</a></div>
     </> : !loading && !historicalReadOnly ? <p className="exposure-empty">尚未计算。系统会按事件范围查询人口模型，并筛查已映射的建筑、道路和关键设施。</p> : null}
@@ -2247,116 +2225,16 @@ function exposureStatusLabel(status: ExposureAssessment["status"] | undefined) {
   return status === "complete" ? "完整" : status === "partial" ? "部分可用" : status === "pending" ? "计算中" : status === "unavailable" ? "不可用" : "未计算";
 }
 
+function overpassCacheStatusLabel(status: "refreshed" | "fresh" | "stale" | undefined) {
+  return status === "fresh" ? "本地缓存命中" : status === "stale" ? "过期缓存降级" : "已向数据服务刷新";
+}
+
 function exposureFacilityColor(kind: ExposureFacilityKind) {
   return { health: "#d5414a", emergency: "#ee7d22", shelter: "#16866c", education: "#6f57b5", power: "#d2a100", water: "#087fa1" }[kind];
 }
 
 function impactRiskLabel(level: NonNullable<DisasterEvent["impactRisk"]>["level"]) {
   return level === "very_high" ? "极高" : level === "high" ? "高" : level === "moderate" ? "中" : level === "low" ? "低" : "待评估";
-}
-
-function EventReviewCard({ event, review, history, loading, loadError, currentUser, historicalReadOnly, onSaved }: {
-  event: DisasterEvent;
-  review: EventReviewSummary | null;
-  history: EventReviewHistoryEntry[];
-  loading: boolean;
-  loadError?: string;
-  currentUser?: { username: string; role: "viewer" | "operator" | "admin" };
-  historicalReadOnly: boolean;
-  onSaved: (review: EventReviewSummary, history: EventReviewHistoryEntry[]) => void;
-}) {
-  const [status, setStatus] = useState<EventReviewStatus>(review?.status ?? "pending");
-  const [assignee, setAssignee] = useState(review?.assignee || currentUser?.username || "");
-  const [conclusion, setConclusion] = useState(review?.conclusion ?? "");
-  const [exposureIndex, setExposureIndex] = useState<number | "">(review?.exposure?.index ?? "");
-  const [exposureBasis, setExposureBasis] = useState(review?.exposure?.basis ?? "");
-  const [vulnerabilityIndex, setVulnerabilityIndex] = useState<number | "">(review?.vulnerability?.index ?? "");
-  const [vulnerabilityBasis, setVulnerabilityBasis] = useState(review?.vulnerability?.basis ?? "");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const canEdit = !historicalReadOnly && (currentUser?.role === "operator" || currentUser?.role === "admin");
-  const alertNeedsAcknowledgement = ["orange", "red"].includes(event.severity) && !review?.alertAcknowledgedCurrent;
-  const conclusionRequired = ["verified", "rejected", "closed"].includes(status);
-  const partialExposure = (exposureIndex === "") !== !exposureBasis.trim();
-  const partialVulnerability = (vulnerabilityIndex === "") !== !vulnerabilityBasis.trim();
-  const invalidDraft = partialExposure || partialVulnerability || (conclusionRequired && conclusion.trim().length < 5);
-
-  const optionalRiskInput = (index: number | "", basis: string): ReviewRiskInput | null => index === "" && !basis.trim()
-    ? null
-    : { index: Number(index), basis: basis.trim() };
-
-  const save = async (acknowledgeAlert = false) => {
-    if (!canEdit || invalidDraft) return;
-    setBusy(true);
-    setError("");
-    try {
-      const response = await fetch("/api/reviews", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          masterEventId: event.masterEventId,
-          expectedRevision: review?.revision ?? 0,
-          eventRevision: eventRevisionFingerprint(event),
-          status,
-          assignee,
-          conclusion,
-          exposure: optionalRiskInput(exposureIndex, exposureBasis),
-          vulnerability: optionalRiskInput(vulnerabilityIndex, vulnerabilityBasis),
-          acknowledgeAlert,
-        }),
-      });
-      const result = await response.json().catch(() => ({})) as { review?: EventReviewSummary; history?: EventReviewHistoryEntry[]; error?: string };
-      if (!response.ok || !result.review) throw new Error(result.error || `研判保存失败（HTTP ${response.status}）`);
-      onSaved(result.review, result.history ?? []);
-    } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : "研判保存失败");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return <section className="event-review-card" aria-labelledby={`review-title-${event.id}`}>
-    <div className="event-review-heading">
-      <div><h3 id={`review-title-${event.id}`}>值守研判</h3><small>共享记录 · 版本 {review?.revision ?? 0}</small></div>
-      <span className={`review-status ${review?.status ?? "pending"}`}>{eventReviewStatusLabel(review?.status ?? "pending")}</span>
-    </div>
-    {historicalReadOnly ? <p className="review-notice">这是快照采集时的研判记录，只读展示；不会读取当前实时研判。</p> : null}
-    {review?.stale ? <p className="review-warning" role="alert">事件来源已更新，现有结论基于旧版本。请核对最新证据后重新保存。</p> : null}
-    {alertNeedsAcknowledgement ? <div className="alert-acknowledgement"><span>本轮{severityLabels[event.severity]}告警尚未由值守人员确认收到。</span>{canEdit ? <button disabled={busy || invalidDraft} onClick={() => void save(true)}>确认收到</button> : null}</div> : review?.alertAcknowledgedCurrent ? <p className="alert-acknowledged">已由 {review.alertAcknowledgedBy} 于 {formatTimeWithYear(review.alertAcknowledgedAt!)} UTC+08 确认本轮告警。</p> : null}
-    {loading ? <p className="review-loading">正在读取研判记录…</p> : null}
-    {loadError ? <p className="review-error" role="alert">{loadError}</p> : null}
-    <div className="review-form">
-      <label>研判状态<select value={status} disabled={!canEdit || busy} onChange={(change) => setStatus(change.target.value as EventReviewStatus)}>
-        <option value="pending">待研判</option><option value="reviewing">研判中</option><option value="monitoring">持续监测</option><option value="verified">已确认</option><option value="rejected">已驳回</option><option value="closed">已结束</option>
-      </select></label>
-      <label>负责人<input value={assignee} disabled={!canEdit || busy} maxLength={120} placeholder="值守人或小组" onChange={(change) => setAssignee(change.target.value)} /></label>
-      <div className="review-risk-input">
-        <label>暴露度指数<input type="number" min="0" max="100" step="1" inputMode="numeric" value={exposureIndex} disabled={!canEdit || busy} placeholder="0–100" onChange={(change) => setExposureIndex(boundedReviewIndex(change.target.value))} /></label>
-        <label>暴露度依据<input value={exposureBasis} disabled={!canEdit || busy} maxLength={500} placeholder="人口、建筑或关键设施数据来源" onChange={(change) => setExposureBasis(change.target.value)} /></label>
-      </div>
-      <div className="review-risk-input">
-        <label>脆弱性指数<input type="number" min="0" max="100" step="1" inputMode="numeric" value={vulnerabilityIndex} disabled={!canEdit || busy} placeholder="0–100" onChange={(change) => setVulnerabilityIndex(boundedReviewIndex(change.target.value))} /></label>
-        <label>脆弱性依据<input value={vulnerabilityBasis} disabled={!canEdit || busy} maxLength={500} placeholder="分灾种脆弱性曲线或专家依据" onChange={(change) => setVulnerabilityBasis(change.target.value)} /></label>
-      </div>
-      <small className="risk-input-note">指数不会自动冒充实测结果。每个指数必须同时填写数据来源或专家依据；两项齐全后才生成影响风险初筛分。</small>
-      <label>研判结论<textarea value={conclusion} disabled={!canEdit || busy} maxLength={2000} rows={3} placeholder={conclusionRequired ? "确认、驳回或结束时必须写明理由" : "记录证据判断、疑点和下一复核点"} onChange={(change) => setConclusion(change.target.value)} /></label>
-      {partialExposure || partialVulnerability ? <small className="review-validation">指数和依据必须成对填写，也可以同时留空。</small> : null}
-      {conclusionRequired && conclusion.trim().length < 5 ? <small className="review-validation">当前状态必须填写至少5个字的研判结论。</small> : null}
-      {canEdit ? <button className="review-save" disabled={busy || invalidDraft} onClick={() => void save(false)}>{busy ? "正在保存…" : review ? "保存研判新版本" : "建立研判记录"}</button> : <small className="review-readonly">当前账号只有查看权限。</small>}
-      {error ? <p className="review-error" role="alert">{error}</p> : null}
-    </div>
-    {history.length ? <details className="review-history"><summary>操作记录 · {history.length} 条</summary>{history.map((entry) => <div key={entry.revision}><b>v{entry.revision} · {reviewActionLabel(entry.action)}</b><span>{eventReviewStatusLabel(entry.toStatus)} · {entry.actor}</span><time>{formatTimeWithYear(entry.changedAt)} UTC+08</time></div>)}</details> : null}
-  </section>;
-}
-
-function reviewActionLabel(action: string) {
-  return action === "create_review" ? "建立研判" : action === "transition_review" ? "变更状态" : action === "acknowledge_and_review" ? "确认告警并保存" : "更新研判";
-}
-
-function boundedReviewIndex(value: string): number | "" {
-  if (!value) return "";
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? Math.max(0, Math.min(100, Math.round(parsed))) : "";
 }
 
 function LandslidePlanningCard({ event, terrain, templateCount, taskAllowed, onTerrainChange, onAddTasks }: { event: DisasterEvent; terrain?: LandslideTerrainScreening; templateCount: number; taskAllowed: boolean; onTerrainChange: (terrain?: LandslideTerrainScreening) => void; onAddTasks: (terrain: LandslideTerrainScreening) => void }) {
@@ -2723,7 +2601,7 @@ function ResponsePlanPanel({ open, event, events, scenarios, activeScenarioId, c
     <div className="response-panel-body">
       <section className="response-method-note">
         <strong>真实路网、道路中断与基础设施复核</strong>
-        <p>中国境内支持高德驾车、步行、骑行和电动自行车规划，并用灾害影响场、核验台账及免认证 OSM/Overpass 桥梁、隧道、涉水点三次筛查。OSM 是静态社区地图，不证明设施当前完好；燃油摩托车没有可靠专用接口，暂不冒充驾车路线。</p>
+        <p>中国境内支持高德驾车、步行、骑行和电动自行车规划，并用灾害影响场、核验台账及 OSM/Overpass 桥梁、隧道、涉水点三次筛查。OSM 是社区维护的基础设施底图，更新频率以结果中的数据时点为准，不证明设施当前完好；燃油摩托车没有可靠专用接口，暂不冒充驾车路线。</p>
       </section>
       <section className="response-create">
         <h3>建立推演场景</h3>
@@ -2770,7 +2648,7 @@ function ResponsePlanPanel({ open, event, events, scenarios, activeScenarioId, c
             <p>这不是道路规划。假设速度只用于估算沿直线移动的到达时刻，以检查路线与灾害 4D 影响场的时间相交；不使用高德路况，也不能判断道路、桥梁或隧道可通行。</p>
             <div><label>假设平均速度（km/h）<input type="number" min="5" max="160" value={fallbackSpeed} onChange={(change) => setFallbackSpeed(change.target.value)} /></label><button className="response-generate-fallback" onClick={generateGeometric}>生成直线估算</button></div>
           </details>
-          {roadRoutingState === "ready" ? <div className={`response-routing-ready ${infrastructureQueryState === "ready" ? "" : "partial"}`} role="status">高德{amapTravelModeLabels[travelMode]}路线已接通；耗时采用高德返回值，不读取直线估算速度。已完成灾害与 {effectiveRoadDisruptions.length} 条有效/临时道路中断复核。{infrastructureQueryState === "ready" ? "OSM 基础设施暴露查询已完成，设施结构状态仍须核验。" : infrastructureQueryState === "too_large" ? "路线范围过大，未向公共 Overpass 发起重查询，基础设施覆盖未知。" : infrastructureQueryState === "unsupported" ? "当前路线不支持公共 Overpass 查询，基础设施覆盖未知。" : "Overpass 暂不可用，路线仍已保存但基础设施覆盖未知。"}</div> : roadRoutingState === "fallback" ? <div className="response-routing-fallback" role="status">当前保存的是{amapTravelModeLabels[travelMode]}直线敏感性估算，不代表真实道路可通行。</div> : null}
+          {roadRoutingState === "ready" ? <div className={`response-routing-ready ${infrastructureQueryState === "ready" ? "" : "partial"}`} role="status">高德{amapTravelModeLabels[travelMode]}路线已接通；耗时采用高德返回值，不读取直线估算速度。已完成灾害与 {effectiveRoadDisruptions.length} 条有效/临时道路中断复核。{infrastructureQueryState === "ready" ? "OSM 基础设施暴露查询已完成，设施结构状态仍须核验。" : infrastructureQueryState === "too_large" ? "路线范围超过当前 OSM 服务的单次安全阈值，基础设施覆盖未知。" : infrastructureQueryState === "unsupported" ? "当前路线不支持 OSM 包围盒查询，基础设施覆盖未知。" : "Overpass 暂不可用，路线仍已保存但基础设施覆盖未知。"}</div> : roadRoutingState === "fallback" ? <div className="response-routing-fallback" role="status">当前保存的是{amapTravelModeLabels[travelMode]}直线敏感性估算，不代表真实道路可通行。</div> : null}
         </> : <p className="response-select-hint">从当前监测事件中选择一个主事件，或在灾害详情中点击“建立处置推演场景”。</p>}
       </section>
       <section className="response-scenarios">
@@ -2796,7 +2674,7 @@ function ResponsePlanPanel({ open, event, events, scenarios, activeScenarioId, c
               <b className={scenario.infrastructureData?.state === "ready" ? "checked" : "unknown"}>OSM 设施暴露：{scenario.infrastructureData?.state === "ready" ? `已核对 ${scenario.infrastructureCheckCount ?? 0} 个要素 · 本路线穿越 ${selectedRoute.infrastructureCrossings?.length ?? 0} 处` : "覆盖未知"}</b>
               <b className={(scenario.roadDisruptionCheckCount ?? scenario.roadDisruptions?.length ?? 0) > 0 ? "checked" : "unknown"}>道路毁损数据：{(scenario.roadDisruptionCheckCount ?? scenario.roadDisruptions?.length ?? 0) > 0 ? `已核对 ${scenario.roadDisruptionCheckCount ?? scenario.roadDisruptions?.length ?? 0} 条 · 保存 ${scenario.roadDisruptions?.length ?? 0} 条相交证据` : "未提供"}</b>
               {selectedRoute.infrastructureCrossings?.length ? <small className="infrastructure-crossings">设施存在不等于安全：{selectedRoute.infrastructureCrossings.slice(0, 8).map((crossing, index) => <span key={crossing.infrastructureId}>{index ? "；" : ""}<a href={safeHttpUrl(crossing.sourceUrl)} target="_blank" rel="noreferrer">{infrastructureKindLabel(crossing.kind)}·{crossing.label.replace(/^.*? · /, "")}</a></span>)}{selectedRoute.infrastructureCrossings.length > 8 ? `；另 ${selectedRoute.infrastructureCrossings.length - 8} 处` : ""}</small> : null}
-              {scenario.infrastructureData?.state === "ready" ? <small className="infrastructure-source"><a href={safeHttpUrl(scenario.infrastructureData.sourceUrl)} target="_blank" rel="noreferrer">{scenario.infrastructureData.attribution} · 查看许可与来源 ↗</a><br />查询时间 {formatTimeWithYear(scenario.infrastructureData.fetchedAt!)} UTC+08 · 包围盒约 {scenario.infrastructureData.queryAreaKm2?.toFixed(1)} km²</small> : scenario.infrastructureData ? <small className="infrastructure-warning">{scenario.infrastructureData.note}</small> : null}
+              {scenario.infrastructureData?.state === "ready" ? <small className="infrastructure-source"><a href={safeHttpUrl(scenario.infrastructureData.sourceUrl)} target="_blank" rel="noreferrer">{scenario.infrastructureData.attribution} · 查看许可与来源 ↗</a><br />{scenario.infrastructureData.dataProfile === "china_daily" ? "中国日更镜像（非实时）" : "公共 Overpass 上游"} · {overpassCacheStatusLabel(scenario.infrastructureData.cacheStatus)}{scenario.infrastructureData.osmBaseTimestamp ? ` · 数据时点 ${formatTimeWithYear(scenario.infrastructureData.osmBaseTimestamp)} UTC+08` : " · 数据时点未返回"}<br />查询时间 {formatTimeWithYear(scenario.infrastructureData.fetchedAt!)} UTC+08 · 包围盒约 {scenario.infrastructureData.queryAreaKm2?.toFixed(1)} km²</small> : scenario.infrastructureData ? <small className="infrastructure-warning">{scenario.infrastructureData.note}</small> : null}
               {selectedRoute.disruptionConflicts?.length ? <small className="disruption-conflicts">冲突：{selectedRoute.disruptionConflicts.map((conflict) => `${roadDisruptionKindLabel(conflict.kind)}·${conflict.label}${conflict.verification === "verified" ? "（已核验）" : "（上报待核验）"}`).join("；")}</small> : null}
             </div> : null}
             <p className={`response-route-note ${selectedRoute.status}`}>{selectedRoute.note}</p>

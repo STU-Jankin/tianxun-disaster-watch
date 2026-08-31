@@ -1,4 +1,4 @@
-import { getCanonicalEventForTask, getEventExposureAssessment, upsertEventExposureAssessment } from "../../../db/operational.ts";
+import { getCanonicalEventForTask, getEventExposureAssessment, getOsmQueryCache, upsertEventExposureAssessment, upsertOsmQueryCache } from "../../../db/operational.ts";
 import { ApiInputError, apiActor, authorizeApiRequest, enforceRateLimit, readJsonObject, rejectCrossOriginBrowserWrite } from "../../../lib/api-security.ts";
 import {
   exposureAssessmentIdentity,
@@ -13,6 +13,7 @@ import {
   type OsmExposure,
   type PopulationExposure,
 } from "../../../lib/exposure-assessment.ts";
+import { overpassCacheKey, overpassFreshUntil, resolveOverpassRuntimeConfig, type OverpassRuntimeConfig } from "../../../lib/overpass-runtime.ts";
 
 export const dynamic = "force-dynamic";
 
@@ -52,19 +53,25 @@ export async function POST(request: Request) {
     if (!canonical) throw new ApiInputError("主事件不存在、已结束或缺少有效证据", 404);
     const identity = exposureAssessmentIdentity(canonical.event);
     const cached = await getEventExposureAssessment(masterEventId);
+    const overpassConfig = resolveOverpassRuntimeConfig();
     const sameInput = cached?.eventRevision === identity.eventRevision && cached.aoiHash === identity.aoiHash;
-    const fresh = sameInput && Date.parse(cached!.expiresAt) > Date.now();
+    const sameOsmProfile = cached?.osm.dataProfile === overpassConfig.profile;
+    const fresh = sameInput && sameOsmProfile && Date.parse(cached!.expiresAt) > Date.now();
     if (!force && fresh && cached!.status !== "pending") return Response.json({ assessment: cached }, { headers: privateHeaders("hit") });
 
     const actor = await apiActor(request);
     const year = configuredWorldPopYear();
     const reusablePending = !force && sameInput && cached?.population.state === "pending" ? cached.population : undefined;
-    const reusableOsm = !force && sameInput && cached?.osm.state === "ready" ? cached.osm : undefined;
     const [population, osm] = await Promise.all([
       fetchPopulation(identity.aoi, year, reusablePending),
-      reusableOsm ? Promise.resolve(reusableOsm) : fetchOsmExposure(identity.aoi),
+      fetchOsmExposure(identity.aoi, overpassConfig, force),
     ]);
     const computedAt = new Date().toISOString();
+    const osmFetchedAt = osm.state === "ready" && osm.fetchedAt ? Date.parse(osm.fetchedAt) : Number.NaN;
+    const osmFreshRemainingMs = Number.isFinite(osmFetchedAt) ? Math.max(15 * 60_000, osmFetchedAt + overpassConfig.cacheTtlMs - Date.now()) : overpassConfig.cacheTtlMs;
+    const assessmentTtlMs = population.state === "pending"
+      ? 60 * 60_000
+      : osm.state === "ready" ? (osm.cacheStatus === "stale" ? 60 * 60_000 : Math.min(overpassConfig.cacheTtlMs, osmFreshRemainingMs)) : 6 * 60 * 60_000;
     const assessment: ExposureAssessment = {
       masterEventId,
       eventRevision: identity.eventRevision,
@@ -75,13 +82,13 @@ export async function POST(request: Request) {
       osm,
       riskInput: exposureRiskInput(population, osm),
       computedAt,
-      expiresAt: new Date(Date.now() + (population.state === "pending" ? 60 * 60_000 : 7 * 24 * 60 * 60_000)).toISOString(),
+      expiresAt: new Date(Date.now() + assessmentTtlMs).toISOString(),
       updatedBy: actor,
       limitations: [
         "该结果是暴露度筛查，不是受灾、受损、伤亡或经济损失评估。",
         "WorldPop 是指定年份人口模型估计，不代表灾害发生时刻的人口分布。",
         "OSM 为志愿者维护的已映射要素；零记录或缺失记录不能证明现实中不存在。",
-        identity.aoi.basis === "derived_screening_buffer" ? "当前没有可直接采用的官方影响面，AOI 为事件代表点缓冲区，必须由值守人员复核。" : "AOI 采用来源几何，但来源范围不等于实际受灾边界。",
+        identity.aoi.basis === "derived_screening_buffer" ? "当前没有可直接采用的官方影响面，AOI 为事件代表点缓冲区，需要在地图中核对。" : "AOI 采用来源几何，但来源范围不等于实际受灾边界。",
       ],
       modelVersion: exposureAssessmentModelVersion,
     };
@@ -131,38 +138,77 @@ async function requestWorldPopTask(endpoint: URL, taskId: string, year: number, 
   return parseWorldPopTask(JSON.parse(response), year, resolution, taskId);
 }
 
-async function fetchOsmExposure(aoi: ReturnType<typeof exposureAssessmentIdentity>["aoi"]): Promise<OsmExposure> {
-  const plan = prepareOverpassExposureQuery(aoi);
-  if (plan.state === "skipped") return { state: "skipped", provider: "OpenStreetMap · Overpass", facilityCounts: {}, facilities: [], facilitiesTruncated: false, message: plan.message };
+async function fetchOsmExposure(aoi: ReturnType<typeof exposureAssessmentIdentity>["aoi"], config: OverpassRuntimeConfig, force: boolean): Promise<OsmExposure> {
+  const plan = prepareOverpassExposureQuery(aoi, {
+    maximumAreaKm2: config.maximumAreaKm2,
+    serviceLabel: config.profileLabel,
+    queryTimeoutSeconds: config.queryTimeoutSeconds,
+  });
+  if (plan.state === "skipped") return {
+    state: "skipped",
+    provider: "OpenStreetMap · Overpass",
+    dataProfile: config.profile,
+    updateCadence: config.updateCadence,
+    facilityCounts: {},
+    facilities: [],
+    facilitiesTruncated: false,
+    message: plan.message,
+  };
+  const cacheKey = overpassCacheKey(config, "exposure", plan.cacheIdentity);
+  const cached = await readExposureCache(cacheKey);
+  if (!force && cached && Date.parse(cached.expiresAt) > Date.now()) {
+    return { ...cached.payload, cacheStatus: "fresh", dataProfile: config.profile, updateCadence: config.updateCadence };
+  }
   try {
-    const response = await boundedFetch(overpassEndpoint().toString(), {
+    const response = await boundedFetch(config.endpoint.toString(), {
       method: "POST",
       headers: {
         Accept: "application/json",
         "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-        "User-Agent": overpassUserAgent(),
+        "User-Agent": config.userAgent,
       },
       body: new URLSearchParams({ data: plan.query }).toString(),
-    }, 18_000, 6 * 1024 * 1024);
+    }, (config.queryTimeoutSeconds + 5) * 1_000, 6 * 1024 * 1024);
     const result = parseOverpassExposure(JSON.parse(response));
-    return {
+    const fetchedAt = new Date().toISOString();
+    const ready: OsmExposure = {
       state: "ready",
       provider: "OpenStreetMap · Overpass",
       ...result,
-      fetchedAt: new Date().toISOString(),
-      message: `${plan.queryBasis}；建筑和道路是已映射要素计数，关键设施最多返回 300 个地图点位`,
+      fetchedAt,
+      cacheStatus: "refreshed",
+      dataProfile: config.profile,
+      updateCadence: config.updateCadence,
+      message: `${config.profileLabel} · ${plan.queryBasis}；建筑和道路是已映射要素计数，关键设施最多返回 300 个地图点位`,
     };
+    await writeExposureCache(cacheKey, ready, config);
+    return ready;
   } catch (error) {
-    return { state: "unavailable", provider: "OpenStreetMap · Overpass", facilityCounts: {}, facilities: [], facilitiesTruncated: false, message: safeUpstreamMessage(error, "公共 Overpass 当前不可用") };
+    const cachedFetchedAt = cached ? Date.parse(cached.fetchedAt) : Number.NaN;
+    if (cached && Number.isFinite(cachedFetchedAt) && cachedFetchedAt + config.staleIfErrorMs > Date.now()) {
+      return {
+        ...cached.payload,
+        cacheStatus: "stale",
+        dataProfile: config.profile,
+        updateCadence: config.updateCadence,
+        message: `${cached.payload.message}；${config.profileLabel}刷新失败，当前使用 ${cached.fetchedAt} 的过期缓存，禁止据此认定设施或道路没有变化`,
+      };
+    }
+    return {
+      state: "unavailable",
+      provider: "OpenStreetMap · Overpass",
+      dataProfile: config.profile,
+      updateCadence: config.updateCadence,
+      facilityCounts: {},
+      facilities: [],
+      facilitiesTruncated: false,
+      message: safeUpstreamMessage(error, `${config.profileLabel}当前不可用`),
+    };
   }
 }
 
 function worldPopEndpoint() {
   return publicHttpsBaseUrl(process.env.WORLDPOP_API_URL?.trim() || "https://api.worldpop.org/v2/", "WORLDPOP_API_URL");
-}
-
-function overpassEndpoint() {
-  return publicHttpsBaseUrl(process.env.OVERPASS_API_URL?.trim() || "https://overpass-api.de/api/interpreter", "OVERPASS_API_URL", false);
 }
 
 function publicHttpsBaseUrl(raw: string, name: string, trailingSlash = true) {
@@ -176,10 +222,6 @@ function publicHttpsBaseUrl(raw: string, name: string, trailingSlash = true) {
 function worldPopHeaders(extra: Record<string, string> = {}) {
   const apiKey = process.env.WORLDPOP_API_KEY?.trim();
   return { Accept: "application/json", ...(apiKey ? { "X-API-Key": apiKey } : {}), ...extra };
-}
-
-function overpassUserAgent() {
-  return process.env.OVERPASS_USER_AGENT?.trim().replace(/[\r\n]+/g, " ").slice(0, 180) || "Tianxun-Disaster-Watch/0.1 github.com/STU-Jankin/tianxun-disaster-watch";
 }
 
 function configuredWorldPopYear() {
@@ -252,4 +294,29 @@ function privateLiteral(hostname: string) {
 
 function delay(milliseconds: number) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function readExposureCache(cacheKey: string) {
+  try {
+    const cached = await getOsmQueryCache<OsmExposure>(cacheKey, "exposure");
+    return cached?.payload.state === "ready" && Array.isArray(cached.payload.facilities) && cached.payload.facilities.length <= 300 ? cached : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeExposureCache(cacheKey: string, payload: OsmExposure, config: OverpassRuntimeConfig) {
+  try {
+    await upsertOsmQueryCache({
+      cacheKey,
+      queryKind: "exposure",
+      dataProfile: config.profile,
+      payload,
+      fetchedAt: payload.fetchedAt!,
+      expiresAt: overpassFreshUntil(payload.fetchedAt!, config),
+      osmBaseTimestamp: payload.osmBaseTimestamp,
+    });
+  } catch {
+    // Event-level persistence still keeps the assessment usable when the shared cache is unavailable.
+  }
 }

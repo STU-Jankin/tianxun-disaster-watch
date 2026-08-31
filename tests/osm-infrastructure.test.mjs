@@ -26,8 +26,20 @@ test("refuses a heavy public Overpass request for a wide route envelope", async 
   assert.match(plan.message, /未向公共 Overpass|超过公共 Overpass/);
 });
 
+test("allows a wider route only when a separately configured service raises the limit", async () => {
+  const { prepareInfrastructureQuery } = await infrastructure();
+  const plan = prepareInfrastructureQuery([{ routeId: "wide", coordinates: [[119, 30], [121, 32]] }], {
+    maximumAreaKm2: 60_000,
+    serviceLabel: "中国 OSM 日更镜像",
+    queryTimeoutSeconds: 45,
+  });
+  assert.equal(plan.state, "ready");
+  assert.match(plan.query, /\[timeout:45\]/);
+});
+
 test("parses only bridge, tunnel and ford inventory without claiming safety", async () => {
-  const { parseOverpassInfrastructure } = await infrastructure();
+  const { parseOverpassBaseTimestamp, parseOverpassInfrastructure } = await infrastructure();
+  assert.equal(parseOverpassBaseTimestamp({ osm3s: { timestamp_osm_base: "2026-08-31T00:00:00Z" } }), "2026-08-31T00:00:00Z");
   const features = parseOverpassInfrastructure({ elements: [
     { type: "way", id: 10, tags: { highway: "primary", bridge: "yes", name: "太湖测试桥", maxweight: "20" }, geometry: [{ lon: 120.25, lat: 31.5 }, { lon: 120.26, lat: 31.5 }] },
     { type: "way", id: 11, tags: { highway: "primary", bridge: "no" }, geometry: [{ lon: 120.25, lat: 31.5 }, { lon: 120.26, lat: 31.5 }] },

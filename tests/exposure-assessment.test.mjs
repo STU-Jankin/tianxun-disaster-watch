@@ -10,7 +10,7 @@ import {
   prepareOverpassExposureQuery,
   worldPopRequestPlan,
 } from "../lib/exposure-assessment.ts";
-import { reviewImpactRisk } from "../lib/event-review.ts";
+import { assessImpactRisk } from "../lib/impact-risk.ts";
 
 function pointEvent(overrides = {}) {
   return {
@@ -55,6 +55,9 @@ test("uses official polygon geometry when available and enforces provider area l
   const oversized = { ...aoi, areaKm2: 50_001 };
   assert.equal(worldPopRequestPlan(oversized, 2026).state, "skipped");
   assert.equal(prepareOverpassExposureQuery({ ...aoi, areaKm2: 2_501 }).state, "skipped");
+  const chinaPlan = prepareOverpassExposureQuery({ ...aoi, areaKm2: 31_326 }, { maximumAreaKm2: 50_000, serviceLabel: "中国 OSM 日更镜像", queryTimeoutSeconds: 45 });
+  assert.equal(chinaPlan.state, "ready");
+  assert.match(chinaPlan.query, /\[timeout:45\]/);
 });
 
 test("parses ordered Overpass counts and classifies locatable key facilities", () => {
@@ -91,11 +94,12 @@ test("population parser preserves year and automatic exposure never treats missi
   assert.equal(exposureAssessmentStatus(population, unavailableOsm), "partial");
 });
 
-test("automatic exposure feeds screening but manual review exposure overrides it", () => {
-  const event = pointEvent({ exposureAssessment: { riskInput: { index: 68, basis: "自动人口与设施筛查" } } });
-  assert.equal(reviewImpactRisk(event, null).exposureIndex, 68);
-  const manual = { exposure: { index: 82, basis: "人工核验人口与设施" }, vulnerability: null };
-  assert.equal(reviewImpactRisk(event, manual).exposureIndex, 82);
+test("automatic exposure feeds screening without a manual review dependency", () => {
+  const event = pointEvent();
+  const result = assessImpactRisk({ ...event, exposure: { index: 68, basis: "自动人口与设施筛查" } });
+  assert.equal(result.exposureIndex, 68);
+  assert.equal(result.status, "screening");
+  assert.ok(result.missingInputs.includes("承灾体脆弱性模型"));
 });
 
 test("WorldPop pending tasks retain their task id for idempotent polling", () => {

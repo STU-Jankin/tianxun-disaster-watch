@@ -1,3 +1,5 @@
+import type { OverpassCacheStatus, OverpassProfile } from "./overpass-runtime.ts";
+
 export type InfrastructureKind = "bridge" | "tunnel" | "ford";
 export type InfrastructureGeometry =
   | { type: "Point"; coordinates: [number, number] }
@@ -37,6 +39,10 @@ export type InfrastructureAssessment = {
   fetchedAt: string;
   queryBbox: [number, number, number, number];
   queryAreaKm2: number;
+  osmBaseTimestamp?: string;
+  cacheStatus?: OverpassCacheStatus;
+  dataProfile?: OverpassProfile;
+  updateCadence?: "upstream" | "daily";
   features: InfrastructureFeature[];
   crossingsByRoute: Record<string, InfrastructureCrossing[]>;
   attribution: "© OpenStreetMap contributors · ODbL";
@@ -70,7 +76,7 @@ const osmCopyrightUrl = "https://www.openstreetmap.org/copyright" as const;
 const maximumBboxAreaKm2 = 2_500;
 const crossingToleranceKm = 0.06;
 
-export function prepareInfrastructureQuery(input: unknown): InfrastructureQueryPlan {
+export function prepareInfrastructureQuery(input: unknown, options: { maximumAreaKm2?: number; serviceLabel?: string; queryTimeoutSeconds?: number } = {}): InfrastructureQueryPlan {
   if (!Array.isArray(input) || input.length < 1 || input.length > 3) throw new Error("基础设施查询必须包含 1–3 条路线");
   const routeIds = new Set<string>();
   const routes = input.map((item, routeIndex) => {
@@ -101,18 +107,30 @@ export function prepareInfrastructureQuery(input: unknown): InfrastructureQueryP
   const heightKm = Math.max(0, (north - south) * 110.57);
   const widthKm = Math.max(0, (east - west) * 111.32 * Math.max(0.15, Math.cos(meanLatitude * Math.PI / 180)));
   const areaKm2 = round(heightKm * widthKm, 1);
-  if (areaKm2 > maximumBboxAreaKm2 || heightKm > 120 || widthKm > 120) {
+  const maximumAreaKm2 = Math.max(1, options.maximumAreaKm2 ?? maximumBboxAreaKm2);
+  const maximumSpanKm = Math.max(120, Math.min(450, Math.sqrt(maximumAreaKm2) * 1.4));
+  const serviceLabel = safeText(options.serviceLabel, 80) || "公共 Overpass";
+  if (areaKm2 > maximumAreaKm2 || heightKm > maximumSpanKm || widthKm > maximumSpanKm) {
     return {
       state: "too_large",
       provider: "OpenStreetMap · Overpass",
-      message: `路线包围盒约 ${areaKm2.toFixed(1)} km²，超过公共 Overpass 的保守查询范围；路线仍可推演，但基础设施覆盖标记为未知`,
+      message: `路线包围盒约 ${areaKm2.toFixed(1)} km²，超过${serviceLabel}单次 ${Math.round(maximumAreaKm2).toLocaleString()} km² 的保守查询范围；路线仍可推演，但基础设施覆盖标记为未知`,
       queryBbox: bbox,
       queryAreaKm2: areaKm2,
     };
   }
   const box = bbox.map((value) => value.toFixed(6)).join(",");
-  const query = `[out:json][timeout:12];\n(\n  way["highway"]["bridge"]["bridge"!="no"](${box});\n  way["highway"]["tunnel"]["tunnel"!="no"](${box});\n  way["highway"]["ford"](${box});\n  way["ford"](${box});\n  node["highway"="ford"](${box});\n  node["ford"](${box});\n);\nout tags geom qt 500;`;
+  const timeoutSeconds = Math.max(10, Math.min(120, Math.round(options.queryTimeoutSeconds ?? 12)));
+  const query = `[out:json][timeout:${timeoutSeconds}];\n(\n  way["highway"]["bridge"]["bridge"!="no"](${box});\n  way["highway"]["tunnel"]["tunnel"!="no"](${box});\n  way["highway"]["ford"](${box});\n  way["ford"](${box});\n  node["highway"="ford"](${box});\n  node["ford"](${box});\n);\nout tags geom qt 500;`;
   return { state: "ready", query, cacheKey: bbox.map((value) => value.toFixed(4)).join(":"), bbox, areaKm2, routes };
+}
+
+export function parseOverpassBaseTimestamp(payload: unknown) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  const osm3s = (payload as { osm3s?: unknown }).osm3s;
+  if (!osm3s || typeof osm3s !== "object" || Array.isArray(osm3s)) return undefined;
+  const value = (osm3s as { timestamp_osm_base?: unknown }).timestamp_osm_base;
+  return typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : undefined;
 }
 
 export function parseOverpassInfrastructure(payload: unknown): InfrastructureFeature[] {
@@ -170,7 +188,12 @@ export function parseOverpassInfrastructure(payload: unknown): InfrastructureFea
   return [...result.values()].sort((left, right) => left.kind.localeCompare(right.kind) || left.osmId - right.osmId);
 }
 
-export function assessInfrastructureRoutes(plan: Extract<InfrastructureQueryPlan, { state: "ready" }>, features: InfrastructureFeature[], fetchedAt = new Date().toISOString()): Extract<InfrastructureAssessment, { state: "ready" }> {
+export function assessInfrastructureRoutes(
+  plan: Extract<InfrastructureQueryPlan, { state: "ready" }>,
+  features: InfrastructureFeature[],
+  fetchedAt = new Date().toISOString(),
+  metadata: { osmBaseTimestamp?: string; cacheStatus?: OverpassCacheStatus; dataProfile?: OverpassProfile; updateCadence?: "upstream" | "daily" } = {},
+): Extract<InfrastructureAssessment, { state: "ready" }> {
   const crossingsByRoute: Record<string, InfrastructureCrossing[]> = {};
   for (const route of plan.routes) {
     crossingsByRoute[route.routeId] = features.filter((feature) => routeModeCompatible(route, feature)).flatMap((feature) => {
@@ -184,6 +207,7 @@ export function assessInfrastructureRoutes(plan: Extract<InfrastructureQueryPlan
     fetchedAt,
     queryBbox: plan.bbox,
     queryAreaKm2: plan.areaKm2,
+    ...metadata,
     features,
     crossingsByRoute,
     attribution,

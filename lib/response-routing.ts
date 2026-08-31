@@ -58,6 +58,10 @@ export type ResponseScenario = {
     state: InfrastructureAssessment["state"];
     provider: "OpenStreetMap · Overpass";
     fetchedAt?: string;
+    osmBaseTimestamp?: string;
+    cacheStatus?: "refreshed" | "fresh" | "stale";
+    dataProfile?: "public" | "china_daily";
+    updateCadence?: "upstream" | "daily";
     queryBbox?: [number, number, number, number];
     queryAreaKm2?: number;
     attribution?: "© OpenStreetMap contributors · ODbL";
@@ -209,6 +213,10 @@ export function planRoadResponseScenario(event: DisasterEvent, options: {
     state: options.infrastructure.state,
     provider: options.infrastructure.provider,
     fetchedAt: options.infrastructure.state === "ready" ? options.infrastructure.fetchedAt : undefined,
+    osmBaseTimestamp: options.infrastructure.state === "ready" ? options.infrastructure.osmBaseTimestamp : undefined,
+    cacheStatus: options.infrastructure.state === "ready" ? options.infrastructure.cacheStatus : undefined,
+    dataProfile: options.infrastructure.state === "ready" ? options.infrastructure.dataProfile : undefined,
+    updateCadence: options.infrastructure.state === "ready" ? options.infrastructure.updateCadence : undefined,
     queryBbox: options.infrastructure.state === "ready" ? options.infrastructure.queryBbox : options.infrastructure.queryBbox,
     queryAreaKm2: options.infrastructure.state === "ready" ? options.infrastructure.queryAreaKm2 : options.infrastructure.queryAreaKm2,
     attribution: options.infrastructure.state === "ready" ? options.infrastructure.attribution : undefined,

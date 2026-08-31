@@ -14,11 +14,11 @@ import {
 import { normalizeAntimeridianGeometry, validateGeoGeometry } from "../../../lib/geo-geometry";
 import { latestByKey } from "../../../lib/latest-by-key";
 import { applyEventSourcePresence } from "../../../lib/event-presence";
-import { listEventReviews, listRetainedCanonicalEvents, persistCanonicalEvents, persistIngestionArtifacts, resolveCanonicalEventsByReferences, type SourceFetchCapture } from "../../../db/operational";
+import { listRetainedCanonicalEvents, persistCanonicalEvents, persistIngestionArtifacts, resolveCanonicalEventsByReferences, type SourceFetchCapture } from "../../../db/operational";
 import { circularGeometryCenter, cycloneSeverityFromKnots, firmsConfidenceScore, firmsHeatSeverity, latestTrackPoint } from "../../../lib/source-normalization";
 import { authorizeApiRequest } from "../../../lib/api-security";
 import { buildHourlyCycloneImpactField, buildJmaCycloneForecast, extractKmlFromKmz, parseNhcConeKml, parseNhcTrackKml, parseNhcWindRadiiKml } from "../../../lib/cyclone-forecast";
-import { eventHasInvalidIdentity, eventRevisionFingerprint, firstValidSourceEventId, isValidSourceEventId, latestEventVersionsByMasterId } from "../../../lib/event-integrity";
+import { eventHasInvalidIdentity, firstValidSourceEventId, isValidSourceEventId, latestEventVersionsByMasterId } from "../../../lib/event-integrity";
 import { updateIngestionHealth } from "../../../lib/runtime-health";
 import { floodProcessEntityKey, sameFloodRegion } from "../../../lib/process-identity";
 import { selectFirmsEvents } from "../../../lib/event-selection";
@@ -48,7 +48,6 @@ import { parseMemGeohazardBulletin, parseMemGeohazardListing } from "../../../li
 import { decodeLhasaRiskPng, lhasaCandidatesFromRaster } from "../../../lib/lhasa-nowcast";
 import { amapConfiguration, buildAmapGeocodeUrl, parseAmapGeocodes, type RoutingCoordinate } from "../../../lib/amap-routing";
 import { assessImpactRisk } from "../../../lib/impact-risk";
-import { summarizeEventReview } from "../../../lib/event-review";
 import { sanitizeSnapshotUrl, sourceGovernance, sourceIdForName, sourceNameForUrl, type SourceGovernance, type SourceRole, type SourceTier } from "../../../lib/source-governance";
 
 export const dynamic = "force-dynamic";
@@ -413,14 +412,7 @@ async function refreshEvents() {
     }, {}),
   ).map(([hazard, count]) => ({ hazard, count }));
   const selectedEvents = selectBalancedEvents(operationalEvents.filter((event) => event.observationStatus !== "expired" && event.lifecycleStatus !== "resolved"), 250);
-  const reviews = await listEventReviewsSafely(selectedEvents.map((event) => event.masterEventId));
-  const reviewByEvent = new Map(reviews.map((review) => [review.masterEventId, review]));
-  const events = selectedEvents.map((event) => {
-    const review = reviewByEvent.get(event.masterEventId);
-    if (!review) return event;
-    const summary = summarizeEventReview(event, review, eventRevisionFingerprint(event));
-    return { ...event, review: summary, impactRisk: summary.impactRisk };
-  });
+  const events = selectedEvents;
   const retainedCount = events.filter((event) => event.sourcePresence === "retained").length;
   const fallback = allSourcesUnavailable ? fallbackEvents().map(finalize) : [];
   const fallbackSourceCounts = allSourcesUnavailable
@@ -507,15 +499,6 @@ async function listRetainedEventsSafely() {
     return await listRetainedCanonicalEvents();
   } catch (error) {
     console.error("retained event lookup unavailable", error);
-    return [];
-  }
-}
-
-async function listEventReviewsSafely(masterEventIds: string[]) {
-  try {
-    return await listEventReviews(masterEventIds);
-  } catch (error) {
-    console.error("event review lookup unavailable", error);
     return [];
   }
 }

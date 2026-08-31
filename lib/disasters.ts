@@ -118,8 +118,6 @@ export type DisasterEvent = {
   severity: "red" | "orange" | "yellow" | "blue";
   /** Separate from the source-issued severity and satellite task priority. */
   impactRisk?: import("./impact-risk.ts").ImpactRiskAssessment;
-  /** Human-in-the-loop operational review, separate from the source event lifecycle. */
-  review?: import("./event-review.ts").EventReviewSummary;
   /** Modelled population and mapped infrastructure exposure; never a damage assessment. */
   exposureAssessment?: import("./exposure-assessment.ts").ExposureAssessment;
   magnitude?: number;

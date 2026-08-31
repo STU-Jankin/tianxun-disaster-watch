@@ -1,14 +1,17 @@
+import { getOsmQueryCache, upsertOsmQueryCache } from "../../../db/operational.ts";
 import { ApiInputError, authorizeApiRequest, enforceRateLimit, readJsonObject, rejectCrossOriginBrowserWrite } from "../../../lib/api-security";
 import {
   assessInfrastructureRoutes,
+  parseOverpassBaseTimestamp,
   parseOverpassInfrastructure,
   prepareInfrastructureQuery,
   type InfrastructureFeature,
 } from "../../../lib/osm-infrastructure";
+import { overpassCacheKey, resolveOverpassRuntimeConfig, type OverpassProfile } from "../../../lib/overpass-runtime.ts";
 
 export const dynamic = "force-dynamic";
 
-type CacheEntry = { features: InfrastructureFeature[]; fetchedAt: string; expiresAt: number };
+type CacheEntry = { features: InfrastructureFeature[]; fetchedAt: string; expiresAt: number; osmBaseTimestamp?: string; dataProfile: OverpassProfile };
 const infrastructureState = globalThis as typeof globalThis & { __tianxunInfrastructureCache?: Map<string, CacheEntry> };
 
 export async function POST(request: Request) {
@@ -21,25 +24,41 @@ export async function POST(request: Request) {
 
   try {
     const body = await readJsonObject(request, 256 * 1024);
+    const config = resolveOverpassRuntimeConfig();
     let plan: ReturnType<typeof prepareInfrastructureQuery>;
-    try { plan = prepareInfrastructureQuery(body.routes); }
+    try {
+      plan = prepareInfrastructureQuery(body.routes, {
+        maximumAreaKm2: config.maximumAreaKm2,
+        serviceLabel: config.profileLabel,
+        queryTimeoutSeconds: config.queryTimeoutSeconds,
+      });
+    }
     catch (error) { throw new ApiInputError(error instanceof Error ? error.message : "路线参数无效", 400); }
     if (plan.state !== "ready") return Response.json(plan, { headers: { "Cache-Control": "private, no-store" } });
 
     const cache = infrastructureState.__tianxunInfrastructureCache ??= new Map();
-    const cached = cache.get(plan.cacheKey);
-    if (cached && cached.expiresAt > Date.now()) return assessmentResponse(assessInfrastructureRoutes(plan, cached.features, cached.fetchedAt), "hit");
+    const cacheKey = overpassCacheKey(config, "infrastructure", plan.cacheKey);
+    const cached = cache.get(cacheKey) ?? await readDurableCache(cacheKey);
+    if (cached) cache.set(cacheKey, cached);
+    const metadata = (entry: CacheEntry, cacheStatus: "fresh" | "stale" | "refreshed") => ({
+      osmBaseTimestamp: entry.osmBaseTimestamp,
+      cacheStatus,
+      dataProfile: config.profile,
+      updateCadence: config.updateCadence,
+    } as const);
+    if (cached && cached.expiresAt > Date.now()) {
+      return assessmentResponse(assessInfrastructureRoutes(plan, cached.features, cached.fetchedAt, metadata(cached, "fresh")), "hit");
+    }
 
-    const endpoint = overpassEndpoint();
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15_000);
+    const timeout = setTimeout(() => controller.abort(), (config.queryTimeoutSeconds + 5) * 1_000);
     try {
-      const response = await fetch(endpoint, {
+      const response = await fetch(config.endpoint, {
         method: "POST",
         headers: {
           Accept: "application/json",
           "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-          "User-Agent": overpassUserAgent(),
+          "User-Agent": config.userAgent,
         },
         body: new URLSearchParams({ data: plan.query }).toString(),
         redirect: "manual",
@@ -47,11 +66,28 @@ export async function POST(request: Request) {
       });
       if (!response.ok) throw new Error(`Overpass 上游返回 HTTP ${response.status}`);
       const text = await readLimitedText(response, 4 * 1024 * 1024);
-      const features = parseOverpassInfrastructure(JSON.parse(text));
+      const payload = JSON.parse(text);
+      const features = parseOverpassInfrastructure(payload);
       const fetchedAt = new Date().toISOString();
-      cache.set(plan.cacheKey, { features, fetchedAt, expiresAt: Date.now() + 24 * 60 * 60_000 });
+      const entry: CacheEntry = {
+        features,
+        fetchedAt,
+        expiresAt: Date.now() + config.cacheTtlMs,
+        osmBaseTimestamp: parseOverpassBaseTimestamp(payload),
+        dataProfile: config.profile,
+      };
+      cache.set(cacheKey, entry);
+      await writeDurableCache(cacheKey, entry);
       pruneCache(cache);
-      return assessmentResponse(assessInfrastructureRoutes(plan, features, fetchedAt), "miss");
+      return assessmentResponse(assessInfrastructureRoutes(plan, features, fetchedAt, metadata(entry, "refreshed")), "miss");
+    } catch (error) {
+      const fetchedAt = cached ? Date.parse(cached.fetchedAt) : Number.NaN;
+      if (cached && Number.isFinite(fetchedAt) && fetchedAt + config.staleIfErrorMs > Date.now()) {
+        const assessment = assessInfrastructureRoutes(plan, cached.features, cached.fetchedAt, metadata(cached, "stale"));
+        assessment.note = `${assessment.note} 当前${config.profileLabel}刷新失败，已使用 ${cached.fetchedAt} 的本地缓存；禁止据此认定道路或设施状态未变化。`;
+        return assessmentResponse(assessment, "stale");
+      }
+      throw error;
     } finally {
       clearTimeout(timeout);
     }
@@ -68,20 +104,7 @@ export async function POST(request: Request) {
   }
 }
 
-export function overpassEndpoint() {
-  const raw = process.env.OVERPASS_API_URL?.trim() || "https://overpass-api.de/api/interpreter";
-  let url: URL;
-  try { url = new URL(raw); } catch { throw new ApiInputError("OVERPASS_API_URL 无效", 503); }
-  if (url.protocol !== "https:" || url.username || url.password || !url.hostname || isPrivateLiteral(url.hostname)) throw new ApiInputError("OVERPASS_API_URL 必须是无凭据的公网 HTTPS 地址", 503);
-  return url.toString();
-}
-
-function overpassUserAgent() {
-  const configured = process.env.OVERPASS_USER_AGENT?.trim().replace(/[\r\n]+/g, " ").slice(0, 180);
-  return configured || "Tianxun-Disaster-Watch/0.1 github.com/STU-Jankin/tianxun-disaster-watch";
-}
-
-function assessmentResponse(value: ReturnType<typeof assessInfrastructureRoutes>, cache: "hit" | "miss") {
+function assessmentResponse(value: ReturnType<typeof assessInfrastructureRoutes>, cache: "hit" | "miss" | "stale") {
   return Response.json(value, { headers: { "Cache-Control": "private, no-store", "X-Tianxun-Cache": cache } });
 }
 
@@ -114,13 +137,42 @@ function pruneCache(cache: Map<string, CacheEntry>) {
   while (cache.size > 100) cache.delete(cache.keys().next().value!);
 }
 
-function isPrivateLiteral(hostname: string) {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (["localhost", "::1", "0.0.0.0"].includes(host)) return true;
-  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
-  if (!match) return false;
-  const [, aText, bText] = match;
-  const a = Number(aText);
-  const b = Number(bText);
-  return a === 10 || a === 127 || a === 0 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+async function readDurableCache(cacheKey: string): Promise<CacheEntry | undefined> {
+  try {
+    const record = await getOsmQueryCache<{ features?: unknown }>(cacheKey, "infrastructure");
+    if (!record || !isInfrastructureFeatureList(record.payload.features)) return undefined;
+    return {
+      features: record.payload.features,
+      fetchedAt: record.fetchedAt,
+      expiresAt: Date.parse(record.expiresAt),
+      osmBaseTimestamp: record.osmBaseTimestamp,
+      dataProfile: record.dataProfile,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeDurableCache(cacheKey: string, entry: CacheEntry) {
+  try {
+    await upsertOsmQueryCache({
+      cacheKey,
+      queryKind: "infrastructure",
+      dataProfile: entry.dataProfile,
+      payload: { features: entry.features },
+      fetchedAt: entry.fetchedAt,
+      expiresAt: new Date(entry.expiresAt).toISOString(),
+      osmBaseTimestamp: entry.osmBaseTimestamp,
+    });
+  } catch {
+    // The request remains usable with process-local caching when durable storage is unavailable.
+  }
+}
+
+function isInfrastructureFeatureList(value: unknown): value is InfrastructureFeature[] {
+  return Array.isArray(value) && value.length <= 500 && value.every((item) => Boolean(item)
+    && typeof item === "object"
+    && typeof (item as InfrastructureFeature).infrastructureId === "string"
+    && ["bridge", "tunnel", "ford"].includes((item as InfrastructureFeature).kind)
+    && Boolean((item as InfrastructureFeature).geometry));
 }

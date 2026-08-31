@@ -1,6 +1,7 @@
 import type { DisasterEvent, EventGeometry, HazardType } from "./disasters.ts";
 import { aoiFingerprint, eventRevisionFingerprint } from "./event-integrity.ts";
 import { normalizeAntimeridianGeometry, validateGeoGeometry } from "./geo-geometry.ts";
+import type { OverpassCacheStatus, OverpassProfile } from "./overpass-runtime.ts";
 
 export const exposureAssessmentModelVersion = "tianxun-exposure-screening-v1" as const;
 export const maximumWorldPopAreaKm2 = 50_000;
@@ -51,6 +52,9 @@ export type OsmExposure = {
   facilitiesTruncated: boolean;
   osmBaseTimestamp?: string;
   fetchedAt?: string;
+  cacheStatus?: OverpassCacheStatus;
+  dataProfile?: OverpassProfile;
+  updateCadence?: "upstream" | "daily";
   message: string;
 };
 
@@ -130,20 +134,27 @@ export function worldPopRequestPlan(aoi: ExposureAoi, requestedYear = new Date()
   return { state: "ready" as const, year, resolution, payload: { geojson: aoi.geometry, year, resolution } };
 }
 
-export function prepareOverpassExposureQuery(aoi: ExposureAoi) {
-  if (aoi.crossesAntimeridian) return { state: "skipped" as const, message: "范围跨越日期变更线，公共 Overpass 矩形查询未执行" };
-  if (aoi.areaKm2 > maximumOverpassAreaKm2) return { state: "skipped" as const, message: `范围 ${Math.round(aoi.areaKm2).toLocaleString()} km² 超过公共 Overpass 保守查询上限 2,500 km²` };
+export function prepareOverpassExposureQuery(aoi: ExposureAoi, options: { maximumAreaKm2?: number; serviceLabel?: string; queryTimeoutSeconds?: number } = {}) {
+  const maximumAreaKm2 = Math.max(1, options.maximumAreaKm2 ?? maximumOverpassAreaKm2);
+  const serviceLabel = typeof options.serviceLabel === "string" && options.serviceLabel.trim() ? options.serviceLabel.trim().slice(0, 80) : "公共 Overpass";
+  if (aoi.crossesAntimeridian) return { state: "skipped" as const, message: `范围跨越日期变更线，${serviceLabel}矩形查询未执行` };
+  if (aoi.areaKm2 > maximumAreaKm2) return {
+    state: "skipped" as const,
+    message: `范围 ${Math.round(aoi.areaKm2).toLocaleString()} km²，超过${serviceLabel}单次 ${Math.round(maximumAreaKm2).toLocaleString()} km² 的保守查询范围，已安全跳过 OSM；人口模型仍可独立使用`,
+  };
   const polygons = outerPolygonRings(aoi.geometry);
   const polygonVertexCount = polygons.reduce((sum, ring) => sum + ring.length, 0);
-  if (!polygons.length || polygons.length > 12 || polygonVertexCount > 400) return { state: "skipped" as const, message: "AOI 分块或顶点过多，未向公共 Overpass 提交高负载查询" };
+  if (!polygons.length || polygons.length > 12 || polygonVertexCount > 400) return { state: "skipped" as const, message: `AOI 分块或顶点过多，未向${serviceLabel}提交高负载查询` };
   const polygonFilters = polygons.map((ring) => `(poly:"${ring.map(([longitude, latitude]) => `${latitude.toFixed(6)} ${longitude.toFixed(6)}`).join(" ")}")`);
   const facilityAmenity = "hospital|clinic|doctors|pharmacy|fire_station|police|school|kindergarten|college|university|shelter|community_centre";
   const selectors = (prefix: string, suffix = "") => polygonFilters.map((filter) => `  ${prefix}${filter}${suffix};`).join("\n");
+  const timeoutSeconds = Math.max(15, Math.min(120, Math.round(options.queryTimeoutSeconds ?? 15)));
   return {
     state: "ready" as const,
     bbox: aoi.bbox,
+    cacheIdentity: aoiFingerprint(aoi.geometry),
     queryBasis: "AOI 外环多边形筛查；内洞暂不从公共 OSM 查询中扣除" as const,
-    query: `[out:json][timeout:15];\n(\n${selectors("way[\"building\"]")}\n)->.buildings;\n(\n${selectors("way[\"highway\"]")}\n)->.roads;\n(\n${selectors(`nwr["amenity"~"^(${facilityAmenity})$"]`)}\n${selectors("nwr[\"emergency\"=\"ambulance_station\"]")}\n${selectors("nwr[\"power\"~\"^(plant|substation)$\"]")}\n${selectors("nwr[\"man_made\"~\"^(water_works|wastewater_plant|pumping_station)$\"]")}\n)->.facilities;\n.buildings out count;\n.roads out count;\n.facilities out count;\n.facilities out center qt 300;`,
+    query: `[out:json][timeout:${timeoutSeconds}];\n(\n${selectors("way[\"building\"]")}\n)->.buildings;\n(\n${selectors("way[\"highway\"]")}\n)->.roads;\n(\n${selectors(`nwr["amenity"~"^(${facilityAmenity})$"]`)}\n${selectors("nwr[\"emergency\"=\"ambulance_station\"]")}\n${selectors("nwr[\"power\"~\"^(plant|substation)$\"]")}\n${selectors("nwr[\"man_made\"~\"^(water_works|wastewater_plant|pumping_station)$\"]")}\n)->.facilities;\n.buildings out count;\n.roads out count;\n.facilities out count;\n.facilities out center qt 300;`,
   };
 }
 
