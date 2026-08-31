@@ -263,7 +263,7 @@ export function exposureRiskInput(population: PopulationExposure, osm: OsmExposu
   const index = Math.min(100, Math.round(populationBaseline + osmContext));
   const osmBasis = osm.state === "ready"
     ? `；OSM 已映射建筑 ${osm.mappedBuildingCount?.toLocaleString()}、道路 way ${osm.mappedRoadWayCount?.toLocaleString()}、关键设施 ${osm.mappedKeyFacilityCount?.toLocaleString()} 仅作上调背景，不以缺失记录降低指数`
-    : "；OSM 当前不可用或超出查询范围，未作为降低暴露度的依据";
+    : "；本指数仅含人口暴露，未计入建筑、道路和关键设施存量";
   return {
     index,
     basis: `WorldPop ${population.year} 年模型估计人口 ${Math.round(total).toLocaleString()}，密度 ${Math.round(density).toLocaleString()} 人/km²${osmBasis}`,

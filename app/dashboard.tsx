@@ -2197,43 +2197,53 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
 
   const population = assessment?.population;
   const osm = assessment?.osm;
+  const populationReady = population?.state === "ready" && population.totalPopulation !== undefined;
+  const osmReady = osm?.state === "ready";
+  const populationOnly = Boolean(assessment?.riskInput && populationReady && !osmReady);
+  const missingOsmLabel = osm?.state === "skipped" ? "范围较大，未运行 OSM 统计" : "OSM 数据暂未取得";
   return <section className="exposure-card" aria-labelledby={`exposure-title-${event.id}`}>
     <div className="exposure-heading">
       <div><h3 id={`exposure-title-${event.id}`}>人口与承灾体暴露</h3><small>WorldPop 人口模型 · OpenStreetMap 已映射要素（非实时设施状态）</small></div>
-      <span className={`exposure-status ${assessment?.status ?? "unavailable"}`}>{loading ? "读取中" : exposureStatusLabel(assessment?.status)}</span>
+      <span className={`exposure-status ${populationOnly ? "population-ready" : assessment?.status ?? "unavailable"}`}>{loading ? "读取中" : exposureStatusLabel(assessment?.status, populationOnly)}</span>
     </div>
     {historicalReadOnly ? <p className="exposure-notice">历史重演不读取当前暴露度数据；只有随快照保存的结果才能用于历史复盘。</p> : null}
     {stale ? <p className="exposure-warning">事件范围或版本已更新，旧暴露度结果已隐藏，请重新计算。</p> : null}
-    {assessment ? <>
-      <div className="exposure-metrics">
-        <div><span>模型人口</span><strong>{population?.state === "ready" && population.totalPopulation !== undefined ? Math.round(population.totalPopulation).toLocaleString() : "—"}</strong><small>{population?.state === "ready" ? `${population.year} 年 · ${population.resolution} · ${Math.round(population.populationDensityPerKm2 ?? 0).toLocaleString()} 人/km²` : population?.message}</small></div>
-        <div><span>已映射建筑</span><strong>{osm?.state === "ready" ? osm.mappedBuildingCount?.toLocaleString() : "—"}</strong><small>OSM building 轮廓数，不是受损建筑数</small></div>
-        <div><span>已映射道路</span><strong>{osm?.state === "ready" ? osm.mappedRoadWayCount?.toLocaleString() : "—"}</strong><small>OSM highway way 数，不代表里程或通行状态</small></div>
-        <div><span>关键设施</span><strong>{osm?.state === "ready" ? osm.mappedKeyFacilityCount?.toLocaleString() : "—"}</strong><small>{osm?.facilitiesTruncated ? `地图仅显示前 ${osm.facilities.length} 个` : "地图显示可定位设施"}</small></div>
+      {assessment ? <>
+        <div className="exposure-metrics">
+          <div><span>范围内模型人口</span><strong>{populationReady ? Math.round(population.totalPopulation!).toLocaleString() : "—"}</strong><small>{populationReady ? `${population.year} 年 · ${population.resolution} · ${Math.round(population.populationDensityPerKm2 ?? 0).toLocaleString()} 人/km²` : population?.message}</small></div>
+          <div><span>已映射建筑</span><strong>{osmReady ? osm.mappedBuildingCount?.toLocaleString() : "未统计"}</strong><small>{osmReady ? "OSM building 轮廓数，不是受损建筑数" : missingOsmLabel}</small></div>
+          <div><span>已映射道路</span><strong>{osmReady ? osm.mappedRoadWayCount?.toLocaleString() : "未统计"}</strong><small>{osmReady ? "OSM highway way 数，不代表里程或通行状态" : missingOsmLabel}</small></div>
+          <div><span>关键设施</span><strong>{osmReady ? osm.mappedKeyFacilityCount?.toLocaleString() : "未统计"}</strong><small>{osmReady ? (osm.facilitiesTruncated ? `地图仅显示前 ${osm.facilities.length} 个` : "地图显示可定位设施") : missingOsmLabel}</small></div>
       </div>
       {osm?.state === "ready" && Object.keys(osm.facilityCounts).length ? <div className="exposure-facility-summary">{(Object.entries(osm.facilityCounts) as Array<[ExposureFacilityKind, number]>).map(([kind, count]) => <span key={kind}><i style={{ background: exposureFacilityColor(kind) }} />{exposureFacilityKindLabel(kind)} {count}</span>)}</div> : null}
       <dl className="exposure-provenance">
         <div><dt>筛查范围</dt><dd>{assessment.aoi.label} · {Math.round(assessment.aoi.areaKm2).toLocaleString()} km²</dd></div>
-        <div><dt>自动指数</dt><dd>{assessment.riskInput ? `${assessment.riskInput.index}/100（仅用于演示初筛）` : "未生成"}</dd></div>
+        <div><dt>人口暴露指数</dt><dd>{assessment.riskInput ? `${assessment.riskInput.index}/100（仅用于初筛）` : "未生成"}</dd></div>
         <div><dt>计算时间</dt><dd>{formatTimeWithYear(assessment.computedAt)} UTC+08</dd></div>
         {osm?.osmBaseTimestamp ? <div><dt>OSM 数据时点</dt><dd>{formatTimeWithYear(osm.osmBaseTimestamp)} UTC+08</dd></div> : null}
         {osm?.dataProfile ? <div><dt>OSM 更新方式</dt><dd>{osm.dataProfile === "china_daily" ? "中国日更镜像（非实时）" : "公共 Overpass 上游"}</dd></div> : null}
         {osm?.state === "ready" && osm.fetchedAt ? <div><dt>OSM 查询缓存</dt><dd>{overpassCacheStatusLabel(osm.cacheStatus)} · 查询于 {formatTimeWithYear(osm.fetchedAt)} UTC+08</dd></div> : null}
       </dl>
-      {assessment.riskInput ? <p className="exposure-risk-basis"><strong>自动指数依据：</strong>{assessment.riskInput.basis}</p> : null}
-      {population ? <p className={`exposure-source-state ${population.state}`}>WorldPop：{population.message}</p> : null}
-      {osm ? <p className={`exposure-source-state ${osm.state}`}>OSM：{osm.message}</p> : null}
-      {osm?.state === "skipped" ? <p className="exposure-source-guidance">当前范围超过已配置 OSM 服务的单次安全阈值；这不会阻塞 WorldPop 分块人口统计和基础暴露度指数。若需大范围建筑和道路存量，应使用自建 OSM 数据库离线汇总；高德 POI 只能补充设施位置。</p> : null}
-      <details className="exposure-limitations"><summary>查看口径与限制</summary>{assessment.limitations.map((item) => <p key={item}>{item}</p>)}<p>自动暴露度只参与初筛排序；没有脆弱性模型时，系统仍不会生成综合影响风险分数。</p></details>
+      {assessment.riskInput ? <p className="exposure-risk-basis"><strong>指数依据：</strong>{exposureRiskBasisForDisplay(assessment)}</p> : null}
+      {populationOnly ? <p className="exposure-data-note"><strong>人口筛查已完成。</strong>建筑、道路和关键设施属于补充项，本次未统计；上方人口是筛查范围内模型人口，不是实际受灾人口。</p> : null}
+      {population && population.state !== "ready" ? <p className={`exposure-source-state ${population.state}`}>WorldPop：{population.message}</p> : null}
+      <details className="exposure-limitations"><summary>查看数据来源与限制</summary>{population ? <p>WorldPop：{population.message}</p> : null}{osm ? <p>OSM：{osm.message}</p> : null}{osm?.state === "skipped" ? <p>大范围建筑和道路存量需要自建 OSM 数据库离线汇总；高德 POI 只能补充设施位置，不能替代 OSM 存量统计。</p> : null}{assessment.limitations.map((item) => <p key={item}>{item}</p>)}<p>人口暴露指数只参与初筛排序；没有脆弱性模型时，系统不会生成综合影响风险分数。</p></details>
       <div className="exposure-links"><a href="https://api.worldpop.org/v2/" target="_blank" rel="noreferrer">WorldPop API ↗</a><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors ↗</a></div>
     </> : !loading && !historicalReadOnly ? <p className="exposure-empty">尚未计算。系统会按事件范围查询人口模型，并筛查已映射的建筑、道路和关键设施。</p> : null}
-    {canCompute ? <button className="exposure-compute" disabled={computing} onClick={() => void compute()}>{computing ? "正在查询外部数据…" : assessment?.status === "pending" ? population?.totalParts ? `继续查询人口分块（${population.completedParts ?? 0}/${population.totalParts}）` : "继续查询人口任务" : assessment ? "重新计算暴露度" : "计算暴露度并叠加地图"}</button> : !historicalReadOnly ? <small className="exposure-readonly">当前账号可查看已有结果；计算需要操作员权限。</small> : null}
+    {canCompute ? <button className="exposure-compute" disabled={computing} onClick={() => void compute()}>{computing ? "正在查询外部数据…" : assessment?.status === "pending" ? population?.totalParts ? `继续查询人口分块（${population.completedParts ?? 0}/${population.totalParts}）` : "继续查询人口任务" : assessment ? "刷新暴露度数据" : "计算暴露度并叠加地图"}</button> : !historicalReadOnly ? <small className="exposure-readonly">当前账号可查看已有结果；计算需要操作员权限。</small> : null}
     {error ? <p className="exposure-error" role="alert">{error}</p> : null}
   </section>;
 }
 
-function exposureStatusLabel(status: ExposureAssessment["status"] | undefined) {
-  return status === "complete" ? "完整" : status === "partial" ? "部分可用" : status === "pending" ? "计算中" : status === "unavailable" ? "不可用" : "未计算";
+function exposureStatusLabel(status: ExposureAssessment["status"] | undefined, populationOnly = false) {
+  if (populationOnly) return "人口指数已生成";
+  return status === "complete" ? "人口与 OSM 已完成" : status === "partial" ? "已有可用结果" : status === "pending" ? "计算中" : status === "unavailable" ? "不可用" : "未计算";
+}
+
+function exposureRiskBasisForDisplay(assessment: ExposureAssessment) {
+  const population = assessment.population;
+  if (!assessment.riskInput || population.state !== "ready" || population.totalPopulation === undefined || assessment.osm.state === "ready") return assessment.riskInput?.basis ?? "";
+  return `WorldPop ${population.year} 年模型估计人口 ${Math.round(population.totalPopulation).toLocaleString()}，密度 ${Math.round(population.populationDensityPerKm2 ?? 0).toLocaleString()} 人/km²；本指数仅含人口暴露，未计入建筑、道路和关键设施存量`;
 }
 
 function overpassCacheStatusLabel(status: "refreshed" | "fresh" | "stale" | undefined) {

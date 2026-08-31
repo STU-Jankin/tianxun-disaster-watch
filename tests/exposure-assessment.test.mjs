@@ -108,7 +108,7 @@ test("population parser preserves year and automatic exposure never treats missi
   const enriched = exposureRiskInput(population, mappedOsm);
   assert.ok(baseline.index > 0);
   assert.ok(enriched.index >= baseline.index);
-  assert.match(baseline.basis, /未作为降低暴露度的依据/);
+  assert.match(baseline.basis, /本指数仅含人口暴露/);
   assert.equal(exposureAssessmentStatus(population, unavailableOsm), "partial");
 });
 
