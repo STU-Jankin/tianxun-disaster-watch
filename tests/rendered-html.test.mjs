@@ -81,6 +81,86 @@ test("includes typed AOI, payload options, and expanded source connectors", asyn
   assert.match(route, /needs_config/);
 });
 
+test("exposes source governance, read-only replay, and three separate decision layers", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  const eventsRoute = await readFile(new URL("../app/api/events/route.ts", import.meta.url), "utf8");
+  const schema = await readFile(new URL("../db/schema.ts", import.meta.url), "utf8");
+  for (const phrase of ["历史重演", "只读重演", "官方告警等级", "影响风险", "卫星观测优先级", "更新语义", "几何语义"]) assert.ok(dashboard.includes(phrase));
+  assert.match(eventsRoute, /boundedReplayPayload/);
+  assert.match(eventsRoute, /assessImpactRisk/);
+  for (const table of ["source_registry", "source_payloads", "source_fetch_runs", "ingestion_snapshots"]) assert.ok(schema.includes(table));
+});
+
+test("exposes a versioned human review workflow with evidence-bound risk inputs", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  const route = await readFile(new URL("../app/api/reviews/route.ts", import.meta.url), "utf8");
+  const schema = await readFile(new URL("../db/schema.ts", import.meta.url), "utf8");
+  for (const phrase of ["值守研判", "确认收到", "暴露度指数", "脆弱性指数", "保存研判新版本", "操作记录"]) assert.ok(dashboard.includes(phrase));
+  for (const contract of ["expectedRevision", "eventRevision", "riskInputsRequireBasis", "rejectCrossOriginBrowserWrite"]) assert.ok(route.includes(contract));
+  for (const table of ["event_reviews", "event_review_history", "event_exposure_assessments"]) assert.ok(schema.includes(table));
+  assert.match(route, /只有当前红色或橙色告警需要值守确认/);
+});
+
+test("adds a bounded and evidence-labelled population and infrastructure exposure workflow", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  const route = await readFile(new URL("../app/api/exposure/route.ts", import.meta.url), "utf8");
+  const model = await readFile(new URL("../lib/exposure-assessment.ts", import.meta.url), "utf8");
+  for (const phrase of ["人口与承灾体暴露", "模型人口", "已映射建筑", "已映射道路", "关键设施", "计算暴露度并叠加地图", "不是受损建筑数", "不代表里程或通行状态"]) assert.ok(dashboard.includes(phrase));
+  for (const contract of ["authorizeApiRequest", "rejectCrossOriginBrowserWrite", "enforceRateLimit", "getCanonicalEventForTask", "upsertEventExposureAssessment", "boundedFetch"]) assert.ok(route.includes(contract));
+  for (const guardrail of ["maximumWorldPopAreaKm2", "maximumOverpassAreaKm2", "derived_screening_buffer", "未作为降低暴露度的依据"]) assert.ok(model.includes(guardrail));
+});
+
+test("saves an authenticated review, exposes its audit history, and rejects a stale revision", async () => {
+  const { ensureOperationalSchema } = await import(new URL("../db/operational.ts", import.meta.url));
+  const { eventRevisionFingerprint } = await import(new URL("../lib/event-integrity.ts", import.meta.url));
+  const { DatabaseSync } = await import("node:sqlite");
+  await ensureOperationalSchema();
+  const now = "2026-08-31T02:00:00.000Z";
+  const event = {
+    id: "review-api-source-event", masterEventId: "ME-review-api", entityKey: "event:flood:review-api", title: "研判接口测试洪水", hazard: "flood",
+    latitude: 31.5, longitude: 120.3, occurredAt: now, updatedAt: now, activityAt: now, issuedAt: now,
+    phenomenonStage: "warning", source: "测试官方源", sourceUrl: "https://example.test/event", sourceSeverity: "Orange", severity: "orange",
+    lifecycleStatus: "active", sourcePresence: "current", evidence: [{ source: "测试官方源", sourceUrl: "https://example.test/event", sourceEventId: "review-api-source-event", observedAt: now, role: "warning" }], evidenceCount: 1,
+    updateHistory: [{ source: "测试官方源", sourceUrl: "https://example.test/event", sourceEventId: "review-api-source-event", title: "研判接口测试洪水", observedAt: now, sourceSeverity: "Orange" }], updateCount: 1,
+    confidenceScore: 90, confidenceLevel: "high", geometryType: "Point", geometry: { type: "Point", coordinates: [120.3, 31.5] }, locationQuality: "precise", locationAccuracyKm: 1,
+    aoiApprovalRequired: false, dispatchEligibility: "ready", observable: "direct", observationTargets: ["淹没范围"], recommendedSensors: ["SAR"], scope: "china", priority: 80,
+    priorityBreakdown: { severity: 30, scope: 9, observability: 20, time: 16, confidence: 5 }, observationGoldenHours: 72, observationWindowHours: 336,
+    observationReviewAt: "2026-09-01T02:00:00.000Z", observationExpiresAt: "2026-09-14T02:00:00.000Z", observationHardReviewAt: "2026-09-30T02:00:00.000Z", observationReferenceAt: now,
+    observationRationale: "测试", observationPolicyVersion: "test", observationPhase: "golden", observationStatus: "actionable",
+  };
+  const sqlite = new DatabaseSync(process.env.TIANXUN_SQLITE_PATH);
+  sqlite.prepare("INSERT OR REPLACE INTO canonical_events (id, hazard, title, lifecycle_status, severity, geometry_type, latitude, longitude, location_quality, location_accuracy_km, confidence_score, occurred_at, updated_at, observation_expires_at, payload_json, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    .run(event.masterEventId, event.hazard, event.title, event.lifecycleStatus, event.severity, event.geometryType, event.latitude, event.longitude, event.locationQuality, event.locationAccuracyKm, event.confidenceScore, event.occurredAt, event.updatedAt, event.observationExpiresAt, JSON.stringify(event), now);
+  sqlite.prepare("INSERT OR IGNORE INTO event_evidence (master_event_id, source, source_url, source_event_id, observed_at, role) VALUES (?, ?, ?, ?, ?, ?)")
+    .run(event.masterEventId, event.source, event.sourceUrl, event.id, now, "warning");
+  sqlite.close();
+
+  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
+  workerUrl.searchParams.set("review-api", `${process.pid}-${Date.now()}`);
+  const { default: worker } = await import(workerUrl.href);
+  const context = { waitUntil() {}, passThroughOnException() {} };
+  const env = { ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) } };
+  const login = await worker.fetch(new Request("https://localhost/api/auth/login", { method: "POST", headers: { "content-type": "application/json", origin: "https://localhost" }, body: JSON.stringify({ username: "render-admin", password: loginPassword }) }), env, context);
+  assert.equal(login.status, 200);
+  const cookie = (login.headers.get("set-cookie") ?? "").split(";")[0];
+  const requestBody = { masterEventId: event.masterEventId, expectedRevision: 0, eventRevision: eventRevisionFingerprint(event), status: "reviewing", assignee: "render-admin", conclusion: "正在核对影响范围", exposure: null, vulnerability: null, acknowledgeAlert: true };
+  const save = await worker.fetch(new Request("https://localhost/api/reviews", { method: "POST", headers: { "content-type": "application/json", origin: "https://localhost", cookie }, body: JSON.stringify(requestBody) }), env, context);
+  assert.equal(save.status, 200);
+  const saved = await save.json();
+  assert.equal(saved.review.revision, 1);
+  assert.equal(saved.review.alertAcknowledgedCurrent, true);
+  assert.equal(saved.review.impactRisk.status, "screening");
+
+  const stale = await worker.fetch(new Request("https://localhost/api/reviews", { method: "POST", headers: { "content-type": "application/json", origin: "https://localhost", cookie }, body: JSON.stringify(requestBody) }), env, context);
+  assert.equal(stale.status, 409);
+  const read = await worker.fetch(new Request(`https://localhost/api/reviews?masterEventId=${encodeURIComponent(event.masterEventId)}`, { headers: { cookie } }), env, context);
+  assert.equal(read.status, 200);
+  assert.equal((await read.json()).history.length, 1);
+});
+
 test("includes both domestic connector batches and only filters base-map tiles", async () => {
   const { readFile } = await import("node:fs/promises");
   const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");

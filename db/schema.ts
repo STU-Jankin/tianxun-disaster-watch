@@ -174,3 +174,116 @@ export const webSessions = sqliteTable("web_sessions", {
   index("web_sessions_expiry_idx").on(table.expiresAt),
   index("web_sessions_user_seen_idx").on(table.username, table.lastSeenAt),
 ]);
+
+export const sourceRegistry = sqliteTable("source_registry", {
+  sourceId: text("source_id").primaryKey(),
+  name: text("name").notNull(),
+  tier: text("tier").notNull(),
+  role: text("role").notNull(),
+  authorityClass: text("authority_class").notNull(),
+  setupUrl: text("setup_url").notNull(),
+  pollIntervalMinutes: integer("poll_interval_minutes").notNull(),
+  latencySloMinutes: integer("latency_slo_minutes").notNull(),
+  updateSemantics: text("update_semantics").notNull(),
+  geometrySemantics: text("geometry_semantics").notNull(),
+  licenseNote: text("license_note").notNull(),
+  state: text("state").notNull(),
+  lastAttemptAt: text("last_attempt_at").notNull(),
+  lastSuccessAt: text("last_success_at"),
+  consecutiveFailures: integer("consecutive_failures").notNull().default(0),
+  lastDurationMs: integer("last_duration_ms").notNull().default(0),
+  lastCount: integer("last_count").notNull().default(0),
+  lastMessage: text("last_message").notNull(),
+}, (table) => [
+  index("source_registry_state_idx").on(table.state, table.lastAttemptAt),
+  index("source_registry_success_idx").on(table.lastSuccessAt),
+]);
+
+export const sourcePayloads = sqliteTable("source_payloads", {
+  payloadSha256: text("payload_sha256").primaryKey(),
+  contentType: text("content_type").notNull(),
+  bodyText: text("body_text").notNull(),
+  byteLength: integer("byte_length").notNull(),
+  storedByteLength: integer("stored_byte_length").notNull(),
+  truncated: integer("truncated", { mode: "boolean" }).notNull().default(false),
+  createdAt: text("created_at").notNull(),
+});
+
+export const sourceFetchRuns = sqliteTable("source_fetch_runs", {
+  runId: text("run_id").primaryKey(),
+  refreshId: text("refresh_id").notNull(),
+  sourceId: text("source_id").notNull(),
+  requestedUrl: text("requested_url").notNull(),
+  fetchedAt: text("fetched_at").notNull(),
+  durationMs: integer("duration_ms").notNull(),
+  httpStatus: integer("http_status"),
+  ok: integer("ok", { mode: "boolean" }).notNull(),
+  payloadSha256: text("payload_sha256"),
+  errorMessage: text("error_message"),
+}, (table) => [
+  index("source_fetch_runs_source_time_idx").on(table.sourceId, table.fetchedAt),
+  index("source_fetch_runs_refresh_idx").on(table.refreshId),
+]);
+
+export const ingestionSnapshots = sqliteTable("ingestion_snapshots", {
+  snapshotId: text("snapshot_id").primaryKey(),
+  refreshId: text("refresh_id").notNull(),
+  capturedAt: text("captured_at").notNull(),
+  payloadSha256: text("payload_sha256").notNull(),
+  eventCount: integer("event_count").notNull(),
+  sourceCount: integer("source_count").notNull(),
+  payloadJson: text("payload_json").notNull(),
+}, (table) => [
+  index("ingestion_snapshots_payload_idx").on(table.payloadSha256),
+  index("ingestion_snapshots_captured_idx").on(table.capturedAt),
+]);
+
+export const eventReviews = sqliteTable("event_reviews", {
+  masterEventId: text("master_event_id").primaryKey(),
+  status: text("status").notNull(),
+  assignee: text("assignee").notNull().default(""),
+  conclusion: text("conclusion").notNull().default(""),
+  exposureIndex: integer("exposure_index"),
+  exposureBasis: text("exposure_basis"),
+  vulnerabilityIndex: integer("vulnerability_index"),
+  vulnerabilityBasis: text("vulnerability_basis"),
+  alertAcknowledgedAt: text("alert_acknowledged_at"),
+  alertAcknowledgedBy: text("alert_acknowledged_by"),
+  alertAcknowledgedVersion: text("alert_acknowledged_version"),
+  eventRevision: text("event_revision").notNull(),
+  revision: integer("revision").notNull().default(1),
+  updatedAt: text("updated_at").notNull(),
+  updatedBy: text("updated_by").notNull(),
+}, (table) => [
+  index("event_reviews_status_time_idx").on(table.status, table.updatedAt),
+  index("event_reviews_assignee_status_idx").on(table.assignee, table.status),
+]);
+
+export const eventReviewHistory = sqliteTable("event_review_history", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  masterEventId: text("master_event_id").notNull(),
+  revision: integer("revision").notNull(),
+  actor: text("actor").notNull(),
+  action: text("action").notNull(),
+  fromStatus: text("from_status"),
+  toStatus: text("to_status").notNull(),
+  payloadJson: text("payload_json").notNull(),
+  changedAt: text("changed_at").notNull(),
+}, (table) => [
+  uniqueIndex("event_review_history_event_revision_uidx").on(table.masterEventId, table.revision),
+  index("event_review_history_event_time_idx").on(table.masterEventId, table.changedAt),
+]);
+
+export const eventExposureAssessments = sqliteTable("event_exposure_assessments", {
+  masterEventId: text("master_event_id").primaryKey(),
+  eventRevision: text("event_revision").notNull(),
+  aoiHash: text("aoi_hash").notNull(),
+  status: text("status").notNull(),
+  payloadJson: text("payload_json").notNull(),
+  computedAt: text("computed_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  updatedBy: text("updated_by").notNull(),
+}, (table) => [
+  index("event_exposure_assessments_expiry_idx").on(table.expiresAt, table.computedAt),
+  index("event_exposure_assessments_status_idx").on(table.status, table.computedAt),
+]);

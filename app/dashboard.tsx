@@ -37,6 +37,8 @@ import { cycloneTrackingGeometry, cycloneTrackingSliceAt, nearestCycloneFrameInd
 import type { MissionPlanningProblem, MissionPlanningSummary, PlanningConstraintAssessment } from "../lib/mission-planning";
 import { emptySchedulingManualRules, schedulingOpportunityRef, type MultiTaskSchedule, type SchedulingComparison, type SchedulingManualRules } from "../lib/mission-scheduler";
 import { planningScenarioMatchesProblems, planningScenarioSummary, type PlanningScenarioRecord, type PlanningScenarioSummary } from "../lib/planning-scenarios";
+import { eventReviewStatusLabel, reviewImpactRisk, type EventReviewHistoryEntry, type EventReviewStatus, type EventReviewSummary, type ReviewRiskInput } from "../lib/event-review";
+import { exposureFacilityKindLabel, type ExposureAssessment, type ExposureFacilityKind } from "../lib/exposure-assessment";
 
 type ApiResponse = {
   events: DisasterEvent[];
@@ -52,6 +54,9 @@ type ApiResponse = {
   persistenceAvailable?: boolean;
   lastSuccessfulFetchAt?: string | null;
   producingSourceCount?: number;
+  runtimeMode?: string;
+  replay?: { readOnly: true; requestedAsOf: string; snapshotId: string; capturedAt: string; eventCount: number };
+  replaySnapshotTruncated?: boolean;
 };
 
 const scopeOrder: ScopeId[] = ["wuxi", "jiangsu", "china", "global"];
@@ -93,6 +98,7 @@ type TimeBasis = "occurred" | "updated";
 type PhaseFilter = "all" | DisasterEvent["observationPhase"];
 type ExportFormat = "json" | "csv" | "geojson";
 type SourceStatus = {
+  sourceId: string;
   name: string;
   state: "online" | "offline" | "needs_config";
   online: boolean;
@@ -102,6 +108,16 @@ type SourceStatus = {
   role: "事件" | "预报" | "核验";
   message: string;
   setupUrl: string;
+  authorityClass: "official" | "scientific" | "humanitarian" | "aggregator";
+  pollIntervalMinutes: number;
+  latencySloMinutes: number;
+  updateSemantics: string;
+  geometrySemantics: string;
+  licenseNote: string;
+  durationMs: number;
+  attempts: number;
+  lastAttemptAt: string;
+  lastSuccessAt: string | null;
 };
 type AoiType = "source" | "point" | "circle" | "rectangle" | "corridor" | "polygon" | "multi";
 type ResponsePointPickTarget = "origin" | "destination";
@@ -360,6 +376,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [lastRefreshErrorAt, setLastRefreshErrorAt] = useState<string | null>(null);
+  const replayModeRef = useRef(false);
   const [query, setQuery] = useState("");
   const [sortMode, setSortMode] = useState<SortMode>("priority");
   const [timeWindow, setTimeWindow] = useState<TimeWindow>("all");
@@ -382,6 +399,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
   const [activeResponseScenarioId, setActiveResponseScenarioId] = useState<string | null>(null);
   const [confirmedAois, setConfirmedAois] = useState<Set<string>>(new Set());
   const [landslideTerrain, setLandslideTerrain] = useState<Record<string, LandslideTerrainScreening>>({});
+  const [exposureAssessments, setExposureAssessments] = useState<Record<string, ExposureAssessment>>({});
   const [taskSync, setTaskSync] = useState<Record<string, TaskSyncState>>({});
   const [taskStorageMode, setTaskStorageMode] = useState<TaskStorageMode>("loading");
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
@@ -427,11 +445,29 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     try {
       const response = await fetch("/api/events", { cache: "no-store" });
       if (!response.ok) throw new Error("数据请求失败");
-      setData(await response.json());
+      const result = await response.json() as ApiResponse;
+      replayModeRef.current = false;
+      setData(result);
       setLastRefreshErrorAt(null);
     } catch {
       setError(true);
       setLastRefreshErrorAt(new Date().toISOString());
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const loadReplay = useCallback(async (asOf: string) => {
+    setLoading(true);
+    setError(false);
+    try {
+      const response = await fetch(`/api/replay?asOf=${encodeURIComponent(asOf)}`, { cache: "no-store" });
+      const result = await response.json() as ApiResponse & { error?: string };
+      if (!response.ok) throw new Error(result.error || "历史快照读取失败");
+      replayModeRef.current = true;
+      setData(result);
+      setSelected(null);
+      setLastRefreshErrorAt(null);
     } finally {
       setLoading(false);
     }
@@ -451,7 +487,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
 
   useEffect(() => {
     const initial = window.setTimeout(refresh, 0);
-    const timer = window.setInterval(refresh, 5 * 60_000);
+    const timer = window.setInterval(() => { if (!replayModeRef.current) void refresh(); }, 5 * 60_000);
     return () => {
       window.clearTimeout(initial);
       window.clearInterval(timer);
@@ -925,7 +961,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
   const severeCount = filtered.filter((e) => e.severity === "red" || e.severity === "orange").length;
   const highPriorityCount = filtered.filter((e) => e.priority >= 70).length;
   const producingSourceCount = data?.producingSourceCount ?? data?.sourceStatus.filter((source) => source.producing).length ?? 0;
-  const runtimeMode = !data ? "正在连接" : data.fallback && data.retainedCount > 0 ? "缓存模式" : data.fallback ? "演示模式" : producingSourceCount === 0 ? "无事件产出" : data.persistenceAvailable === false ? "数据库降级" : "实时监测中";
+  const runtimeMode = !data ? "正在连接" : data.replay ? "历史重演" : data.fallback && data.retainedCount > 0 ? "缓存模式" : data.fallback ? "演示模式" : producingSourceCount === 0 ? "无事件产出" : data.persistenceAvailable === false ? "数据库降级" : "实时监测中";
   const modeStale = runtimeMode !== "实时监测中" || Boolean(lastRefreshErrorAt);
   const activeTask = tasks.find((task) => task.taskId === activeTaskId) ?? null;
   const activeResponseScenario = responseScenarios.find((scenario) => scenario.scenarioId === activeResponseScenarioId) ?? null;
@@ -1011,10 +1047,10 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
             <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索事件或地区" aria-label="搜索事件或地区" />
           </label>
           <button className="icon-button" onClick={refresh} disabled={loading} title="立即刷新" aria-label="立即刷新">↻</button>
-          <button ref={responseTriggerRef} className="response-queue-button" onClick={() => openResponsePlanner()} aria-label={`打开处置推演场景，共${responseScenarios.length}项`}>
+          <button ref={responseTriggerRef} className="response-queue-button" disabled={Boolean(data?.replay)} title={data?.replay ? "历史重演为只读模式" : undefined} onClick={() => openResponsePlanner()} aria-label={`打开处置推演场景，共${responseScenarios.length}项`}>
             处置推演 <b>{responseScenarios.length}</b>
           </button>
-          <button ref={taskTriggerRef} className="task-queue-button" onClick={() => { document.querySelectorAll<HTMLDetailsElement>("details[open]").forEach((details) => { details.open = false; }); setResponsePanelOpen(false); setActiveResponseScenarioId(null); setListOpen(false); setTaskPanelOpen(true); }} aria-label={`打开卫星任务候选单，共${tasks.length}项`}>
+          <button ref={taskTriggerRef} className="task-queue-button" disabled={Boolean(data?.replay)} title={data?.replay ? "历史重演为只读模式" : undefined} onClick={() => { document.querySelectorAll<HTMLDetailsElement>("details[open]").forEach((details) => { details.open = false; }); setResponsePanelOpen(false); setActiveResponseScenarioId(null); setListOpen(false); setTaskPanelOpen(true); }} aria-label={`打开卫星任务候选单，共${tasks.length}项`}>
             任务候选 <b>{tasks.length}</b>
           </button>
           <div className="time-box"><strong>{chinaTime(clock)}</strong><small>UTC+08:00</small></div>
@@ -1031,7 +1067,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
             </button>
           ))}
         </div>
-        <SourceStatusPanel sources={data?.sourceStatus ?? []} forceClosed={modalPanelOpen} isAdmin={currentUser?.role === "admin"} />
+        <SourceStatusPanel sources={data?.sourceStatus ?? []} forceClosed={modalPanelOpen} isAdmin={currentUser?.role === "admin"} replay={data?.replay} loading={loading} onReplay={loadReplay} onReturnLive={refresh} />
       </section>
 
       <section className={`workspace ${modalPanelOpen ? "tasks-open" : ""} ${responsePanelOpen ? "response-open" : ""}`}>
@@ -1047,7 +1083,8 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
             <div><span>时效剔除</span><strong>{data?.expiredCount ?? 0}</strong><small>已自动归档</small></div>
           </div>
           {data?.retainedCount ? <div className="retained-banner"><strong>{data.retainedCount}</strong> 个主事件当前未在短时源中复现，仍按既定观测期持续监测。</div> : null}
-          {modeStale ? <div className="stale-banner" role="alert">当前为{lastRefreshErrorAt ? "刷新失败后的保留结果" : runtimeMode}；可以保存候选草稿，但不能把本轮读取时间当作灾害观测时间，也不能计算、导出或进入下发复核。</div> : null}
+          {modeStale ? <div className="stale-banner" role="alert">{data?.replay ? "当前为历史重演，只能查看和筛选快照；任务、推演、告警和下发均已停用。" : `当前为${lastRefreshErrorAt ? "刷新失败后的保留结果" : runtimeMode}；可以保存候选草稿，但不能把本轮读取时间当作灾害观测时间，也不能计算、导出或进入下发复核。`}</div> : null}
+          {data?.replay ? <div className="replay-banner" role="status"><strong>历史快照 · {formatTimeWithYear(data.replay.capturedAt)} UTC+08</strong><span>只读重演，不参与实时告警或任务下发。{data.replaySnapshotTruncated ? "该快照因存储上限仅保留高优先事件。" : ""}</span><button onClick={() => void refresh()}>返回实时</button></div> : null}
           <HazardFilters selected={hazard} onChange={setHazard} events={scopedEvents} />
           <SortControl selected={sortMode} onChange={setSortMode} />
           <TimeFilterControl windowValue={timeWindow} basis={timeBasis} phase={phaseFilter} onWindowChange={setTimeWindow} onBasisChange={setTimeBasis} onPhaseChange={setPhaseFilter} />
@@ -1070,7 +1107,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
 
         {!listOpen && <button className="reopen-panel" onClick={() => setListOpen(true)} inert={modalPanelOpen ? true : undefined} aria-hidden={modalPanelOpen || undefined}>事件列表 <b>{filtered.length}</b> ›</button>}
 
-          <MapView scope={scope} events={filtered} selected={selected} terrainScreening={selected ? landslideTerrain[selected.masterEventId] : undefined} activeTask={activeTask} activeResponseScenario={activeResponseScenario} fleet={fleet} detailOpen={Boolean(selected) && !modalPanelOpen && !activeResponseScenario} layoutKey={`${modalPanelOpen}-${listOpen}-${activeResponseScenario?.scenarioId ?? "none"}`} obscured={mapObscured} responsePointPickTarget={responsePointPickTarget} onResponsePointPick={acceptResponsePointPick} onCancelResponsePointPick={() => { setResponsePointPickTarget(null); setResponsePanelOpen(true); }} onSelect={selectEvent} onCustomAoiChange={updateCustomAoi} onReturnToTask={() => setTaskPanelOpen(true)} onReturnToResponse={() => setResponsePanelOpen(true)} />
+          <MapView scope={scope} events={filtered} selected={selected} exposureAssessment={selected ? exposureAssessments[selected.masterEventId] : undefined} terrainScreening={selected ? landslideTerrain[selected.masterEventId] : undefined} activeTask={activeTask} activeResponseScenario={activeResponseScenario} fleet={fleet} detailOpen={Boolean(selected) && !modalPanelOpen && !activeResponseScenario} layoutKey={`${modalPanelOpen}-${listOpen}-${activeResponseScenario?.scenarioId ?? "none"}`} obscured={mapObscured} responsePointPickTarget={responsePointPickTarget} onResponsePointPick={acceptResponsePointPick} onCancelResponsePointPick={() => { setResponsePointPickTarget(null); setResponsePanelOpen(true); }} onSelect={selectEvent} onCustomAoiChange={updateCustomAoi} onReturnToTask={() => setTaskPanelOpen(true)} onReturnToResponse={() => setResponsePanelOpen(true)} />
 
         <div className="map-legend" inert={modalPanelOpen ? true : undefined} aria-hidden={modalPanelOpen || undefined}>
           <span><i className="red" />红色</span><span><i className="orange" />橙色</span><span><i className="yellow" />黄色</span><span><i className="blue" />蓝色</span>
@@ -1078,10 +1115,11 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
           <span className="priority-ring">◎</span><span>重点范围加权</span>
           {selected?.cycloneForecast || activeTask?.cycloneForecast ? <><em /><span><i className="forecast-track-key" />官方路径</span><span><i className="forecast-impact-key" />风圈范围</span><span><i className="forecast-uncertainty-key" />路径不确定区</span></> : null}
           {selected && landslideTerrain[selected.masterEventId] ? <><em /><span><i className="landslide-terrain-key" />DEM 地形筛查 AOI</span></> : null}
+          {selected && exposureAssessments[selected.masterEventId] ? <><em /><span><i className="exposure-aoi-key" />暴露度筛查 AOI</span><span><i className="exposure-facility-key" />OSM 关键设施</span></> : null}
           {activeResponseScenario ? <><em /><span><i className="response-route-clear-key" />未检出相交</span><span><i className="response-route-limited-key" />影响区内撤离</span><span><i className="response-route-blocked-key" />禁用/未核验</span>{activeResponseScenario.infrastructureFeatures?.length ? <span><i className="infrastructure-exposure-key" />OSM 设施暴露</span> : null}</> : null}
         </div>
 
-        {selected && !activeResponseScenario && <DetailPanel event={selected} nowMs={clock} compact={compactViewport} obscured={modalPanelOpen} dispatchBlocked={modeStale} locationZh={locationZh[selected.id]} locationLoading={locationLoading === selected.id} locationState={locationState[selected.id]?.state} onRetryLocation={() => { setLocationState((current) => { const next = { ...current }; delete next[selected.id]; return next; }); setLocationRetry((value) => value + 1); }} taskAdded={tasks.some((task) => taskMatchesEvent(task, selected))} landslideTemplateCount={new Set(tasks.filter((task) => task.masterEventId === selected.masterEventId && ["ascending", "descending"].includes(String(task.orbitDirectionPreference))).map((task) => task.orbitDirectionPreference)).size} terrainScreening={landslideTerrain[selected.masterEventId]} onTerrainChange={(terrain) => setLandslideTerrain((current) => { const next = { ...current }; if (terrain) next[selected.masterEventId] = terrain; else delete next[selected.masterEventId]; return next; })} aoiConfirmed={confirmedAois.has(selected.masterEventId)} onConfirmAoi={(confirmed) => setConfirmedAois((current) => { const next = new Set(current); if (confirmed) next.add(selected.masterEventId); else next.delete(selected.masterEventId); return next; })} onAddTask={addTask} onAddLandslideTasks={addLandslideSarTasks} onResponsePlan={openResponsePlanner} onClose={closeSelected} />}
+        {selected && !activeResponseScenario && <DetailPanel key={`${selected.masterEventId}:${data?.replay?.snapshotId ?? "live"}`} event={selected} exposureAssessment={exposureAssessments[selected.masterEventId]} onExposureChange={(assessment) => setExposureAssessments((current) => { const next = { ...current }; if (assessment) next[selected.masterEventId] = assessment; else delete next[selected.masterEventId]; return next; })} currentUser={currentUser} nowMs={clock} compact={compactViewport} obscured={modalPanelOpen} dispatchBlocked={modeStale} historicalReadOnly={Boolean(data?.replay)} locationZh={locationZh[selected.id]} locationLoading={locationLoading === selected.id} locationState={locationState[selected.id]?.state} onRetryLocation={() => { setLocationState((current) => { const next = { ...current }; delete next[selected.id]; return next; }); setLocationRetry((value) => value + 1); }} taskAdded={tasks.some((task) => taskMatchesEvent(task, selected))} landslideTemplateCount={new Set(tasks.filter((task) => task.masterEventId === selected.masterEventId && ["ascending", "descending"].includes(String(task.orbitDirectionPreference))).map((task) => task.orbitDirectionPreference)).size} terrainScreening={landslideTerrain[selected.masterEventId]} onTerrainChange={(terrain) => setLandslideTerrain((current) => { const next = { ...current }; if (terrain) next[selected.masterEventId] = terrain; else delete next[selected.masterEventId]; return next; })} aoiConfirmed={confirmedAois.has(selected.masterEventId)} onConfirmAoi={(confirmed) => setConfirmedAois((current) => { const next = new Set(current); if (confirmed) next.add(selected.masterEventId); else next.delete(selected.masterEventId); return next; })} onAddTask={addTask} onAddLandslideTasks={addLandslideSarTasks} onResponsePlan={openResponsePlanner} onClose={closeSelected} />}
         <TaskPanel open={taskPanelOpen} tasks={tasks} syncState={taskSync} storageMode={taskStorageMode} fleet={fleet} activeTaskId={activeTaskId} onActivate={reviewTaskAoi} onUpdate={updateTask} onRemove={(taskId) => void removeTask(taskId)} onClose={closeTaskPanel} onRetry={saveTask} />
         <ResponsePlanPanel open={responsePanelOpen} event={responsePlanningEvent} events={deduplicatedEvents} scenarios={responseScenarios} activeScenarioId={activeResponseScenarioId} currentUserRole={currentUser?.role ?? "admin"} pickedPoint={responsePickedPoint} onRequestPointPick={requestResponsePointPick} onSave={saveResponseScenario} onActivate={reviewResponseScenario} onSelectRoute={selectResponseRoute} onRemove={removeResponseScenario} onChooseEvent={(event) => setResponseEventId(event.masterEventId)} onClose={closeResponsePanel} />
         {undoDraft ? <div className="task-undo-toast" role="status"><span>已删除本机草稿：{undoDraft.task.title}</span><button onClick={restoreDraft}>撤销</button></div> : null}
@@ -1094,9 +1132,12 @@ function roleLabel(role: "viewer" | "operator" | "admin") {
   return role === "admin" ? "系统管理员" : role === "operator" ? "任务操作员" : "只读观察员";
 }
 
-function SourceStatusPanel({ sources, forceClosed, isAdmin }: { sources: SourceStatus[]; forceClosed: boolean; isAdmin: boolean }) {
+function SourceStatusPanel({ sources, forceClosed, isAdmin, replay, loading, onReplay, onReturnLive }: { sources: SourceStatus[]; forceClosed: boolean; isAdmin: boolean; replay?: ApiResponse["replay"]; loading: boolean; onReplay: (asOf: string) => Promise<void>; onReturnLive: () => Promise<void> }) {
   const detailsRef = useRef<HTMLDetailsElement>(null);
   const [open, setOpen] = useState(false);
+  const [asOf, setAsOf] = useState(() => localDateTimeInput(new Date(Date.now() - 60 * 60_000)));
+  const [replayError, setReplayError] = useState("");
+  const [history, setHistory] = useState<Record<string, { loading?: boolean; error?: string; runs?: Array<Record<string, unknown>>; preview?: string }>>({});
   const effectiveOpen = open && !forceClosed;
   useEffect(() => {
     if (!effectiveOpen) return;
@@ -1111,19 +1152,58 @@ function SourceStatusPanel({ sources, forceClosed, isAdmin }: { sources: SourceS
   }, [effectiveOpen]);
   const online = sources.filter((source) => source.state === "online").length;
   const pending = sources.filter((source) => source.state === "needs_config").length;
+  const loadSourceHistory = async (sourceId: string) => {
+    setHistory((current) => ({ ...current, [sourceId]: { loading: true } }));
+    try {
+      const response = await fetch(`/api/sources?sourceId=${encodeURIComponent(sourceId)}`, { cache: "no-store" });
+      const result = await response.json() as { runs?: Array<Record<string, unknown>>; error?: string };
+      if (!response.ok) throw new Error(result.error || "抓取历史读取失败");
+      setHistory((current) => ({ ...current, [sourceId]: { runs: result.runs ?? [] } }));
+    } catch (historyError) {
+      setHistory((current) => ({ ...current, [sourceId]: { error: historyError instanceof Error ? historyError.message : "抓取历史读取失败" } }));
+    }
+  };
+  const loadPayloadPreview = async (sourceId: string, payloadSha256: string) => {
+    setHistory((current) => ({ ...current, [sourceId]: { ...current[sourceId], loading: true, preview: undefined } }));
+    try {
+      const response = await fetch(`/api/sources?payload=${encodeURIComponent(payloadSha256)}`, { cache: "no-store" });
+      const result = await response.json() as { payload?: { bodyText?: string; byteLength?: number; truncated?: number | boolean; contentType?: string }; error?: string };
+      if (!response.ok || !result.payload) throw new Error(result.error || "响应预览读取失败");
+      const metadata = `${result.payload.contentType || "未知格式"} · 原始 ${Number(result.payload.byteLength ?? 0)} 字节${result.payload.truncated ? " · 已限长" : ""}`;
+      setHistory((current) => ({ ...current, [sourceId]: { ...current[sourceId], loading: false, preview: `${metadata}\n${result.payload?.bodyText ?? ""}` } }));
+    } catch (previewError) {
+      setHistory((current) => ({ ...current, [sourceId]: { ...current[sourceId], loading: false, error: previewError instanceof Error ? previewError.message : "响应预览读取失败" } }));
+    }
+  };
   return <details ref={detailsRef} className="source-status" open={effectiveOpen} onToggle={(event) => setOpen(!forceClosed && event.currentTarget.open)}>
     <summary><span><i className="online-dot" />{sources.length ? `数据源 ${online}/${sources.length}` : "数据源正在连接…"}</span>{pending ? <b>{pending} 待配置</b> : null}</summary>
     <div className="source-status-popover" role="dialog" aria-modal="false" aria-label="数据源运行状态">
       <div className="source-status-heading"><strong>数据源运行状态</strong><button type="button" onClick={() => setOpen(false)} aria-label="关闭数据源状态">×</button></div>
+      <section className="replay-control">
+        <h3>历史重演</h3>
+        <p>读取最接近所选时刻的事件快照。历史模式只读，不触发告警、排程或下发。</p>
+        <label>回看时刻（本机时间）<input type="datetime-local" value={asOf} max={localDateTimeInput(new Date())} onChange={(event) => setAsOf(event.target.value)} /></label>
+        <div><button type="button" disabled={loading} onClick={async () => { setReplayError(""); try { await onReplay(new Date().toISOString()); } catch (loadError) { setReplayError(loadError instanceof Error ? loadError.message : "历史快照读取失败"); } }}>{loading ? "读取中…" : "最近快照"}</button><button type="button" disabled={loading || !asOf} onClick={async () => { setReplayError(""); try { const selectedMinute = new Date(asOf); selectedMinute.setSeconds(59, 999); await onReplay(selectedMinute.toISOString()); } catch (loadError) { setReplayError(loadError instanceof Error ? loadError.message : "历史快照读取失败"); } }}>按时刻载入</button>{replay ? <button type="button" disabled={loading} onClick={() => void onReturnLive()}>返回实时</button> : null}</div>
+        {replayError ? <small role="alert">{replayError}</small> : null}
+      </section>
       {(["中国第一批", "中国第二批", "基础", "第一优先级", "第二优先级"] as const).map((tier) => <section key={tier}>
         <h3>{tier}</h3>
         {sources.filter((source) => source.tier === tier).map((source) => <div key={source.name} className={`source-status-item ${source.state}`}>
-          <i /><span><strong>{source.name}</strong><small>{source.role} · {humanizeSourceStatus(source)}</small>{isAdmin ? <details><summary>技术详情</summary><code>{source.message}</code></details> : null}</span><b>{source.state === "online" ? source.producing ? `${source.count} 条` : "连接正常" : source.state === "needs_config" ? "需配置" : "暂不可用"}</b><a href={safeHttpUrl(source.setupUrl)} target="_blank" rel="noreferrer">查看来源</a>
+          <i /><span><strong>{source.name}</strong><small>{source.role} · {sourceAuthorityLabel(source.authorityClass)} · {humanizeSourceStatus(source)}</small>{isAdmin ? <details className="source-governance"><summary>治理与技术详情</summary><dl><div><dt>轮询 / 延迟目标</dt><dd>{source.pollIntervalMinutes} 分钟 / {source.latencySloMinutes} 分钟</dd></div><div><dt>本轮耗时</dt><dd>{source.durationMs} ms · {source.attempts} 次尝试</dd></div><div><dt>更新语义</dt><dd>{source.updateSemantics}</dd></div><div><dt>几何语义</dt><dd>{source.geometrySemantics}</dd></div><div><dt>使用约束</dt><dd>{source.licenseNote}</dd></div></dl><code>{source.message}</code><button type="button" onClick={() => void loadSourceHistory(source.sourceId)}>查看最近抓取</button>{history[source.sourceId]?.loading ? <small>正在读取…</small> : history[source.sourceId]?.error ? <small role="alert">{history[source.sourceId].error}</small> : history[source.sourceId]?.runs ? <div className="source-run-list">{history[source.sourceId].runs?.length ? history[source.sourceId].runs?.slice(0, 8).map((run) => <p key={String(run.runId)}><time>{formatTimeWithYear(String(run.fetchedAt))}</time><b>{run.ok ? `HTTP ${run.httpStatus}` : "失败"}</b><span>{Number(run.durationMs)} ms</span>{run.payloadSha256 ? <button type="button" onClick={() => void loadPayloadPreview(source.sourceId, String(run.payloadSha256))}>响应预览</button> : null}</p>) : <small>保留期内暂无可关联的原始抓取记录。</small>}</div> : null}{history[source.sourceId]?.preview ? <pre className="source-payload-preview">{history[source.sourceId].preview}</pre> : null}</details> : null}</span><b>{source.state === "online" ? source.producing ? `${source.count} 条` : "连接正常" : source.state === "needs_config" ? "需配置" : "暂不可用"}</b><a href={safeHttpUrl(source.setupUrl)} target="_blank" rel="noreferrer">查看来源</a>
         </div>)}
       </section>)}
       <footer>区域通报只用于任务初筛；正式规划前仍需用权威矢量或实测数据复核范围。“核验”来源只补充证据，不生成任务坐标。</footer>
     </div>
   </details>;
+}
+
+function localDateTimeInput(date: Date) {
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function sourceAuthorityLabel(value: SourceStatus["authorityClass"]) {
+  return value === "official" ? "官方源" : value === "scientific" ? "科研机构" : value === "humanitarian" ? "人道信息" : "聚合源";
 }
 
 function humanizeSourceStatus(source: SourceStatus) {
@@ -1189,6 +1269,8 @@ function EventCard({ event, active, onClick }: { event: DisasterEvent; active: b
         {event.updateCount > 1 ? <span className="update-tag">{event.updateCount}期更新</span> : null}
         <span className={`confidence-tag ${event.confidenceLevel}`}>{confidenceLabels[event.confidenceLevel]} · {event.independentSourceCount ?? new Set(event.evidence.map((item) => item.source.split(" · ")[0])).size}源</span>
         <span className="time-weight-tag">时效 +{event.priorityBreakdown.time}</span>
+        <span className={`impact-risk-tag ${event.impactRisk?.level ?? "undetermined"}`}>{event.impactRisk?.status === "assessed" ? `影响风险 ${impactRiskLabel(event.impactRisk.level)} ${event.impactRisk.score}` : `影响风险待评估 · 危险性 ${event.impactRisk?.hazardIndex ?? "—"}`}</span>
+        <span className={`review-tag ${event.review?.status ?? "pending"}`}>研判 {eventReviewStatusLabel(event.review?.status ?? "pending")}{event.review?.stale ? " · 待复核" : ""}</span>
         <span>{event.observable === "direct" ? "直接可观测" : event.observable === "consequence" ? "灾后可观测" : "条件可观测"}</span>
       </div>
     </div>
@@ -1196,7 +1278,7 @@ function EventCard({ event, active, onClick }: { event: DisasterEvent; active: b
   </button>;
 }
 
-function MapView({ scope, events, selected, terrainScreening, activeTask, activeResponseScenario, fleet, detailOpen, layoutKey, obscured, responsePointPickTarget, onResponsePointPick, onCancelResponsePointPick, onSelect, onCustomAoiChange, onReturnToTask, onReturnToResponse }: { scope: ScopeId; events: DisasterEvent[]; selected: DisasterEvent | null; terrainScreening?: LandslideTerrainScreening; activeTask: SatelliteTask | null; activeResponseScenario: ResponseScenario | null; fleet: SatelliteFleetState; detailOpen: boolean; layoutKey: string; obscured: boolean; responsePointPickTarget: ResponsePointPickTarget | null; onResponsePointPick: (target: ResponsePointPickTarget, longitude: number, latitude: number) => void; onCancelResponsePointPick: () => void; onSelect: (event: DisasterEvent) => void; onCustomAoiChange: (taskId: string, geometry?: CustomAoiGeometry) => void; onReturnToTask: () => void; onReturnToResponse: () => void }) {
+function MapView({ scope, events, selected, exposureAssessment, terrainScreening, activeTask, activeResponseScenario, fleet, detailOpen, layoutKey, obscured, responsePointPickTarget, onResponsePointPick, onCancelResponsePointPick, onSelect, onCustomAoiChange, onReturnToTask, onReturnToResponse }: { scope: ScopeId; events: DisasterEvent[]; selected: DisasterEvent | null; exposureAssessment?: ExposureAssessment; terrainScreening?: LandslideTerrainScreening; activeTask: SatelliteTask | null; activeResponseScenario: ResponseScenario | null; fleet: SatelliteFleetState; detailOpen: boolean; layoutKey: string; obscured: boolean; responsePointPickTarget: ResponsePointPickTarget | null; onResponsePointPick: (target: ResponsePointPickTarget, longitude: number, latitude: number) => void; onCancelResponsePointPick: () => void; onSelect: (event: DisasterEvent) => void; onCustomAoiChange: (taskId: string, geometry?: CustomAoiGeometry) => void; onReturnToTask: () => void; onReturnToResponse: () => void }) {
   const bbox = scopes[scope].bbox;
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<import("leaflet").Map | null>(null);
@@ -1206,6 +1288,7 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
   const aoiLayerRef = useRef<import("leaflet").GeoJSON | null>(null);
   const opportunityLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const responseLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
+  const exposureLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const drawPreviewLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const orbitLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const scopeRef = useRef(scope);
@@ -1285,6 +1368,7 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
       taskForecastLayerRef.current = L.featureGroup().addTo(map);
       opportunityLayerRef.current = L.featureGroup().addTo(map);
       responseLayerRef.current = L.featureGroup().addTo(map);
+      exposureLayerRef.current = L.featureGroup().addTo(map);
       drawPreviewLayerRef.current = L.featureGroup().addTo(map);
       orbitLayerRef.current = L.featureGroup().addTo(map);
       mapRef.current = map;
@@ -1311,6 +1395,7 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
       taskForecastLayerRef.current = null;
       opportunityLayerRef.current = null;
       responseLayerRef.current = null;
+      exposureLayerRef.current = null;
       drawPreviewLayerRef.current = null;
       orbitLayerRef.current = null;
     };
@@ -1787,6 +1872,33 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
 
   useEffect(() => {
     const map = mapRef.current;
+    const layer = exposureLayerRef.current;
+    if (!mapReady || !map || !layer) return;
+    layer.clearLayers();
+    if (!selected || !exposureAssessment || exposureAssessment.masterEventId !== selected.masterEventId) return;
+    let cancelled = false;
+    void import("leaflet").then((L) => {
+      if (cancelled) return;
+      const aoiLayer = L.geoJSON(unwrapForecastGeometry(exposureAssessment.aoi.geometry, selected.longitude) as GeoJSON.GeoJsonObject, {
+        style: { color: "#087bd3", weight: 2, fillColor: "#35a5e8", fillOpacity: 0.09, dashArray: exposureAssessment.aoi.basis === "derived_screening_buffer" ? "6 5" : undefined, className: "exposure-assessment-aoi" },
+        interactive: true,
+      });
+      aoiLayer.bindTooltip(`暴露度 AOI · ${exposureAssessment.aoi.label} · ${Math.round(exposureAssessment.aoi.areaKm2).toLocaleString()} km²`, { sticky: true });
+      aoiLayer.addTo(layer);
+      aoiLayer.bringToBack();
+      exposureAssessment.osm.facilities.forEach((facility) => {
+        const color = exposureFacilityColor(facility.kind);
+        const marker = L.circleMarker([facility.latitude, facility.longitude], { radius: 6, color: "#fff", weight: 2, fillColor: color, fillOpacity: 0.95, className: `exposure-facility ${facility.kind}` });
+        marker.bindTooltip(`${exposureFacilityKindLabel(facility.kind)} · ${facility.name} · OSM 已映射点位`, { direction: "top" });
+        marker.addTo(layer);
+      });
+      if (!activeTask && !activeResponseScenario && layer.getBounds().isValid()) fitWithOverlay(map, layer.getBounds(), 11);
+    }).catch(() => setMapError("暴露度 AOI 或关键设施图层无法绘制；统计结果仍可查看。"));
+    return () => { cancelled = true; layer.clearLayers(); };
+  }, [activeResponseScenario, activeTask, exposureAssessment, fitWithOverlay, mapReady, selected]);
+
+  useEffect(() => {
+    const map = mapRef.current;
     const layer = responseLayerRef.current;
     if (!mapReady || !map || !layer) return;
     let cancelled = false;
@@ -1911,10 +2023,26 @@ function MapView({ scope, events, selected, terrainScreening, activeTask, active
   </div>;
 }
 
-function DetailPanel({ event, nowMs, compact, obscured, dispatchBlocked, locationZh, locationLoading, locationState, onRetryLocation, taskAdded, landslideTemplateCount, terrainScreening, onTerrainChange, aoiConfirmed, onConfirmAoi, onAddTask, onAddLandslideTasks, onResponsePlan, onClose }: { event: DisasterEvent; nowMs: number; compact: boolean; obscured: boolean; dispatchBlocked: boolean; locationZh?: string; locationLoading: boolean; locationState?: "resolved" | "fallback" | "error"; onRetryLocation: () => void; taskAdded: boolean; landslideTemplateCount: number; terrainScreening?: LandslideTerrainScreening; onTerrainChange: (terrain?: LandslideTerrainScreening) => void; aoiConfirmed: boolean; onConfirmAoi: (confirmed: boolean) => void; onAddTask: (event: DisasterEvent, operatorConfirmed: boolean) => void; onAddLandslideTasks: (event: DisasterEvent, terrain: LandslideTerrainScreening) => void; onResponsePlan: (event: DisasterEvent) => void; onClose: () => void }) {
+function DetailPanel({ event, exposureAssessment, onExposureChange, currentUser, nowMs, compact, obscured, dispatchBlocked, historicalReadOnly, locationZh, locationLoading, locationState, onRetryLocation, taskAdded, landslideTemplateCount, terrainScreening, onTerrainChange, aoiConfirmed, onConfirmAoi, onAddTask, onAddLandslideTasks, onResponsePlan, onClose }: { event: DisasterEvent; exposureAssessment?: ExposureAssessment; onExposureChange: (assessment?: ExposureAssessment) => void; currentUser?: { username: string; role: "viewer" | "operator" | "admin" }; nowMs: number; compact: boolean; obscured: boolean; dispatchBlocked: boolean; historicalReadOnly: boolean; locationZh?: string; locationLoading: boolean; locationState?: "resolved" | "fallback" | "error"; onRetryLocation: () => void; taskAdded: boolean; landslideTemplateCount: number; terrainScreening?: LandslideTerrainScreening; onTerrainChange: (terrain?: LandslideTerrainScreening) => void; aoiConfirmed: boolean; onConfirmAoi: (confirmed: boolean) => void; onAddTask: (event: DisasterEvent, operatorConfirmed: boolean) => void; onAddLandslideTasks: (event: DisasterEvent, terrain: LandslideTerrainScreening) => void; onResponsePlan: (event: DisasterEvent) => void; onClose: () => void }) {
   const isDemo = event.source === "演示数据";
   const panelRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const [reviewState, setReviewState] = useState<{ state: "loading" | "ready" | "error"; review: EventReviewSummary | null; history: EventReviewHistoryEntry[]; message?: string }>({ state: historicalReadOnly ? "ready" : "loading", review: event.review ?? null, history: [] });
+  useEffect(() => {
+    if (historicalReadOnly) return;
+    const controller = new AbortController();
+    void fetch(`/api/reviews?masterEventId=${encodeURIComponent(event.masterEventId)}`, { cache: "no-store", signal: controller.signal })
+      .then(async (response) => {
+        const result = await response.json().catch(() => ({})) as { review?: EventReviewSummary | null; history?: EventReviewHistoryEntry[]; error?: string };
+        if (!response.ok) throw new Error(result.error || `研判记录读取失败（HTTP ${response.status}）`);
+        setReviewState({ state: "ready", review: result.review ?? null, history: result.history ?? [] });
+      })
+      .catch((error) => {
+        if (controller.signal.aborted) return;
+        setReviewState((current) => ({ ...current, state: "error", message: error instanceof Error ? error.message : "研判记录读取失败" }));
+      });
+    return () => controller.abort();
+  }, [event.masterEventId, event.review, historicalReadOnly]);
   useEffect(() => {
     if (!compact) return;
     closeRef.current?.focus();
@@ -1934,9 +2062,10 @@ function DetailPanel({ event, nowMs, compact, obscured, dispatchBlocked, locatio
   const taskWindowValid = Date.parse(event.observationExpiresAt) > nowMs + 3_600_000;
   const cycloneForecastUsable = !event.cycloneForecast || Date.parse(event.cycloneForecast.forecastValidUntil) > nowMs + 3_600_000;
   const needsAoiReview = event.aoiApprovalRequired || !cycloneForecastUsable;
-  const canSaveCandidate = !isDemo && taskWindowValid && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived";
+  const canSaveCandidate = !historicalReadOnly && !isDemo && taskWindowValid && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived";
   const canEnterDispatchReview = !dispatchBlocked && canSaveCandidate && (!needsAoiReview || aoiConfirmed);
-  const canBuildTerrainTask = !isDemo && taskWindowValid && event.dispatchEligibility !== "blocked" && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived";
+  const canBuildTerrainTask = !historicalReadOnly && !isDemo && taskWindowValid && event.dispatchEligibility !== "blocked" && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived";
+  const effectiveImpactRisk = reviewImpactRisk({ ...event, exposureAssessment }, reviewState.review);
   return <aside ref={panelRef} className="detail-panel" role={compact ? "dialog" : "region"} aria-modal={compact ? "true" : undefined} aria-labelledby={`detail-title-${event.id}`} inert={obscured ? true : undefined} aria-hidden={obscured || undefined}>
     <button ref={closeRef} className="detail-close" onClick={onClose} aria-label="关闭详情">×</button>
     <div className={`detail-kicker ${event.severity}`}><span>{hazardMeta[event.hazard].symbol}</span>{event.hazardSubtype ? hazardSubtypeLabels[event.hazardSubtype] : hazardMeta[event.hazard].label} · {severityLabels[event.severity]} · {phenomenonLabels[event.phenomenonStage]}{event.crossBorder ? " · 跨境影响" : ""}</div>
@@ -1948,7 +2077,25 @@ function DetailPanel({ event, nowMs, compact, obscured, dispatchBlocked, locatio
       {locationState === "error" ? <small role="alert">中文地点解析失败。<button onClick={onRetryLocation}>重试</button></small> : null}
       <small>来源原文：{event.country || event.title}</small>
     </div>
-    <div className="detail-score"><div><strong>{event.priority}</strong><span>任务优先级</span></div><p>严重度 {event.priorityBreakdown.severity} · 区域 {event.priorityBreakdown.scope} · 遥感 {event.priorityBreakdown.observability} · 时效 {event.priorityBreakdown.time} · 可信度 {event.priorityBreakdown.confidence ?? 0}</p></div>
+    <div className="classification-grid" aria-label="事件分级与任务排序">
+      <div className={`official-severity ${event.severity}`}><span>来源/官方告警等级</span><strong>{severityLabels[event.severity]}</strong><small>来源原始表述：{event.sourceSeverity}</small></div>
+      <div className={`impact-risk ${effectiveImpactRisk?.level ?? "undetermined"}`}><span>影响风险</span><strong>{effectiveImpactRisk?.status === "assessed" ? `${impactRiskLabel(effectiveImpactRisk.level)} · ${effectiveImpactRisk.score}` : "待评估"}</strong><small>{effectiveImpactRisk?.status === "assessed" ? "危险性、暴露度和脆弱性初筛" : `危险性 ${effectiveImpactRisk?.hazardIndex ?? "—"}/100；待补 ${effectiveImpactRisk?.missingInputs.join("、") || "必要输入"}`}</small></div>
+      <div className="satellite-priority"><span>卫星观测优先级</span><strong>{event.priority}</strong><small>用于候选任务排序，不等于灾害影响风险</small></div>
+    </div>
+    <details className="priority-method"><summary>查看卫星优先级构成</summary><p>官方等级 {event.priorityBreakdown.severity} · 重点区域 {event.priorityBreakdown.scope} · 遥感可观测性 {event.priorityBreakdown.observability} · 时效 {event.priorityBreakdown.time} · 数据可信度 {event.priorityBreakdown.confidence ?? 0}</p></details>
+    {effectiveImpactRisk ? <section className="impact-risk-method"><h3>影响风险说明</h3><p>{effectiveImpactRisk.limitations}</p>{effectiveImpactRisk.missingInputs.length ? <small>待补数据：{effectiveImpactRisk.missingInputs.join("、")}</small> : null}</section> : null}
+    <ExposureAssessmentCard event={event} assessment={exposureAssessment} currentUser={currentUser} historicalReadOnly={historicalReadOnly} onChange={onExposureChange} />
+    <EventReviewCard
+      key={`${event.masterEventId}:${reviewState.review?.revision ?? 0}:${historicalReadOnly ? "history" : "live"}`}
+      event={event}
+      review={reviewState.review}
+      history={reviewState.history}
+      loading={reviewState.state === "loading"}
+      loadError={reviewState.state === "error" ? reviewState.message : undefined}
+      currentUser={currentUser}
+      historicalReadOnly={historicalReadOnly}
+      onSaved={(review, history) => setReviewState({ state: "ready", review, history })}
+    />
     <div className={`event-integrity ${event.dispatchEligibility}`}>
       <div><strong>{confidenceLabels[event.confidenceLevel]} {event.confidenceScore}</strong><span>{event.independentSourceCount ?? new Set(event.evidence.map((item) => item.source.split(" · ")[0])).size} 个独立来源 · {event.bulletinCount ?? event.updateCount} 期公告</span></div>
       {event.peakSeverity && event.peakSeverity !== event.severity ? <p><b>当前{severityLabels[event.severity]}</b> · 历史峰值{severityLabels[event.peakSeverity]}</p> : null}
@@ -1994,11 +2141,219 @@ function DetailPanel({ event, nowMs, compact, obscured, dispatchBlocked, locatio
       <div><dt>数据来源</dt><dd>{event.source}</dd></div>
     </dl>
     <a className="source-link" href={safeHttpUrl(event.sourceUrl)} target="_blank" rel="noreferrer">查看权威来源 ↗</a>
-    <button className="response-plan-button" onClick={() => onResponsePlan(event)}>建立处置推演场景</button>
-    {needsAoiReview ? <div className="aoi-approval"><input id={`aoi-confirm-${event.id}`} type="checkbox" checked={aoiConfirmed} onChange={(change) => onConfirmAoi(change.target.checked)} /><label htmlFor={`aoi-confirm-${event.id}`}><strong>人工核对 AOI</strong><small>{!cycloneForecastUsable ? "官方台风报次已不足一小时，不再作为预测 AOI；如需灾后复核，请在地图重新圈定实况 AOI。" : "地图已用绿色虚线显示完整来源几何；确认前请核对目标类型、范围和代表点误差。"}</small></label></div> : null}
-    <button className="task-button" onClick={() => onAddTask(event, aoiConfirmed)} disabled={taskAdded || !canSaveCandidate}>{taskAdded ? "已加入卫星任务候选" : isDemo ? "演示事件不能建立任务" : !taskWindowValid ? "观测期不足一小时，不能建立任务" : canEnterDispatchReview ? "加入卫星任务候选" : "保存为候选草稿"}</button>
+    <button className="response-plan-button" disabled={historicalReadOnly} onClick={() => onResponsePlan(event)}>{historicalReadOnly ? "历史重演不可建立推演" : "建立处置推演场景"}</button>
+    {needsAoiReview ? <div className="aoi-approval"><input id={`aoi-confirm-${event.id}`} type="checkbox" checked={aoiConfirmed} disabled={historicalReadOnly} onChange={(change) => onConfirmAoi(change.target.checked)} /><label htmlFor={`aoi-confirm-${event.id}`}><strong>人工核对 AOI</strong><small>{historicalReadOnly ? "历史重演为只读；返回实时后再确认任务 AOI。" : !cycloneForecastUsable ? "官方台风报次已不足一小时，不再作为预测 AOI；如需灾后复核，请在地图重新圈定实况 AOI。" : "地图已用绿色虚线显示完整来源几何；确认前请核对目标类型、范围和代表点误差。"}</small></label></div> : null}
+    <button className="task-button" onClick={() => onAddTask(event, aoiConfirmed)} disabled={taskAdded || !canSaveCandidate}>{historicalReadOnly ? "历史重演不可建立任务" : taskAdded ? "已加入卫星任务候选" : isDemo ? "演示事件不能建立任务" : !taskWindowValid ? "观测期不足一小时，不能建立任务" : canEnterDispatchReview ? "加入卫星任务候选" : "保存为候选草稿"}</button>
     {!canEnterDispatchReview && canSaveCandidate ? <small className="task-candidate-note">当前可先保存候选草稿；完成 AOI 复核且数据恢复实时后，才能计算、导出或进入下发复核。</small> : null}
   </aside>;
+}
+
+function ExposureAssessmentCard({ event, assessment, currentUser, historicalReadOnly, onChange }: {
+  event: DisasterEvent;
+  assessment?: ExposureAssessment;
+  currentUser?: { username: string; role: "viewer" | "operator" | "admin" };
+  historicalReadOnly: boolean;
+  onChange: (assessment?: ExposureAssessment) => void;
+}) {
+  const [loading, setLoading] = useState(!historicalReadOnly);
+  const [computing, setComputing] = useState(false);
+  const [error, setError] = useState("");
+  const [stale, setStale] = useState(false);
+  const onChangeRef = useRef(onChange);
+  useEffect(() => { onChangeRef.current = onChange; }, [onChange]);
+  useEffect(() => {
+    if (historicalReadOnly) return;
+    const controller = new AbortController();
+    void fetch(`/api/exposure?masterEventId=${encodeURIComponent(event.masterEventId)}`, { cache: "no-store", signal: controller.signal })
+      .then(async (response) => {
+        const result = await response.json().catch(() => ({})) as { assessment?: ExposureAssessment | null; stale?: boolean; error?: string };
+        if (!response.ok) throw new Error(result.error || `暴露度记录读取失败（HTTP ${response.status}）`);
+        const versionMismatch = Boolean(result.assessment && result.assessment.eventRevision !== eventRevisionFingerprint(event));
+        setStale(Boolean(result.stale) || versionMismatch);
+        onChangeRef.current(versionMismatch ? undefined : result.assessment ?? undefined);
+      })
+      .catch((loadError) => {
+        if (!controller.signal.aborted) setError(loadError instanceof Error ? loadError.message : "暴露度记录读取失败");
+      })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, [event, historicalReadOnly]);
+
+  const compute = async () => {
+    if (historicalReadOnly || computing) return;
+    setComputing(true);
+    setError("");
+    try {
+      const response = await fetch("/api/exposure", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ masterEventId: event.masterEventId, force: Boolean(assessment && assessment.status !== "pending") }),
+      });
+      const result = await response.json().catch(() => ({})) as { assessment?: ExposureAssessment; error?: string };
+      if (!response.ok || !result.assessment) throw new Error(result.error || `暴露度计算失败（HTTP ${response.status}）`);
+      if (result.assessment.eventRevision !== eventRevisionFingerprint(event)) {
+        setStale(true);
+        onChangeRef.current(undefined);
+        throw new Error("事件在计算期间已更新，请刷新事件后重新计算");
+      }
+      setStale(false);
+      onChangeRef.current(result.assessment);
+    } catch (computeError) {
+      setError(computeError instanceof Error ? computeError.message : "暴露度计算失败");
+    } finally {
+      setComputing(false);
+    }
+  };
+
+  const canCompute = !historicalReadOnly && (currentUser?.role === "operator" || currentUser?.role === "admin");
+  const population = assessment?.population;
+  const osm = assessment?.osm;
+  return <section className="exposure-card" aria-labelledby={`exposure-title-${event.id}`}>
+    <div className="exposure-heading">
+      <div><h3 id={`exposure-title-${event.id}`}>人口与承灾体暴露</h3><small>WorldPop 人口模型 · OpenStreetMap 已映射要素</small></div>
+      <span className={`exposure-status ${assessment?.status ?? "unavailable"}`}>{loading ? "读取中" : exposureStatusLabel(assessment?.status)}</span>
+    </div>
+    {historicalReadOnly ? <p className="exposure-notice">历史重演不读取当前暴露度数据；只有随快照保存的结果才能用于历史复盘。</p> : null}
+    {stale ? <p className="exposure-warning">事件范围或版本已更新，旧暴露度结果已隐藏，请重新计算。</p> : null}
+    {assessment ? <>
+      <div className="exposure-metrics">
+        <div><span>模型人口</span><strong>{population?.state === "ready" && population.totalPopulation !== undefined ? Math.round(population.totalPopulation).toLocaleString() : "—"}</strong><small>{population?.state === "ready" ? `${population.year} 年 · ${population.resolution} · ${Math.round(population.populationDensityPerKm2 ?? 0).toLocaleString()} 人/km²` : population?.message}</small></div>
+        <div><span>已映射建筑</span><strong>{osm?.state === "ready" ? osm.mappedBuildingCount?.toLocaleString() : "—"}</strong><small>OSM building 轮廓数，不是受损建筑数</small></div>
+        <div><span>已映射道路</span><strong>{osm?.state === "ready" ? osm.mappedRoadWayCount?.toLocaleString() : "—"}</strong><small>OSM highway way 数，不代表里程或通行状态</small></div>
+        <div><span>关键设施</span><strong>{osm?.state === "ready" ? osm.mappedKeyFacilityCount?.toLocaleString() : "—"}</strong><small>{osm?.facilitiesTruncated ? `地图仅显示前 ${osm.facilities.length} 个` : "地图显示可定位设施"}</small></div>
+      </div>
+      {osm?.state === "ready" && Object.keys(osm.facilityCounts).length ? <div className="exposure-facility-summary">{(Object.entries(osm.facilityCounts) as Array<[ExposureFacilityKind, number]>).map(([kind, count]) => <span key={kind}><i style={{ background: exposureFacilityColor(kind) }} />{exposureFacilityKindLabel(kind)} {count}</span>)}</div> : null}
+      <dl className="exposure-provenance">
+        <div><dt>筛查范围</dt><dd>{assessment.aoi.label} · {Math.round(assessment.aoi.areaKm2).toLocaleString()} km²</dd></div>
+        <div><dt>自动指数</dt><dd>{assessment.riskInput ? `${assessment.riskInput.index}/100（可由人工研判覆盖）` : "未生成"}</dd></div>
+        <div><dt>计算时间</dt><dd>{formatTimeWithYear(assessment.computedAt)} UTC+08</dd></div>
+        {osm?.osmBaseTimestamp ? <div><dt>OSM 数据时点</dt><dd>{formatTimeWithYear(osm.osmBaseTimestamp)} UTC+08</dd></div> : null}
+      </dl>
+      {assessment.riskInput ? <p className="exposure-risk-basis"><strong>自动指数依据：</strong>{assessment.riskInput.basis}</p> : null}
+      {population ? <p className={`exposure-source-state ${population.state}`}>WorldPop：{population.message}</p> : null}
+      {osm ? <p className={`exposure-source-state ${osm.state}`}>OSM：{osm.message}</p> : null}
+      <details className="exposure-limitations"><summary>查看口径与限制</summary>{assessment.limitations.map((item) => <p key={item}>{item}</p>)}<p>自动暴露度只参与初筛排序；没有脆弱性模型时，系统仍不会生成综合影响风险分数。</p></details>
+      <div className="exposure-links"><a href="https://api.worldpop.org/v2/" target="_blank" rel="noreferrer">WorldPop API ↗</a><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors ↗</a></div>
+    </> : !loading && !historicalReadOnly ? <p className="exposure-empty">尚未计算。系统会按事件范围查询人口模型，并筛查已映射的建筑、道路和关键设施。</p> : null}
+    {canCompute ? <button className="exposure-compute" disabled={computing} onClick={() => void compute()}>{computing ? "正在查询外部数据…" : assessment?.status === "pending" ? "继续查询人口任务" : assessment ? "重新计算暴露度" : "计算暴露度并叠加地图"}</button> : !historicalReadOnly ? <small className="exposure-readonly">当前账号可查看已有结果；计算需要操作员权限。</small> : null}
+    {error ? <p className="exposure-error" role="alert">{error}</p> : null}
+  </section>;
+}
+
+function exposureStatusLabel(status: ExposureAssessment["status"] | undefined) {
+  return status === "complete" ? "完整" : status === "partial" ? "部分可用" : status === "pending" ? "计算中" : status === "unavailable" ? "不可用" : "未计算";
+}
+
+function exposureFacilityColor(kind: ExposureFacilityKind) {
+  return { health: "#d5414a", emergency: "#ee7d22", shelter: "#16866c", education: "#6f57b5", power: "#d2a100", water: "#087fa1" }[kind];
+}
+
+function impactRiskLabel(level: NonNullable<DisasterEvent["impactRisk"]>["level"]) {
+  return level === "very_high" ? "极高" : level === "high" ? "高" : level === "moderate" ? "中" : level === "low" ? "低" : "待评估";
+}
+
+function EventReviewCard({ event, review, history, loading, loadError, currentUser, historicalReadOnly, onSaved }: {
+  event: DisasterEvent;
+  review: EventReviewSummary | null;
+  history: EventReviewHistoryEntry[];
+  loading: boolean;
+  loadError?: string;
+  currentUser?: { username: string; role: "viewer" | "operator" | "admin" };
+  historicalReadOnly: boolean;
+  onSaved: (review: EventReviewSummary, history: EventReviewHistoryEntry[]) => void;
+}) {
+  const [status, setStatus] = useState<EventReviewStatus>(review?.status ?? "pending");
+  const [assignee, setAssignee] = useState(review?.assignee || currentUser?.username || "");
+  const [conclusion, setConclusion] = useState(review?.conclusion ?? "");
+  const [exposureIndex, setExposureIndex] = useState<number | "">(review?.exposure?.index ?? "");
+  const [exposureBasis, setExposureBasis] = useState(review?.exposure?.basis ?? "");
+  const [vulnerabilityIndex, setVulnerabilityIndex] = useState<number | "">(review?.vulnerability?.index ?? "");
+  const [vulnerabilityBasis, setVulnerabilityBasis] = useState(review?.vulnerability?.basis ?? "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const canEdit = !historicalReadOnly && (currentUser?.role === "operator" || currentUser?.role === "admin");
+  const alertNeedsAcknowledgement = ["orange", "red"].includes(event.severity) && !review?.alertAcknowledgedCurrent;
+  const conclusionRequired = ["verified", "rejected", "closed"].includes(status);
+  const partialExposure = (exposureIndex === "") !== !exposureBasis.trim();
+  const partialVulnerability = (vulnerabilityIndex === "") !== !vulnerabilityBasis.trim();
+  const invalidDraft = partialExposure || partialVulnerability || (conclusionRequired && conclusion.trim().length < 5);
+
+  const optionalRiskInput = (index: number | "", basis: string): ReviewRiskInput | null => index === "" && !basis.trim()
+    ? null
+    : { index: Number(index), basis: basis.trim() };
+
+  const save = async (acknowledgeAlert = false) => {
+    if (!canEdit || invalidDraft) return;
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch("/api/reviews", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          masterEventId: event.masterEventId,
+          expectedRevision: review?.revision ?? 0,
+          eventRevision: eventRevisionFingerprint(event),
+          status,
+          assignee,
+          conclusion,
+          exposure: optionalRiskInput(exposureIndex, exposureBasis),
+          vulnerability: optionalRiskInput(vulnerabilityIndex, vulnerabilityBasis),
+          acknowledgeAlert,
+        }),
+      });
+      const result = await response.json().catch(() => ({})) as { review?: EventReviewSummary; history?: EventReviewHistoryEntry[]; error?: string };
+      if (!response.ok || !result.review) throw new Error(result.error || `研判保存失败（HTTP ${response.status}）`);
+      onSaved(result.review, result.history ?? []);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : "研判保存失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return <section className="event-review-card" aria-labelledby={`review-title-${event.id}`}>
+    <div className="event-review-heading">
+      <div><h3 id={`review-title-${event.id}`}>值守研判</h3><small>共享记录 · 版本 {review?.revision ?? 0}</small></div>
+      <span className={`review-status ${review?.status ?? "pending"}`}>{eventReviewStatusLabel(review?.status ?? "pending")}</span>
+    </div>
+    {historicalReadOnly ? <p className="review-notice">这是快照采集时的研判记录，只读展示；不会读取当前实时研判。</p> : null}
+    {review?.stale ? <p className="review-warning" role="alert">事件来源已更新，现有结论基于旧版本。请核对最新证据后重新保存。</p> : null}
+    {alertNeedsAcknowledgement ? <div className="alert-acknowledgement"><span>本轮{severityLabels[event.severity]}告警尚未由值守人员确认收到。</span>{canEdit ? <button disabled={busy || invalidDraft} onClick={() => void save(true)}>确认收到</button> : null}</div> : review?.alertAcknowledgedCurrent ? <p className="alert-acknowledged">已由 {review.alertAcknowledgedBy} 于 {formatTimeWithYear(review.alertAcknowledgedAt!)} UTC+08 确认本轮告警。</p> : null}
+    {loading ? <p className="review-loading">正在读取研判记录…</p> : null}
+    {loadError ? <p className="review-error" role="alert">{loadError}</p> : null}
+    <div className="review-form">
+      <label>研判状态<select value={status} disabled={!canEdit || busy} onChange={(change) => setStatus(change.target.value as EventReviewStatus)}>
+        <option value="pending">待研判</option><option value="reviewing">研判中</option><option value="monitoring">持续监测</option><option value="verified">已确认</option><option value="rejected">已驳回</option><option value="closed">已结束</option>
+      </select></label>
+      <label>负责人<input value={assignee} disabled={!canEdit || busy} maxLength={120} placeholder="值守人或小组" onChange={(change) => setAssignee(change.target.value)} /></label>
+      <div className="review-risk-input">
+        <label>暴露度指数<input type="number" min="0" max="100" step="1" inputMode="numeric" value={exposureIndex} disabled={!canEdit || busy} placeholder="0–100" onChange={(change) => setExposureIndex(boundedReviewIndex(change.target.value))} /></label>
+        <label>暴露度依据<input value={exposureBasis} disabled={!canEdit || busy} maxLength={500} placeholder="人口、建筑或关键设施数据来源" onChange={(change) => setExposureBasis(change.target.value)} /></label>
+      </div>
+      <div className="review-risk-input">
+        <label>脆弱性指数<input type="number" min="0" max="100" step="1" inputMode="numeric" value={vulnerabilityIndex} disabled={!canEdit || busy} placeholder="0–100" onChange={(change) => setVulnerabilityIndex(boundedReviewIndex(change.target.value))} /></label>
+        <label>脆弱性依据<input value={vulnerabilityBasis} disabled={!canEdit || busy} maxLength={500} placeholder="分灾种脆弱性曲线或专家依据" onChange={(change) => setVulnerabilityBasis(change.target.value)} /></label>
+      </div>
+      <small className="risk-input-note">指数不会自动冒充实测结果。每个指数必须同时填写数据来源或专家依据；两项齐全后才生成影响风险初筛分。</small>
+      <label>研判结论<textarea value={conclusion} disabled={!canEdit || busy} maxLength={2000} rows={3} placeholder={conclusionRequired ? "确认、驳回或结束时必须写明理由" : "记录证据判断、疑点和下一复核点"} onChange={(change) => setConclusion(change.target.value)} /></label>
+      {partialExposure || partialVulnerability ? <small className="review-validation">指数和依据必须成对填写，也可以同时留空。</small> : null}
+      {conclusionRequired && conclusion.trim().length < 5 ? <small className="review-validation">当前状态必须填写至少5个字的研判结论。</small> : null}
+      {canEdit ? <button className="review-save" disabled={busy || invalidDraft} onClick={() => void save(false)}>{busy ? "正在保存…" : review ? "保存研判新版本" : "建立研判记录"}</button> : <small className="review-readonly">当前账号只有查看权限。</small>}
+      {error ? <p className="review-error" role="alert">{error}</p> : null}
+    </div>
+    {history.length ? <details className="review-history"><summary>操作记录 · {history.length} 条</summary>{history.map((entry) => <div key={entry.revision}><b>v{entry.revision} · {reviewActionLabel(entry.action)}</b><span>{eventReviewStatusLabel(entry.toStatus)} · {entry.actor}</span><time>{formatTimeWithYear(entry.changedAt)} UTC+08</time></div>)}</details> : null}
+  </section>;
+}
+
+function reviewActionLabel(action: string) {
+  return action === "create_review" ? "建立研判" : action === "transition_review" ? "变更状态" : action === "acknowledge_and_review" ? "确认告警并保存" : "更新研判";
+}
+
+function boundedReviewIndex(value: string): number | "" {
+  if (!value) return "";
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(0, Math.min(100, Math.round(parsed))) : "";
 }
 
 function LandslidePlanningCard({ event, terrain, templateCount, taskAllowed, onTerrainChange, onAddTasks }: { event: DisasterEvent; terrain?: LandslideTerrainScreening; templateCount: number; taskAllowed: boolean; onTerrainChange: (terrain?: LandslideTerrainScreening) => void; onAddTasks: (terrain: LandslideTerrainScreening) => void }) {

@@ -1,0 +1,319 @@
+import type { DisasterEvent, EventGeometry, HazardType } from "./disasters.ts";
+import { aoiFingerprint, eventRevisionFingerprint } from "./event-integrity.ts";
+import { normalizeAntimeridianGeometry, validateGeoGeometry } from "./geo-geometry.ts";
+
+export const exposureAssessmentModelVersion = "tianxun-exposure-screening-v1" as const;
+export const maximumWorldPopAreaKm2 = 50_000;
+export const maximumOverpassAreaKm2 = 2_500;
+
+export type ExposureFacilityKind = "health" | "emergency" | "shelter" | "education" | "power" | "water";
+
+export type ExposureFacility = {
+  id: string;
+  kind: ExposureFacilityKind;
+  name: string;
+  latitude: number;
+  longitude: number;
+  osmType: "node" | "way" | "relation";
+  osmId: number;
+};
+
+export type ExposureAoi = {
+  geometry: EventGeometry;
+  areaKm2: number;
+  bbox: [number, number, number, number];
+  basis: "official_event_geometry" | "official_cyclone_impact" | "derived_screening_buffer";
+  label: string;
+  crossesAntimeridian: boolean;
+};
+
+export type PopulationExposure = {
+  state: "ready" | "pending" | "skipped" | "unavailable";
+  provider: "WorldPop";
+  year: number;
+  resolution: "100m" | "1km";
+  taskId?: string;
+  totalPopulation?: number;
+  populationDensityPerKm2?: number;
+  dataSource?: string;
+  processingTimeMs?: number;
+  message: string;
+};
+
+export type OsmExposure = {
+  state: "ready" | "skipped" | "unavailable";
+  provider: "OpenStreetMap · Overpass";
+  mappedBuildingCount?: number;
+  mappedRoadWayCount?: number;
+  mappedKeyFacilityCount?: number;
+  facilityCounts: Partial<Record<ExposureFacilityKind, number>>;
+  facilities: ExposureFacility[];
+  facilitiesTruncated: boolean;
+  osmBaseTimestamp?: string;
+  fetchedAt?: string;
+  message: string;
+};
+
+export type ExposureAssessment = {
+  masterEventId: string;
+  eventRevision: string;
+  aoiHash: string;
+  status: "complete" | "partial" | "pending" | "unavailable";
+  aoi: ExposureAoi;
+  population: PopulationExposure;
+  osm: OsmExposure;
+  riskInput: { index: number; basis: string } | null;
+  computedAt: string;
+  expiresAt: string;
+  updatedBy: string;
+  limitations: string[];
+  modelVersion: typeof exposureAssessmentModelVersion;
+};
+
+export type OverpassExposureResult = Omit<OsmExposure, "state" | "provider" | "message" | "fetchedAt">;
+
+const derivedRadiusKm: Record<HazardType, number> = {
+  earthquake: 30,
+  tsunami: 50,
+  wildfire: 10,
+  flood: 25,
+  cyclone: 100,
+  volcano: 20,
+  landslide: 10,
+  drought: 100,
+  dust: 100,
+  ice: 50,
+};
+
+export function buildExposureAoi(event: DisasterEvent): ExposureAoi {
+  const preferred = event.cycloneForecast?.impactGeometry ?? event.geometry;
+  const polygonal = preferred.type === "Polygon" || preferred.type === "MultiPolygon" ? normalizeAntimeridianGeometry(preferred) : null;
+  if (polygonal) {
+    const validation = validateGeoGeometry(polygonal, { maximumAreaKm2: 25_000_000, maximumVertices: 20_000, maximumRingVertices: 5_000, allowOverlappingMultiPolygon: true });
+    if (validation.ok) {
+      return {
+        geometry: polygonal,
+        areaKm2: validation.areaKm2,
+        bbox: geometryBbox(polygonal),
+        basis: event.cycloneForecast?.impactGeometry === preferred ? "official_cyclone_impact" : "official_event_geometry",
+        label: event.cycloneForecast?.impactGeometry === preferred ? "官方台风影响范围" : "来源事件范围",
+        crossesAntimeridian: validation.crossesAntimeridian,
+      };
+    }
+  }
+
+  const accuracy = Number.isFinite(event.locationAccuracyKm) ? Math.max(0, event.locationAccuracyKm) : 0;
+  const radiusKm = Math.min(200, Math.max(derivedRadiusKm[event.hazard], accuracy));
+  const geometry = circlePolygon(event.longitude, event.latitude, radiusKm, 48);
+  const validation = validateGeoGeometry(geometry, { maximumAreaKm2: 200_000, maximumVertices: 100 });
+  if (!validation.ok) throw new Error(validation.reason || "无法建立暴露度筛查范围");
+  return {
+    geometry,
+    areaKm2: validation.areaKm2,
+    bbox: geometryBbox(geometry),
+    basis: "derived_screening_buffer",
+    label: `事件代表点 ${radiusKm} km 筛查缓冲区（非官方影响边界）`,
+    crossesAntimeridian: validation.crossesAntimeridian,
+  };
+}
+
+export function exposureAssessmentIdentity(event: DisasterEvent) {
+  const aoi = buildExposureAoi(event);
+  return { aoi, eventRevision: eventRevisionFingerprint(event), aoiHash: aoiFingerprint(aoi.geometry) };
+}
+
+export function worldPopRequestPlan(aoi: ExposureAoi, requestedYear = new Date().getUTCFullYear()) {
+  const year = Math.max(2015, Math.min(2030, Math.round(requestedYear)));
+  const resolution = aoi.areaKm2 <= 10_000 ? "100m" as const : "1km" as const;
+  if (aoi.crossesAntimeridian) return { state: "skipped" as const, year, resolution, message: "范围跨越日期变更线，未向 WorldPop 提交可能改变面积的查询" };
+  if (aoi.areaKm2 > maximumWorldPopAreaKm2) return { state: "skipped" as const, year, resolution, message: `范围 ${Math.round(aoi.areaKm2).toLocaleString()} km² 超过 WorldPop 单次 50,000 km² 上限` };
+  return { state: "ready" as const, year, resolution, payload: { geojson: aoi.geometry, year, resolution } };
+}
+
+export function prepareOverpassExposureQuery(aoi: ExposureAoi) {
+  if (aoi.crossesAntimeridian) return { state: "skipped" as const, message: "范围跨越日期变更线，公共 Overpass 矩形查询未执行" };
+  if (aoi.areaKm2 > maximumOverpassAreaKm2) return { state: "skipped" as const, message: `范围 ${Math.round(aoi.areaKm2).toLocaleString()} km² 超过公共 Overpass 保守查询上限 2,500 km²` };
+  const polygons = outerPolygonRings(aoi.geometry);
+  const polygonVertexCount = polygons.reduce((sum, ring) => sum + ring.length, 0);
+  if (!polygons.length || polygons.length > 12 || polygonVertexCount > 400) return { state: "skipped" as const, message: "AOI 分块或顶点过多，未向公共 Overpass 提交高负载查询" };
+  const polygonFilters = polygons.map((ring) => `(poly:"${ring.map(([longitude, latitude]) => `${latitude.toFixed(6)} ${longitude.toFixed(6)}`).join(" ")}")`);
+  const facilityAmenity = "hospital|clinic|doctors|pharmacy|fire_station|police|school|kindergarten|college|university|shelter|community_centre";
+  const selectors = (prefix: string, suffix = "") => polygonFilters.map((filter) => `  ${prefix}${filter}${suffix};`).join("\n");
+  return {
+    state: "ready" as const,
+    bbox: aoi.bbox,
+    queryBasis: "AOI 外环多边形筛查；内洞暂不从公共 OSM 查询中扣除" as const,
+    query: `[out:json][timeout:15];\n(\n${selectors("way[\"building\"]")}\n)->.buildings;\n(\n${selectors("way[\"highway\"]")}\n)->.roads;\n(\n${selectors(`nwr["amenity"~"^(${facilityAmenity})$"]`)}\n${selectors("nwr[\"emergency\"=\"ambulance_station\"]")}\n${selectors("nwr[\"power\"~\"^(plant|substation)$\"]")}\n${selectors("nwr[\"man_made\"~\"^(water_works|wastewater_plant|pumping_station)$\"]")}\n)->.facilities;\n.buildings out count;\n.roads out count;\n.facilities out count;\n.facilities out center qt 300;`,
+  };
+}
+
+export function parseOverpassExposure(payload: unknown): OverpassExposureResult {
+  if (!payload || typeof payload !== "object" || !Array.isArray((payload as { elements?: unknown }).elements)) throw new Error("Overpass 响应结构无效");
+  const record = payload as { osm3s?: { timestamp_osm_base?: unknown }; elements: Array<Record<string, unknown>> };
+  const countElements = record.elements.filter((element) => element.type === "count");
+  const mappedBuildingCount = countTotal(countElements[0]);
+  const mappedRoadWayCount = countTotal(countElements[1]);
+  const mappedKeyFacilityCount = countTotal(countElements[2]);
+  if ([mappedBuildingCount, mappedRoadWayCount, mappedKeyFacilityCount].some((value) => value === null)) throw new Error("Overpass 统计响应缺少建筑、道路或设施计数");
+  const facilities = record.elements.flatMap((element) => overpassFacility(element));
+  const unique = [...new Map(facilities.map((facility) => [facility.id, facility])).values()];
+  const facilityCounts: Partial<Record<ExposureFacilityKind, number>> = {};
+  for (const facility of unique) facilityCounts[facility.kind] = (facilityCounts[facility.kind] ?? 0) + 1;
+  return {
+    mappedBuildingCount: mappedBuildingCount!,
+    mappedRoadWayCount: mappedRoadWayCount!,
+    mappedKeyFacilityCount: mappedKeyFacilityCount!,
+    facilityCounts,
+    facilities: unique,
+    facilitiesTruncated: mappedKeyFacilityCount! > unique.length,
+    osmBaseTimestamp: typeof record.osm3s?.timestamp_osm_base === "string" ? record.osm3s.timestamp_osm_base : undefined,
+  };
+}
+
+export function parseWorldPopTask(payload: unknown, year: number, resolution: "100m" | "1km", priorTaskId?: string): PopulationExposure {
+  if (!payload || typeof payload !== "object") throw new Error("WorldPop 响应结构无效");
+  const value = payload as Record<string, unknown>;
+  const taskId = textValue(value.task_id) || textValue(value.taskId) || priorTaskId;
+  const status = (textValue(value.status) || textValue(value.state) || "").toLowerCase();
+  const result = objectValue(value.result) ?? objectValue(value.data) ?? value;
+  const totalPopulation = numberValue(result.total_population ?? result.totalPopulation ?? result.population);
+  const density = numberValue(result.population_density ?? result.populationDensity ?? result.density);
+  if (totalPopulation !== null) {
+    return {
+      state: "ready",
+      provider: "WorldPop",
+      year: Math.round(numberValue(result.data_year) ?? year),
+      resolution,
+      taskId,
+      totalPopulation: Math.max(0, totalPopulation),
+      populationDensityPerKm2: density === null ? undefined : Math.max(0, density),
+      dataSource: textValue(result.data_source) || undefined,
+      processingTimeMs: numberValue(result.processing_time_ms) ?? undefined,
+      message: "人口为 WorldPop 指定年份模型估计，不是实时人口或现场普查",
+    };
+  }
+  if (["failed", "error", "cancelled", "canceled"].includes(status)) throw new Error(textValue(value.message) || "WorldPop 任务失败");
+  if (!taskId) throw new Error("WorldPop 响应未返回 task_id 或人口结果");
+  return { state: "pending", provider: "WorldPop", year, resolution, taskId, message: "WorldPop 正在计算；稍后点击继续查询，不会重复提交任务" };
+}
+
+export function exposureRiskInput(population: PopulationExposure, osm: OsmExposure) {
+  if (population.state !== "ready" || population.totalPopulation === undefined) return null;
+  const total = Math.max(0, population.totalPopulation);
+  const density = Math.max(0, population.populationDensityPerKm2 ?? 0);
+  const totalScore = clamp(((Math.log10(total + 1) - 1) / 5) * 100, 0, 100);
+  const densityScore = clamp((Math.log10(density + 1) / 4) * 100, 0, 100);
+  const populationBaseline = Math.min(85, Math.round(totalScore * 0.72 + densityScore * 0.28));
+  const osmContext = osm.state === "ready" ? Math.min(15,
+    Math.min(5, Math.log10((osm.mappedBuildingCount ?? 0) + 1) * 1.5)
+    + Math.min(3, Math.log10((osm.mappedRoadWayCount ?? 0) + 1))
+    + Math.min(7, Math.log10((osm.mappedKeyFacilityCount ?? 0) + 1) * 2.2)) : 0;
+  const index = Math.min(100, Math.round(populationBaseline + osmContext));
+  const osmBasis = osm.state === "ready"
+    ? `；OSM 已映射建筑 ${osm.mappedBuildingCount?.toLocaleString()}、道路 way ${osm.mappedRoadWayCount?.toLocaleString()}、关键设施 ${osm.mappedKeyFacilityCount?.toLocaleString()} 仅作上调背景，不以缺失记录降低指数`
+    : "；OSM 当前不可用或超出查询范围，未作为降低暴露度的依据";
+  return {
+    index,
+    basis: `WorldPop ${population.year} 年模型估计人口 ${Math.round(total).toLocaleString()}，密度 ${Math.round(density).toLocaleString()} 人/km²${osmBasis}`,
+  };
+}
+
+export function exposureAssessmentStatus(population: PopulationExposure, osm: OsmExposure): ExposureAssessment["status"] {
+  if (population.state === "pending") return "pending";
+  if (population.state === "ready" && osm.state === "ready") return "complete";
+  if (population.state === "ready" || osm.state === "ready") return "partial";
+  return "unavailable";
+}
+
+export function exposureFacilityKindLabel(kind: ExposureFacilityKind) {
+  return { health: "医疗", emergency: "应急", shelter: "避难", education: "教育", power: "电力", water: "供排水" }[kind];
+}
+
+function circlePolygon(longitude: number, latitude: number, radiusKm: number, steps: number): EventGeometry {
+  const angular = radiusKm / 6371.0088;
+  const lat1 = latitude * Math.PI / 180;
+  const lon1 = longitude * Math.PI / 180;
+  const ring: Array<[number, number]> = [];
+  for (let index = 0; index < steps; index += 1) {
+    const bearing = index / steps * Math.PI * 2;
+    const lat2 = Math.asin(Math.sin(lat1) * Math.cos(angular) + Math.cos(lat1) * Math.sin(angular) * Math.cos(bearing));
+    const lon2 = lon1 + Math.atan2(Math.sin(bearing) * Math.sin(angular) * Math.cos(lat1), Math.cos(angular) - Math.sin(lat1) * Math.sin(lat2));
+    ring.push([normalizeLongitude(lon2 * 180 / Math.PI), lat2 * 180 / Math.PI]);
+  }
+  ring.push([...ring[0]]);
+  const raw: EventGeometry = { type: "Polygon", coordinates: [ring] };
+  return normalizeAntimeridianGeometry(raw) ?? raw;
+}
+
+function geometryBbox(geometry: EventGeometry): [number, number, number, number] {
+  const points: Array<[number, number]> = [];
+  const visit = (value: unknown) => {
+    if (!Array.isArray(value)) return;
+    if (value.length >= 2 && Number.isFinite(Number(value[0])) && Number.isFinite(Number(value[1]))) {
+      points.push([Number(value[0]), Number(value[1])]);
+      return;
+    }
+    value.forEach(visit);
+  };
+  visit(geometry.coordinates);
+  if (!points.length) throw new Error("暴露度范围没有有效坐标");
+  return [Math.min(...points.map(([lon]) => lon)), Math.min(...points.map(([, lat]) => lat)), Math.max(...points.map(([lon]) => lon)), Math.max(...points.map(([, lat]) => lat))];
+}
+
+function outerPolygonRings(geometry: EventGeometry): Array<Array<[number, number]>> {
+  if (geometry.type === "Polygon") return [(geometry.coordinates as Array<Array<[number, number]>>)[0] ?? []];
+  if (geometry.type === "MultiPolygon") return (geometry.coordinates as Array<Array<Array<[number, number]>>>).map((polygon) => polygon[0] ?? []);
+  return [];
+}
+
+function overpassFacility(element: Record<string, unknown>): ExposureFacility[] {
+  const type = element.type;
+  const osmId = numberValue(element.id);
+  if (!(["node", "way", "relation"].includes(String(type))) || osmId === null) return [];
+  const tags = objectValue(element.tags) ?? {};
+  const center = objectValue(element.center);
+  const latitude = numberValue(element.lat) ?? numberValue(center?.lat);
+  const longitude = numberValue(element.lon) ?? numberValue(center?.lon);
+  if (latitude === null || longitude === null || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return [];
+  const kind = facilityKind(tags);
+  if (!kind) return [];
+  const name = textValue(tags["name:zh"]) || textValue(tags.name) || textValue(tags.operator) || `${exposureFacilityKindLabel(kind)}设施`;
+  return [{ id: `osm-${type}-${osmId}`, kind, name: name.slice(0, 160), latitude, longitude, osmType: type as ExposureFacility["osmType"], osmId }];
+}
+
+function facilityKind(tags: Record<string, unknown>): ExposureFacilityKind | null {
+  const amenity = textValue(tags.amenity);
+  if (["hospital", "clinic", "doctors", "pharmacy"].includes(amenity)) return "health";
+  if (["fire_station", "police"].includes(amenity) || textValue(tags.emergency) === "ambulance_station") return "emergency";
+  if (["shelter", "community_centre"].includes(amenity)) return "shelter";
+  if (["school", "kindergarten", "college", "university"].includes(amenity)) return "education";
+  if (["plant", "substation"].includes(textValue(tags.power))) return "power";
+  if (["water_works", "wastewater_plant", "pumping_station"].includes(textValue(tags.man_made))) return "water";
+  return null;
+}
+
+function countTotal(element: Record<string, unknown> | undefined) {
+  const tags = objectValue(element?.tags);
+  return numberValue(tags?.total);
+}
+
+function objectValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function textValue(value: unknown) {
+  return typeof value === "string" ? value.trim() : typeof value === "number" ? String(value) : "";
+}
+
+function numberValue(value: unknown) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function clamp(value: number, minimum: number, maximum: number) {
+  return Math.max(minimum, Math.min(maximum, value));
+}
+
+function normalizeLongitude(value: number) {
+  return ((value + 540) % 360) - 180;
+}

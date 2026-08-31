@@ -6,6 +6,9 @@ import { createPlanningScenarioRecord, planningScenarioHasValidChecksum, plannin
 import { canTransitionTask } from "../lib/task-contract.ts";
 import { compareEventVersionFreshness, eventHasInvalidIdentity, isValidSourceEventId } from "../lib/event-integrity.ts";
 import { evidenceReassignmentSql } from "../lib/operational-sql.ts";
+import type { SourceGovernance, SourceRole, SourceTier } from "../lib/source-governance.ts";
+import { canTransitionEventReview, eventReviewStatuses, type EventReviewHistoryEntry, type EventReviewRecord, type EventReviewStatus, type ReviewRiskInput } from "../lib/event-review.ts";
+import type { ExposureAssessment } from "../lib/exposure-assessment.ts";
 
 type TaskRecord = Record<string, unknown> & {
   taskId: string;
@@ -36,6 +39,89 @@ export type WebSessionRecord = {
   createdAt: string;
   lastSeenAt: string;
   expiresAt: string;
+};
+
+export type SourceRegistryInput = SourceGovernance & {
+  name: string;
+  tier: SourceTier;
+  role: SourceRole;
+  setupUrl: string;
+  state: "online" | "offline" | "needs_config";
+  lastAttemptAt: string;
+  durationMs: number;
+  count: number;
+  message: string;
+};
+
+export type SourceFetchCapture = {
+  runId: string;
+  refreshId: string;
+  sourceId: string;
+  requestedUrl: string;
+  fetchedAt: string;
+  durationMs: number;
+  httpStatus: number | null;
+  ok: boolean;
+  payloadSha256: string | null;
+  contentType: string;
+  bodyText: string;
+  byteLength: number;
+  storedByteLength: number;
+  truncated: boolean;
+  errorMessage: string | null;
+};
+
+export type IngestionSnapshotRecord = {
+  snapshotId: string;
+  refreshId: string;
+  capturedAt: string;
+  payloadSha256: string;
+  eventCount: number;
+  sourceCount: number;
+  payload: Record<string, unknown>;
+};
+
+type EventReviewRow = {
+  master_event_id: string;
+  status: string;
+  assignee: string;
+  conclusion: string;
+  exposure_index: number | null;
+  exposure_basis: string | null;
+  vulnerability_index: number | null;
+  vulnerability_basis: string | null;
+  alert_acknowledged_at: string | null;
+  alert_acknowledged_by: string | null;
+  alert_acknowledged_version: string | null;
+  event_revision: string;
+  revision: number;
+  updated_at: string;
+  updated_by: string;
+};
+
+type EventExposureAssessmentRow = {
+  master_event_id: string;
+  event_revision: string;
+  aoi_hash: string;
+  status: string;
+  payload_json: string;
+  computed_at: string;
+  expires_at: string;
+  updated_by: string;
+};
+
+export type EventReviewSaveInput = {
+  masterEventId: string;
+  status: EventReviewStatus;
+  assignee: string;
+  conclusion: string;
+  exposure: ReviewRiskInput | null;
+  vulnerability: ReviewRiskInput | null;
+  acknowledgeAlert: boolean;
+  alertVersion: string;
+  eventRevision: string;
+  expectedRevision: number;
+  actor: string;
 };
 
 let schemaReady: Promise<void> | null = null;
@@ -179,6 +265,25 @@ export function ensureOperationalSchema() {
     `CREATE TABLE IF NOT EXISTS web_sessions (session_hash TEXT PRIMARY KEY NOT NULL, username TEXT NOT NULL, role TEXT NOT NULL, auth_version TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, expires_at TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS web_sessions_expiry_idx ON web_sessions (expires_at)`,
     `CREATE INDEX IF NOT EXISTS web_sessions_user_seen_idx ON web_sessions (username, last_seen_at)`,
+    `CREATE TABLE IF NOT EXISTS source_registry (source_id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, tier TEXT NOT NULL, role TEXT NOT NULL, authority_class TEXT NOT NULL, setup_url TEXT NOT NULL, poll_interval_minutes INTEGER NOT NULL, latency_slo_minutes INTEGER NOT NULL, update_semantics TEXT NOT NULL, geometry_semantics TEXT NOT NULL, license_note TEXT NOT NULL, state TEXT NOT NULL, last_attempt_at TEXT NOT NULL, last_success_at TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0, last_duration_ms INTEGER NOT NULL DEFAULT 0, last_count INTEGER NOT NULL DEFAULT 0, last_message TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS source_registry_state_idx ON source_registry (state, last_attempt_at)`,
+    `CREATE INDEX IF NOT EXISTS source_registry_success_idx ON source_registry (last_success_at)`,
+    `CREATE TABLE IF NOT EXISTS source_payloads (payload_sha256 TEXT PRIMARY KEY NOT NULL, content_type TEXT NOT NULL, body_text TEXT NOT NULL, byte_length INTEGER NOT NULL, stored_byte_length INTEGER NOT NULL, truncated INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS source_fetch_runs (run_id TEXT PRIMARY KEY NOT NULL, refresh_id TEXT NOT NULL, source_id TEXT NOT NULL, requested_url TEXT NOT NULL, fetched_at TEXT NOT NULL, duration_ms INTEGER NOT NULL, http_status INTEGER, ok INTEGER NOT NULL, payload_sha256 TEXT, error_message TEXT)`,
+    `CREATE INDEX IF NOT EXISTS source_fetch_runs_source_time_idx ON source_fetch_runs (source_id, fetched_at)`,
+    `CREATE INDEX IF NOT EXISTS source_fetch_runs_refresh_idx ON source_fetch_runs (refresh_id)`,
+    `CREATE TABLE IF NOT EXISTS ingestion_snapshots (snapshot_id TEXT PRIMARY KEY NOT NULL, refresh_id TEXT NOT NULL, captured_at TEXT NOT NULL, payload_sha256 TEXT NOT NULL, event_count INTEGER NOT NULL, source_count INTEGER NOT NULL, payload_json TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS ingestion_snapshots_payload_idx ON ingestion_snapshots (payload_sha256)`,
+    `CREATE INDEX IF NOT EXISTS ingestion_snapshots_captured_idx ON ingestion_snapshots (captured_at)`,
+    `CREATE TABLE IF NOT EXISTS event_reviews (master_event_id TEXT PRIMARY KEY NOT NULL, status TEXT NOT NULL, assignee TEXT NOT NULL DEFAULT '', conclusion TEXT NOT NULL DEFAULT '', exposure_index INTEGER, exposure_basis TEXT, vulnerability_index INTEGER, vulnerability_basis TEXT, alert_acknowledged_at TEXT, alert_acknowledged_by TEXT, alert_acknowledged_version TEXT, event_revision TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS event_reviews_status_time_idx ON event_reviews (status, updated_at)`,
+    `CREATE INDEX IF NOT EXISTS event_reviews_assignee_status_idx ON event_reviews (assignee, status)`,
+    `CREATE TABLE IF NOT EXISTS event_review_history (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, master_event_id TEXT NOT NULL, revision INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, from_status TEXT, to_status TEXT NOT NULL, payload_json TEXT NOT NULL, changed_at TEXT NOT NULL)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS event_review_history_event_revision_uidx ON event_review_history (master_event_id, revision)`,
+    `CREATE INDEX IF NOT EXISTS event_review_history_event_time_idx ON event_review_history (master_event_id, changed_at)`,
+    `CREATE TABLE IF NOT EXISTS event_exposure_assessments (master_event_id TEXT PRIMARY KEY NOT NULL, event_revision TEXT NOT NULL, aoi_hash TEXT NOT NULL, status TEXT NOT NULL, payload_json TEXT NOT NULL, computed_at TEXT NOT NULL, expires_at TEXT NOT NULL, updated_by TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS event_exposure_assessments_expiry_idx ON event_exposure_assessments (expires_at, computed_at)`,
+    `CREATE INDEX IF NOT EXISTS event_exposure_assessments_status_idx ON event_exposure_assessments (status, computed_at)`,
   ];
   schemaReady = database().then(async (db) => {
     await db.batch(statements.map((statement) => db.prepare(statement)));
@@ -292,11 +397,208 @@ async function pruneOperationalDataIfDue(db: DatabaseLike, nowMs: number) {
       db.prepare(`DELETE FROM road_disruption_history WHERE changed_at < ? AND EXISTS (SELECT 1 FROM road_disruptions r WHERE r.disruption_id=road_disruption_history.disruption_id AND r.lifecycle_status IN ('resolved','rejected'))`).bind(auditCutoff),
       db.prepare(`DELETE FROM event_tombstones WHERE resolved_at < ? AND NOT EXISTS (SELECT 1 FROM event_evidence e WHERE e.source=event_tombstones.source AND e.source_event_id=event_tombstones.source_event_id)`).bind(auditCutoff),
       db.prepare(`DELETE FROM web_sessions WHERE expires_at <= ?`).bind(expiredSessionCutoff),
+      db.prepare(`DELETE FROM source_fetch_runs WHERE fetched_at < ?`).bind(new Date(nowMs - 30 * 86_400_000).toISOString()),
+      db.prepare(`DELETE FROM source_payloads WHERE created_at < ? AND NOT EXISTS (SELECT 1 FROM source_fetch_runs r WHERE r.payload_sha256=source_payloads.payload_sha256)`).bind(new Date(nowMs - 30 * 86_400_000).toISOString()),
+      db.prepare(`DELETE FROM ingestion_snapshots WHERE captured_at < ?`).bind(new Date(nowMs - 90 * 86_400_000).toISOString()),
     ]);
     lastRetentionPruneAt = nowMs;
   } catch (error) {
     console.error("operational retention prune failed", error);
   }
+}
+
+export async function persistIngestionArtifacts(input: {
+  refreshId: string;
+  sources: SourceRegistryInput[];
+  fetches: SourceFetchCapture[];
+  snapshot: IngestionSnapshotRecord;
+}) {
+  await ensureOperationalSchema();
+  const db = await database();
+  const statements: DatabaseStatement[] = [];
+  for (const source of input.sources) {
+    statements.push(db.prepare(`INSERT INTO source_registry (source_id, name, tier, role, authority_class, setup_url, poll_interval_minutes, latency_slo_minutes, update_semantics, geometry_semantics, license_note, state, last_attempt_at, last_success_at, consecutive_failures, last_duration_ms, last_count, last_message)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ?='online' THEN ? ELSE NULL END, CASE WHEN ?='offline' THEN 1 ELSE 0 END, ?, ?, ?)
+      ON CONFLICT(source_id) DO UPDATE SET name=excluded.name, tier=excluded.tier, role=excluded.role, authority_class=excluded.authority_class, setup_url=excluded.setup_url, poll_interval_minutes=excluded.poll_interval_minutes, latency_slo_minutes=excluded.latency_slo_minutes, update_semantics=excluded.update_semantics, geometry_semantics=excluded.geometry_semantics, license_note=excluded.license_note, state=excluded.state, last_attempt_at=excluded.last_attempt_at, last_success_at=CASE WHEN excluded.state='online' THEN excluded.last_attempt_at ELSE source_registry.last_success_at END, consecutive_failures=CASE WHEN excluded.state='offline' THEN source_registry.consecutive_failures + 1 WHEN excluded.state='online' THEN 0 ELSE source_registry.consecutive_failures END, last_duration_ms=excluded.last_duration_ms, last_count=excluded.last_count, last_message=excluded.last_message`)
+      .bind(source.sourceId, source.name, source.tier, source.role, source.authorityClass, source.setupUrl, source.pollIntervalMinutes, source.latencySloMinutes, source.updateSemantics, source.geometrySemantics, source.licenseNote, source.state, source.lastAttemptAt, source.state, source.lastAttemptAt, source.state, source.durationMs, source.count, source.message));
+  }
+  for (const fetch of input.fetches) {
+    if (fetch.payloadSha256) {
+      statements.push(db.prepare(`INSERT OR IGNORE INTO source_payloads (payload_sha256, content_type, body_text, byte_length, stored_byte_length, truncated, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .bind(fetch.payloadSha256, fetch.contentType, fetch.bodyText, fetch.byteLength, fetch.storedByteLength, fetch.truncated ? 1 : 0, fetch.fetchedAt));
+    }
+    statements.push(db.prepare(`INSERT OR IGNORE INTO source_fetch_runs (run_id, refresh_id, source_id, requested_url, fetched_at, duration_ms, http_status, ok, payload_sha256, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(fetch.runId, fetch.refreshId, fetch.sourceId, fetch.requestedUrl, fetch.fetchedAt, fetch.durationMs, fetch.httpStatus, fetch.ok ? 1 : 0, fetch.payloadSha256, fetch.errorMessage));
+  }
+  const previous = await db.prepare(`SELECT captured_at, payload_sha256 FROM ingestion_snapshots ORDER BY captured_at DESC LIMIT 1`).first<{ captured_at: string; payload_sha256: string }>();
+  const sameRecentSnapshot = previous?.payload_sha256 === input.snapshot.payloadSha256
+    && Date.parse(input.snapshot.capturedAt) - Date.parse(previous.captured_at) < 30 * 60_000;
+  if (!sameRecentSnapshot) {
+    statements.push(db.prepare(`INSERT INTO ingestion_snapshots (snapshot_id, refresh_id, captured_at, payload_sha256, event_count, source_count, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .bind(input.snapshot.snapshotId, input.snapshot.refreshId, input.snapshot.capturedAt, input.snapshot.payloadSha256, input.snapshot.eventCount, input.snapshot.sourceCount, JSON.stringify(input.snapshot.payload)));
+  }
+  // D1 and the local SQLite adapter both support batch, but one refresh can
+  // contain many independent source payloads. Chunking keeps individual D1
+  // requests below practical statement/body limits without making raw archive
+  // persistence part of the canonical-event transaction.
+  for (let index = 0; index < statements.length; index += 24) await db.batch(statements.slice(index, index + 24));
+  await pruneOperationalDataIfDue(db, Date.now());
+}
+
+export async function listSourceRegistry(sourceId?: string, limit = 80) {
+  await ensureOperationalSchema();
+  const db = await database();
+  const sources = await db.prepare(`SELECT source_id AS sourceId, name, tier, role, authority_class AS authorityClass, setup_url AS setupUrl, poll_interval_minutes AS pollIntervalMinutes, latency_slo_minutes AS latencySloMinutes, update_semantics AS updateSemantics, geometry_semantics AS geometrySemantics, license_note AS licenseNote, state, last_attempt_at AS lastAttemptAt, last_success_at AS lastSuccessAt, consecutive_failures AS consecutiveFailures, last_duration_ms AS lastDurationMs, last_count AS lastCount, last_message AS lastMessage FROM source_registry ${sourceId ? "WHERE source_id=?" : ""} ORDER BY tier, name LIMIT ?`)
+    .bind(...(sourceId ? [sourceId, limit] : [limit])).all<Record<string, unknown>>();
+  const runs = sourceId
+    ? await db.prepare(`SELECT run_id AS runId, refresh_id AS refreshId, source_id AS sourceId, requested_url AS requestedUrl, fetched_at AS fetchedAt, duration_ms AS durationMs, http_status AS httpStatus, ok, payload_sha256 AS payloadSha256, error_message AS errorMessage FROM source_fetch_runs WHERE source_id=? ORDER BY fetched_at DESC LIMIT 30`).bind(sourceId).all<Record<string, unknown>>()
+    : { results: [] };
+  return { sources: sources.results, runs: runs.results };
+}
+
+export async function getSourcePayloadPreview(payloadSha256: string) {
+  await ensureOperationalSchema();
+  const db = await database();
+  return db.prepare(`SELECT payload_sha256 AS payloadSha256, content_type AS contentType, body_text AS bodyText, byte_length AS byteLength, stored_byte_length AS storedByteLength, truncated, created_at AS createdAt FROM source_payloads WHERE payload_sha256=?`).bind(payloadSha256).first<Record<string, unknown>>();
+}
+
+export async function getIngestionSnapshot(asOf: string): Promise<IngestionSnapshotRecord | null> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const row = await db.prepare(`SELECT snapshot_id AS snapshotId, refresh_id AS refreshId, captured_at AS capturedAt, payload_sha256 AS payloadSha256, event_count AS eventCount, source_count AS sourceCount, payload_json AS payloadJson FROM ingestion_snapshots WHERE captured_at <= ? ORDER BY captured_at DESC LIMIT 1`).bind(asOf).first<Record<string, unknown>>();
+  if (!row) return null;
+  try {
+    return { snapshotId: String(row.snapshotId), refreshId: String(row.refreshId), capturedAt: String(row.capturedAt), payloadSha256: String(row.payloadSha256), eventCount: Number(row.eventCount), sourceCount: Number(row.sourceCount), payload: JSON.parse(String(row.payloadJson)) as Record<string, unknown> };
+  } catch {
+    return null;
+  }
+}
+
+export async function listIngestionSnapshots(limit = 24) {
+  await ensureOperationalSchema();
+  const db = await database();
+  const rows = await db.prepare(`SELECT snapshot_id AS snapshotId, captured_at AS capturedAt, event_count AS eventCount, source_count AS sourceCount FROM ingestion_snapshots ORDER BY captured_at DESC LIMIT ?`).bind(Math.max(1, Math.min(100, limit))).all<Record<string, unknown>>();
+  return rows.results;
+}
+
+export async function listEventReviews(masterEventIds: string[] = []): Promise<EventReviewRecord[]> {
+  await ensureOperationalSchema();
+  const db = await database();
+  if (masterEventIds.length) {
+    const ids = [...new Set(masterEventIds.map((item) => item.trim()).filter(Boolean))].slice(0, 300);
+    if (!ids.length) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = await db.prepare(`SELECT * FROM event_reviews WHERE master_event_id IN (${placeholders}) ORDER BY updated_at DESC`).bind(...ids).all<EventReviewRow>();
+    return rows.results.map(eventReviewFromRow);
+  }
+  const rows = await db.prepare(`SELECT * FROM event_reviews ORDER BY updated_at DESC LIMIT 500`).all<EventReviewRow>();
+  return rows.results.map(eventReviewFromRow);
+}
+
+export async function getEventReview(masterEventId: string): Promise<EventReviewRecord | null> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const row = await db.prepare(`SELECT * FROM event_reviews WHERE master_event_id = ?`).bind(masterEventId).first<EventReviewRow>();
+  return row ? eventReviewFromRow(row) : null;
+}
+
+export async function listEventReviewHistory(masterEventId: string, limit = 30): Promise<EventReviewHistoryEntry[]> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const boundedLimit = Math.max(1, Math.min(100, Math.floor(limit)));
+  const rows = await db.prepare(`SELECT revision, actor, action, from_status, to_status, payload_json, changed_at FROM event_review_history WHERE master_event_id = ? ORDER BY revision DESC LIMIT ?`)
+    .bind(masterEventId, boundedLimit).all<{ revision: number; actor: string; action: string; from_status: string | null; to_status: string; payload_json: string; changed_at: string }>();
+  return rows.results.flatMap((row) => {
+    try {
+      if (!eventReviewStatuses.includes(row.to_status as EventReviewStatus) || (row.from_status && !eventReviewStatuses.includes(row.from_status as EventReviewStatus))) return [];
+      return [{
+        revision: row.revision,
+        actor: row.actor,
+        action: row.action,
+        fromStatus: row.from_status as EventReviewStatus | null,
+        toStatus: row.to_status as EventReviewStatus,
+        changedAt: row.changed_at,
+        snapshot: JSON.parse(row.payload_json) as EventReviewRecord,
+      }];
+    } catch {
+      return [];
+    }
+  });
+}
+
+export async function saveEventReview(input: EventReviewSaveInput): Promise<EventReviewRecord> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const existingRow = await db.prepare(`SELECT * FROM event_reviews WHERE master_event_id = ?`).bind(input.masterEventId).first<EventReviewRow>();
+  const existing = existingRow ? eventReviewFromRow(existingRow) : null;
+  if (input.expectedRevision !== (existing?.revision ?? 0)) throw new Error(`研判版本冲突：当前为 ${existing?.revision ?? 0}，请求为 ${input.expectedRevision}`);
+  if (!canTransitionEventReview(existing?.status ?? null, input.status)) throw new Error(`不允许的研判状态转换：${existing?.status ?? "new"} -> ${input.status}`);
+  const updatedAt = new Date().toISOString();
+  const revision = (existing?.revision ?? 0) + 1;
+  const alertAcknowledgedAt = input.acknowledgeAlert ? updatedAt : existing?.alertAcknowledgedAt ?? null;
+  const alertAcknowledgedBy = input.acknowledgeAlert ? input.actor : existing?.alertAcknowledgedBy ?? null;
+  const alertAcknowledgedVersion = input.acknowledgeAlert ? input.alertVersion : existing?.alertAcknowledgedVersion ?? null;
+  const record: EventReviewRecord = {
+    masterEventId: input.masterEventId,
+    status: input.status,
+    assignee: input.assignee,
+    conclusion: input.conclusion,
+    exposure: input.exposure,
+    vulnerability: input.vulnerability,
+    alertAcknowledgedAt,
+    alertAcknowledgedBy,
+    alertAcknowledgedVersion,
+    eventRevision: input.eventRevision,
+    revision,
+    updatedAt,
+    updatedBy: input.actor,
+  };
+  const values = [
+    record.status, record.assignee, record.conclusion,
+    record.exposure?.index ?? null, record.exposure?.basis ?? null,
+    record.vulnerability?.index ?? null, record.vulnerability?.basis ?? null,
+    record.alertAcknowledgedAt, record.alertAcknowledgedBy, record.alertAcknowledgedVersion,
+    record.eventRevision, record.revision, record.updatedAt, record.updatedBy,
+  ];
+  const save = existing
+    ? db.prepare(`UPDATE event_reviews SET status=?, assignee=?, conclusion=?, exposure_index=?, exposure_basis=?, vulnerability_index=?, vulnerability_basis=?, alert_acknowledged_at=?, alert_acknowledged_by=?, alert_acknowledged_version=?, event_revision=?, revision=?, updated_at=?, updated_by=? WHERE master_event_id=? AND revision=?`)
+      .bind(...values, input.masterEventId, existing.revision)
+    : db.prepare(`INSERT INTO event_reviews (status, assignee, conclusion, exposure_index, exposure_basis, vulnerability_index, vulnerability_basis, alert_acknowledged_at, alert_acknowledged_by, alert_acknowledged_version, event_revision, revision, updated_at, updated_by, master_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(...values, input.masterEventId);
+  const action = input.acknowledgeAlert && !existing?.alertAcknowledgedAt
+    ? "acknowledge_and_review"
+    : existing ? existing.status === input.status ? "update_review" : "transition_review" : "create_review";
+  const audit = db.prepare(`INSERT OR IGNORE INTO event_review_history (master_event_id, revision, actor, action, from_status, to_status, payload_json, changed_at)
+    SELECT master_event_id, revision, updated_by, ?, ?, status, ?, updated_at FROM event_reviews WHERE master_event_id=? AND revision=?`)
+    .bind(action, existing?.status ?? null, JSON.stringify(record), input.masterEventId, revision);
+  const [result] = await db.batch([save, audit]);
+  if (affectedRows(result) === 0) throw new Error("研判记录已被其他操作员更新，请刷新后重试");
+  return record;
+}
+
+export async function getEventExposureAssessment(masterEventId: string): Promise<ExposureAssessment | null> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const row = await db.prepare(`SELECT * FROM event_exposure_assessments WHERE master_event_id = ?`).bind(masterEventId).first<EventExposureAssessmentRow>();
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(row.payload_json) as ExposureAssessment;
+    if (parsed.masterEventId !== row.master_event_id || parsed.eventRevision !== row.event_revision || parsed.aoiHash !== row.aoi_hash) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export async function upsertEventExposureAssessment(assessment: ExposureAssessment): Promise<ExposureAssessment> {
+  await ensureOperationalSchema();
+  const db = await database();
+  await db.prepare(`INSERT INTO event_exposure_assessments (master_event_id, event_revision, aoi_hash, status, payload_json, computed_at, expires_at, updated_by)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(master_event_id) DO UPDATE SET event_revision=excluded.event_revision, aoi_hash=excluded.aoi_hash, status=excluded.status, payload_json=excluded.payload_json, computed_at=excluded.computed_at, expires_at=excluded.expires_at, updated_by=excluded.updated_by`)
+    .bind(assessment.masterEventId, assessment.eventRevision, assessment.aoiHash, assessment.status, JSON.stringify(assessment), assessment.computedAt, assessment.expiresAt, assessment.updatedBy).run();
+  await db.prepare(`DELETE FROM event_exposure_assessments WHERE expires_at < ?`).bind(new Date(Date.now() - 30 * 24 * 60 * 60_000).toISOString()).run();
+  return assessment;
 }
 
 export function collapseCanonicalEventsByMasterId(events: DisasterEvent[]) {
@@ -1040,6 +1342,27 @@ async function quarantineInvalidOperationalRecords(db: DatabaseLike) {
 function affectedRows(result: unknown) {
   const value = result as { changes?: number; meta?: { changes?: number } } | null;
   return value?.changes ?? value?.meta?.changes ?? 1;
+}
+
+function eventReviewFromRow(row: EventReviewRow): EventReviewRecord {
+  if (!eventReviewStatuses.includes(row.status as EventReviewStatus)) throw new Error("研判记录状态无效");
+  const exposure = row.exposure_index === null || !row.exposure_basis ? null : { index: row.exposure_index, basis: row.exposure_basis };
+  const vulnerability = row.vulnerability_index === null || !row.vulnerability_basis ? null : { index: row.vulnerability_index, basis: row.vulnerability_basis };
+  return {
+    masterEventId: row.master_event_id,
+    status: row.status as EventReviewStatus,
+    assignee: row.assignee,
+    conclusion: row.conclusion,
+    exposure,
+    vulnerability,
+    alertAcknowledgedAt: row.alert_acknowledged_at,
+    alertAcknowledgedBy: row.alert_acknowledged_by,
+    alertAcknowledgedVersion: row.alert_acknowledged_version,
+    eventRevision: row.event_revision,
+    revision: row.revision,
+    updatedAt: row.updated_at,
+    updatedBy: row.updated_by,
+  };
 }
 
 function distinctEvidenceSources(evidence: Array<{ source: string }>) {

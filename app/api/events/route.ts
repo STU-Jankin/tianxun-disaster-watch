@@ -14,11 +14,11 @@ import {
 import { normalizeAntimeridianGeometry, validateGeoGeometry } from "../../../lib/geo-geometry";
 import { latestByKey } from "../../../lib/latest-by-key";
 import { applyEventSourcePresence } from "../../../lib/event-presence";
-import { listRetainedCanonicalEvents, persistCanonicalEvents, resolveCanonicalEventsByReferences } from "../../../db/operational";
+import { listEventReviews, listRetainedCanonicalEvents, persistCanonicalEvents, persistIngestionArtifacts, resolveCanonicalEventsByReferences, type SourceFetchCapture } from "../../../db/operational";
 import { circularGeometryCenter, cycloneSeverityFromKnots, firmsConfidenceScore, firmsHeatSeverity, latestTrackPoint } from "../../../lib/source-normalization";
 import { authorizeApiRequest } from "../../../lib/api-security";
 import { buildHourlyCycloneImpactField, buildJmaCycloneForecast, extractKmlFromKmz, parseNhcConeKml, parseNhcTrackKml, parseNhcWindRadiiKml } from "../../../lib/cyclone-forecast";
-import { eventHasInvalidIdentity, firstValidSourceEventId, isValidSourceEventId, latestEventVersionsByMasterId } from "../../../lib/event-integrity";
+import { eventHasInvalidIdentity, eventRevisionFingerprint, firstValidSourceEventId, isValidSourceEventId, latestEventVersionsByMasterId } from "../../../lib/event-integrity";
 import { updateIngestionHealth } from "../../../lib/runtime-health";
 import { floodProcessEntityKey, sameFloodRegion } from "../../../lib/process-identity";
 import { selectFirmsEvents } from "../../../lib/event-selection";
@@ -47,6 +47,9 @@ import {
 import { parseMemGeohazardBulletin, parseMemGeohazardListing } from "../../../lib/china-geohazard-sources";
 import { decodeLhasaRiskPng, lhasaCandidatesFromRaster } from "../../../lib/lhasa-nowcast";
 import { amapConfiguration, buildAmapGeocodeUrl, parseAmapGeocodes, type RoutingCoordinate } from "../../../lib/amap-routing";
+import { assessImpactRisk } from "../../../lib/impact-risk";
+import { summarizeEventReview } from "../../../lib/event-review";
+import { sanitizeSnapshotUrl, sourceGovernance, sourceIdForName, sourceNameForUrl, type SourceGovernance, type SourceRole, type SourceTier } from "../../../lib/source-governance";
 
 export const dynamic = "force-dynamic";
 
@@ -79,8 +82,6 @@ const endpoints = {
 };
 
 type SourceState = "online" | "offline" | "needs_config";
-type SourceTier = "中国第一批" | "中国第二批" | "基础" | "第一优先级" | "第二优先级";
-type SourceRole = "事件" | "预报" | "核验";
 
 type SourceConnector = {
   name: string;
@@ -92,7 +93,7 @@ type SourceConnector = {
   fetcher: () => Promise<DisasterEvent[]>;
 };
 
-type SourceRun = {
+type SourceRun = SourceGovernance & {
   name: string;
   tier: SourceTier;
   role: SourceRole;
@@ -103,6 +104,9 @@ type SourceRun = {
   message: string;
   events: DisasterEvent[];
   producing: boolean;
+  durationMs: number;
+  attempts: number;
+  lastAttemptAt: string;
 };
 
 type CancellationReference = { source: string; sourceEventId: string; reason: string };
@@ -115,6 +119,8 @@ let copernicusCache: { events: DisasterEvent[]; expiresAt: number } | null = nul
 let usgsGroundFailureCache: { events: DisasterEvent[]; expiresAt: number } | null = null;
 const nveBoundaryCache = new Map<string, { geometry: { type: string; coordinates: unknown }; expiresAt: number }>();
 const memGeocodeCache = new Map<string, { coordinate: RoutingCoordinate; expiresAt: number }>();
+let activeRefreshId: string | null = null;
+const sourceFetchCaptureBuffer: SourceFetchCapture[] = [];
 
 export async function GET(request: Request) {
   const unauthorized = await authorizeApiRequest(request);
@@ -148,6 +154,9 @@ function hashText(value: string) {
 }
 
 async function refreshEvents() {
+  const refreshId = crypto.randomUUID();
+  activeRefreshId = refreshId;
+  sourceFetchCaptureBuffer.splice(0);
   const cmaSurface = cmaSurfaceConfiguration();
   const connectors: SourceConnector[] = [
     {
@@ -355,13 +364,24 @@ async function refreshEvents() {
   const allSourcesUnavailable = runs.every((source) => !source.online);
   const sourceCounts = runs.map((run) => ({
     name: run.name,
+    sourceId: run.sourceId,
     tier: run.tier,
     role: run.role,
+    authorityClass: run.authorityClass,
+    pollIntervalMinutes: run.pollIntervalMinutes,
+    latencySloMinutes: run.latencySloMinutes,
+    updateSemantics: run.updateSemantics,
+    geometrySemantics: run.geometrySemantics,
+    licenseNote: run.licenseNote,
     setupUrl: run.setupUrl,
     state: run.state,
     online: run.online,
     message: run.message,
     producing: run.producing,
+    durationMs: run.durationMs,
+    attempts: run.attempts,
+    lastAttemptAt: run.lastAttemptAt,
+    lastSuccessAt: run.online ? run.lastAttemptAt : null,
     count: currentEvents.filter((event) => event.evidence.some((item) => item.source.startsWith(run.name))).length,
   }));
   const persistedEvents = allSourcesUnavailable ? normalizedWithPresence : await persistCanonicalEvents(normalizedWithPresence);
@@ -392,15 +412,22 @@ async function refreshEvents() {
       return counts;
     }, {}),
   ).map(([hazard, count]) => ({ hazard, count }));
-  const events = selectBalancedEvents(operationalEvents.filter((event) => event.observationStatus !== "expired" && event.lifecycleStatus !== "resolved"), 250);
+  const selectedEvents = selectBalancedEvents(operationalEvents.filter((event) => event.observationStatus !== "expired" && event.lifecycleStatus !== "resolved"), 250);
+  const reviews = await listEventReviewsSafely(selectedEvents.map((event) => event.masterEventId));
+  const reviewByEvent = new Map(reviews.map((review) => [review.masterEventId, review]));
+  const events = selectedEvents.map((event) => {
+    const review = reviewByEvent.get(event.masterEventId);
+    if (!review) return event;
+    const summary = summarizeEventReview(event, review, eventRevisionFingerprint(event));
+    return { ...event, review: summary, impactRisk: summary.impactRisk };
+  });
   const retainedCount = events.filter((event) => event.sourcePresence === "retained").length;
   const fallback = allSourcesUnavailable ? fallbackEvents().map(finalize) : [];
   const fallbackSourceCounts = allSourcesUnavailable
     ? sourceCounts.map((source) => ({ ...source, count: 0 }))
     : sourceCounts;
 
-  return Response.json(
-    {
+  const responsePayload = {
       events: allSourcesUnavailable ? (events.length ? events : fallback) : events,
       sourceStatus: fallbackSourceCounts,
       hazardCounts,
@@ -414,9 +441,65 @@ async function refreshEvents() {
       persistenceAvailable,
       selectionPolicy: { limit: 250, reservedPerHazard: 20, wildfireCap: 100, perSourceCap: 80, firmsIngestionCap: 600, firmsSpatialReserveDegrees: 5 },
       windowPolicyVersion: "2026.08-science-v5",
-    },
-    { headers: { "Cache-Control": "public, max-age=60, s-maxage=120" } },
+      runtimeMode: allSourcesUnavailable ? "缓存/兜底" : "实时",
+    };
+  try {
+    const replayPayload = boundedReplayPayload(responsePayload);
+    const replayJson = JSON.stringify(replayPayload);
+    const snapshotHash = await sha256Text(replayJson);
+    await persistIngestionArtifacts({
+      refreshId,
+      sources: runs.map((run) => ({
+        sourceId: run.sourceId,
+        name: run.name,
+        tier: run.tier,
+        role: run.role,
+        authorityClass: run.authorityClass,
+        setupUrl: run.setupUrl,
+        pollIntervalMinutes: run.pollIntervalMinutes,
+        latencySloMinutes: run.latencySloMinutes,
+        updateSemantics: run.updateSemantics,
+        geometrySemantics: run.geometrySemantics,
+        licenseNote: run.licenseNote,
+        state: run.state,
+        lastAttemptAt: run.lastAttemptAt,
+        durationMs: run.durationMs,
+        count: run.count,
+        message: run.message,
+      })),
+      fetches: sourceFetchCaptureBuffer.splice(0),
+      snapshot: {
+        snapshotId: `snapshot-${refreshId}`,
+        refreshId,
+        capturedAt: refreshCompletedAt,
+        payloadSha256: snapshotHash,
+        eventCount: Array.isArray(replayPayload.events) ? replayPayload.events.length : 0,
+        sourceCount: runs.length,
+        payload: replayPayload,
+      },
+    });
+  } catch (error) {
+    console.error("ingestion governance persistence unavailable", error);
+  } finally {
+    activeRefreshId = null;
+    sourceFetchCaptureBuffer.splice(0);
+  }
+
+  return Response.json(
+    responsePayload,
+    { headers: { "Cache-Control": "private, max-age=60", "X-Content-Type-Options": "nosniff" } },
   );
+}
+
+function boundedReplayPayload(payload: Record<string, unknown>) {
+  const events = Array.isArray(payload.events) ? payload.events : [];
+  let retainedEvents = events;
+  let replay = { ...payload, events: retainedEvents, replaySnapshotTruncated: false };
+  while (new TextEncoder().encode(JSON.stringify(replay)).byteLength > 650_000 && retainedEvents.length > 25) {
+    retainedEvents = retainedEvents.slice(0, Math.ceil(retainedEvents.length * 0.75));
+    replay = { ...payload, events: retainedEvents, replaySnapshotTruncated: true };
+  }
+  return replay;
 }
 
 async function listRetainedEventsSafely() {
@@ -428,10 +511,23 @@ async function listRetainedEventsSafely() {
   }
 }
 
-async function runConnector(connector: SourceConnector): Promise<SourceRun> {
-  if (connector.config && !connector.config.ready) {
-    return { ...connector, state: "needs_config", online: false, producing: false, count: 0, message: connector.config.message, events: [] };
+async function listEventReviewsSafely(masterEventIds: string[]) {
+  try {
+    return await listEventReviews(masterEventIds);
+  } catch (error) {
+    console.error("event review lookup unavailable", error);
+    return [];
   }
+}
+
+async function runConnector(connector: SourceConnector): Promise<SourceRun> {
+  const startedAt = Date.now();
+  const lastAttemptAt = new Date(startedAt).toISOString();
+  const governance = sourceGovernance(connector.name, connector.tier, connector.role);
+  if (connector.config && !connector.config.ready) {
+    return { ...connector, ...governance, state: "needs_config", online: false, producing: false, count: 0, message: connector.config.message, events: [], durationMs: 0, attempts: 0, lastAttemptAt };
+  }
+  let attempts = 1;
   try {
     let events: DisasterEvent[];
     try {
@@ -439,10 +535,12 @@ async function runConnector(connector: SourceConnector): Promise<SourceRun> {
     } catch (firstError) {
       if (!isTransientConnectorError(firstError)) throw firstError;
       await new Promise((resolve) => setTimeout(resolve, 350));
+      attempts = 2;
       events = await connector.fetcher();
     }
     return {
       ...connector,
+      ...governance,
       state: "online",
       online: true,
       producing: events.length > 0,
@@ -451,10 +549,13 @@ async function runConnector(connector: SourceConnector): Promise<SourceRun> {
         ? "在线，仅用于交叉核验，不生成任务坐标"
         : events.length ? "在线并产出本轮有效事件" : "连接成功，但本轮没有通过时间、身份与几何校验的有效事件"),
       events,
+      durationMs: Date.now() - startedAt,
+      attempts,
+      lastAttemptAt,
     };
   } catch (error) {
     const reason = error instanceof Error ? error.message.slice(0, 90) : "未知错误";
-    return { ...connector, state: "offline", online: false, producing: false, count: 0, message: `本轮连接失败：${reason}`, events: [] };
+    return { ...connector, ...governance, state: "offline", online: false, producing: false, count: 0, message: `本轮连接失败：${reason}`, events: [], durationMs: Date.now() - startedAt, attempts, lastAttemptAt };
   }
 }
 
@@ -465,18 +566,25 @@ function isTransientConnectorError(error: unknown) {
 
 const officialUserAgent = "Tianxun-Disaster-Watch/0.1 github.com/STU-Jankin/tianxun-disaster-watch";
 
-async function fetchJson(url: string, options: { maximumBytes?: number; timeoutMs?: number; headers?: Record<string, string> } = {}) {
+async function fetchJson(url: string, options: { maximumBytes?: number; timeoutMs?: number; headers?: Record<string, string>; sourceName?: string; archive?: boolean } = {}) {
+  const startedAt = Date.now();
   const safeUrl = validateExternalFeedUrl(url);
   const response = await fetch(safeUrl, {
     headers: { Accept: "application/json,application/geo+json", "User-Agent": officialUserAgent, ...options.headers },
     signal: AbortSignal.timeout(options.timeoutMs ?? 8_000),
     redirect: "manual",
   });
-  if (!response.ok) throw new Error(`上游返回 HTTP ${response.status}`);
-  return JSON.parse(await readLimitedText(response, options.maximumBytes ?? 5_000_000, "JSON"));
+  if (!response.ok) {
+    if (options.archive !== false) await recordSourceFetch(url, response, "", startedAt, `上游返回 HTTP ${response.status}`, options.sourceName);
+    throw new Error(`上游返回 HTTP ${response.status}`);
+  }
+  const body = await readLimitedText(response, options.maximumBytes ?? 5_000_000, "JSON");
+  if (options.archive !== false) await recordSourceFetch(url, response, body, startedAt, null, options.sourceName);
+  return JSON.parse(body);
 }
 
 async function fetchText(url: string) {
+  const startedAt = Date.now();
   const safeUrl = validateExternalFeedUrl(url);
   const response = await fetch(safeUrl, {
     headers: {
@@ -486,11 +594,54 @@ async function fetchText(url: string) {
     signal: AbortSignal.timeout(12_000),
     redirect: "manual",
   });
-  if (!response.ok) throw new Error(`上游返回 HTTP ${response.status}`);
-  return readLimitedText(response, 5_000_000, "文本");
+  if (!response.ok) {
+    await recordSourceFetch(url, response, "", startedAt, `上游返回 HTTP ${response.status}`);
+    throw new Error(`上游返回 HTTP ${response.status}`);
+  }
+  const body = await readLimitedText(response, 5_000_000, "文本");
+  await recordSourceFetch(url, response, body, startedAt, null);
+  return body;
+}
+
+async function recordSourceFetch(url: string, response: Response, body: string, startedAt: number, errorMessage: string | null, explicitSourceName?: string) {
+  if (!activeRefreshId) return;
+  const encoded = new TextEncoder().encode(body);
+  const maximumStoredBytes = 128 * 1024;
+  const storedBody = encoded.byteLength > maximumStoredBytes
+    ? new TextDecoder().decode(encoded.slice(0, maximumStoredBytes))
+    : body;
+  const payloadSha256 = body ? await sha256Text(body) : null;
+  const sourceName = sourceNameForUrl(url, explicitSourceName);
+  sourceFetchCaptureBuffer.push({
+    runId: crypto.randomUUID(),
+    refreshId: activeRefreshId,
+    sourceId: sourceIdForName(sourceName),
+    requestedUrl: sanitizeSnapshotUrl(url),
+    fetchedAt: new Date().toISOString(),
+    durationMs: Math.max(0, Date.now() - startedAt),
+    httpStatus: response.status,
+    ok: response.ok && !errorMessage,
+    payloadSha256,
+    contentType: response.headers.get("content-type") ?? "application/octet-stream",
+    bodyText: storedBody,
+    byteLength: encoded.byteLength,
+    storedByteLength: new TextEncoder().encode(storedBody).byteLength,
+    truncated: encoded.byteLength > maximumStoredBytes,
+    errorMessage,
+  });
+}
+
+async function sha256Text(value: string) {
+  return sha256Bytes(new TextEncoder().encode(value));
+}
+
+async function sha256Bytes(value: BufferSource) {
+  const digest = await crypto.subtle.digest("SHA-256", value);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 async function fetchKmzKml(url: string) {
+  const startedAt = Date.now();
   const safeUrl = validateExternalFeedUrl(url, ["nhc.noaa.gov", "www.nhc.noaa.gov"]);
   const response = await fetch(safeUrl, {
     headers: { Accept: "application/vnd.google-earth.kmz,application/zip", "User-Agent": "Tianxun-Disaster-Watch/0.1" },
@@ -500,7 +651,22 @@ async function fetchKmzKml(url: string) {
   if (!response.ok) throw new Error(`${response.status} ${url}`);
   const contentLength = Number(response.headers.get("content-length") ?? 0);
   if (contentLength > 6_000_000) throw new Error("KMZ 文件超过安全上限");
-  return extractKmlFromKmz(await readLimitedBytes(response, 6_000_000, "KMZ"));
+  const bytes = await readLimitedBytes(response, 6_000_000, "KMZ");
+  await recordBinarySourceFetch(url, response, bytes, startedAt, "NOAA NHC");
+  return extractKmlFromKmz(bytes);
+}
+
+async function recordBinarySourceFetch(url: string, response: Response, body: ArrayBuffer, startedAt: number, explicitSourceName?: string) {
+  if (!activeRefreshId) return;
+  const sourceName = sourceNameForUrl(url, explicitSourceName);
+  const bodyText = "[二进制响应仅保存摘要；请按来源和抓取时刻获取原始文件]";
+  sourceFetchCaptureBuffer.push({
+    runId: crypto.randomUUID(), refreshId: activeRefreshId, sourceId: sourceIdForName(sourceName),
+    requestedUrl: sanitizeSnapshotUrl(url), fetchedAt: new Date().toISOString(), durationMs: Math.max(0, Date.now() - startedAt),
+    httpStatus: response.status, ok: response.ok, payloadSha256: await sha256Bytes(body),
+    contentType: response.headers.get("content-type") ?? "application/octet-stream", bodyText, byteLength: body.byteLength,
+    storedByteLength: new TextEncoder().encode(bodyText).byteLength, truncated: true, errorMessage: null,
+  });
 }
 
 async function readLimitedBytes(response: Response, maximumBytes: number, label: string) {
@@ -736,7 +902,7 @@ async function resolveMemGeohazardCoordinate(location: string): Promise<RoutingC
   const configuration = amapConfiguration();
   if (configuration.ready && configuration.config) {
     try {
-      const payload = await fetchJson(buildAmapGeocodeUrl(configuration.config, location), { maximumBytes: 1_000_000, timeoutMs: 8_000 });
+      const payload = await fetchJson(buildAmapGeocodeUrl(configuration.config, location), { maximumBytes: 1_000_000, timeoutMs: 8_000, archive: false });
       const geocode = parseAmapGeocodes(payload)[0];
       if (geocode) {
         memGeocodeCache.set(location, { coordinate: geocode.coordinate, expiresAt: Date.now() + 30 * 86_400_000 });
@@ -757,6 +923,7 @@ async function fetchCmaEventFeed(): Promise<DisasterEvent[]> {
   if (!url) return [];
   const safeUrl = validateExternalFeedUrl(url);
   const authorization = process.env.CMA_EVENT_FEED_AUTHORIZATION?.trim();
+  const startedAt = Date.now();
   const response = await fetch(safeUrl, {
     headers: { Accept: "application/geo+json,application/json,application/xml,text/xml", "User-Agent": "Tianxun-Disaster-Watch/0.1", ...(authorization ? { Authorization: authorization } : {}) },
     signal: AbortSignal.timeout(12_000),
@@ -764,6 +931,7 @@ async function fetchCmaEventFeed(): Promise<DisasterEvent[]> {
   });
   if (!response.ok) throw new Error(`${response.status} CMA`);
   const body = await readLimitedText(response, 5_000_000, "CMA");
+  await recordSourceFetch(url, response, body, startedAt, null, "中国气象数据网 CMA 预警");
   if (/^\s*</.test(body)) return parseCapFeed(body, "中国气象数据网 CMA 预警", publicSourceUrl(url, "https://data.cma.cn/"));
   const data = JSON.parse(body) as { features?: Array<{ id?: string | number; geometry?: { type?: string; coordinates?: unknown }; properties?: Record<string, unknown> }> };
   return (data.features ?? []).flatMap((feature, index) => {
@@ -813,6 +981,7 @@ async function fetchCmaSurface(): Promise<DisasterEvent[]> {
   if (!configuration.ready || !configuration.config) return [];
   const requestUrl = buildCmaSurfaceRequestUrl(configuration.config);
   let response: Response;
+  const startedAt = Date.now();
   try {
     response = await fetch(requestUrl, {
       headers: { Accept: "application/json", "User-Agent": "Tianxun-Disaster-Watch/0.1" },
@@ -824,6 +993,7 @@ async function fetchCmaSurface(): Promise<DisasterEvent[]> {
   }
   if (!response.ok) throw new Error(`CMA 地面观测返回 HTTP ${response.status}`);
   const body = await readLimitedText(response, 5_000_000, "CMA 地面观测");
+  await recordSourceFetch(requestUrl, response, body, startedAt, null, CMA_SURFACE_SOURCE);
   let payload: unknown;
   try {
     payload = JSON.parse(body);
@@ -1079,6 +1249,7 @@ async function fetchEonet(): Promise<DisasterEvent[]> {
 }
 
 async function fetchGdacs(): Promise<DisasterEvent[]> {
+  const startedAt = Date.now();
   const response = await fetch(endpoints.gdacs, {
     headers: { "User-Agent": "Tianxun-Disaster-Watch/0.1" },
     signal: AbortSignal.timeout(8_000),
@@ -1086,6 +1257,7 @@ async function fetchGdacs(): Promise<DisasterEvent[]> {
   });
   if (!response.ok) throw new Error(`${response.status} GDACS`);
   const xml = await readLimitedText(response, 5_000_000, "GDACS");
+  await recordSourceFetch(endpoints.gdacs, response, xml, startedAt, null, "GDACS");
   return [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)].flatMap((match, index) => {
     const item = match[1];
     const typeCode = tag(item, "gdacs:eventtype");
@@ -1117,13 +1289,16 @@ async function fetchFirms(): Promise<DisasterEvent[]> {
   const mapKey = process.env.FIRMS_MAP_KEY;
   if (!mapKey) return [];
   const url = `${endpoints.firms}/${encodeURIComponent(mapKey)}/VIIRS_NOAA20_NRT/world/1`;
+  const startedAt = Date.now();
   const response = await fetch(url, {
     headers: { "User-Agent": "Tianxun-Disaster-Watch/0.1" },
     signal: AbortSignal.timeout(15_000),
     redirect: "manual",
   });
   if (!response.ok) throw new Error(`${response.status} FIRMS`);
-  const rows = parseCsv(await readLimitedText(response, 8_000_000, "FIRMS"));
+  const body = await readLimitedText(response, 8_000_000, "FIRMS");
+  await recordSourceFetch(url, response, body, startedAt, null, "NASA FIRMS");
+  const rows = parseCsv(body);
   const cells = new Map<string, Array<Record<string, string>>>();
   rows.forEach((row) => {
     const latitude = Number(row.latitude);
@@ -1443,6 +1618,7 @@ async function fetchUsgsVolcanoes(): Promise<DisasterEvent[]> {
 }
 
 async function fetchGeonetVolcanoes(): Promise<DisasterEvent[]> {
+  const startedAt = Date.now();
   const response = await fetch(endpoints.geonetVolcanoes, {
     headers: {
       Accept: "application/vnd.geo+json;version=2,application/geo+json,application/json",
@@ -1451,7 +1627,9 @@ async function fetchGeonetVolcanoes(): Promise<DisasterEvent[]> {
     signal: AbortSignal.timeout(12_000),
   });
   if (!response.ok) throw new Error(`${response.status} GeoNet`);
-  const data = JSON.parse(await readLimitedText(response, 2_000_000, "GeoNet")) as { type?: string; features?: unknown[] };
+  const body = await readLimitedText(response, 2_000_000, "GeoNet");
+  await recordSourceFetch(endpoints.geonetVolcanoes, response, body, startedAt, null, "GeoNet 火山警戒");
+  const data = JSON.parse(body) as { type?: string; features?: unknown[] };
   if (data.type !== "FeatureCollection" || !Array.isArray(data.features)) throw new Error("GeoNet 返回结构异常");
   // 该端点提供当前警戒状态，但不提供警戒开始/更新时间。这里仅验证数据可用性，
   // 不把响应时间伪造成灾害发生时间，也不生成卫星任务坐标。
@@ -1459,12 +1637,14 @@ async function fetchGeonetVolcanoes(): Promise<DisasterEvent[]> {
 }
 
 async function fetchSmithsonianVolcanoes(): Promise<DisasterEvent[]> {
+  const startedAt = Date.now();
   const response = await fetch(endpoints.smithsonianVolcanoes, {
     headers: { "User-Agent": "Tianxun-Disaster-Watch/0.1" },
     signal: AbortSignal.timeout(8_000),
   });
   if (!response.ok) throw new Error(`${response.status} Smithsonian GVP`);
-  await readLimitedText(response, 2_000_000, "Smithsonian GVP");
+  const body = await readLimitedText(response, 2_000_000, "Smithsonian GVP");
+  await recordSourceFetch(endpoints.smithsonianVolcanoes, response, body, startedAt, null, "Smithsonian GVP");
   return [];
 }
 
@@ -1474,6 +1654,7 @@ async function fetchLhasa(): Promise<DisasterEvent[]> {
     const date = `${productDate.getUTCFullYear()}${String(productDate.getUTCMonth() + 1).padStart(2, "0")}${String(productDate.getUTCDate()).padStart(2, "0")}`;
     const productTime = `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)}T00:00:00.000Z`;
     const imageUrl = `${endpoints.lhasaImages}global_landslide_nowcast_${date}.0000_float.png`;
+    const startedAt = Date.now();
     const response = await fetch(imageUrl, {
       headers: { Accept: "image/png", "User-Agent": officialUserAgent },
       signal: AbortSignal.timeout(8_000),
@@ -1489,6 +1670,7 @@ async function fetchLhasa(): Promise<DisasterEvent[]> {
       return [];
     }
     const image = await readLimitedBytes(response, 2_000_000, "LHASA PNG");
+    await recordBinarySourceFetch(imageUrl, response, image, startedAt, "NASA LHASA");
     const raster = await decodeLhasaRiskPng(image, 5);
     return lhasaCandidatesFromRaster(raster, productTime, imageUrl).map((candidate) => publicCandidateEvent(candidate, "NASA LHASA", "lhasa"));
   }
@@ -1499,16 +1681,18 @@ async function fetchWmoCap(): Promise<DisasterEvent[]> {
   const url = process.env.WMO_CAP_FEED_URL;
   if (!url) return [];
   const safeUrl = validateExternalFeedUrl(url);
+  const startedAt = Date.now();
   const response = await fetch(safeUrl, { headers: { "User-Agent": "Tianxun-Disaster-Watch/0.1" }, signal: AbortSignal.timeout(10_000), redirect: "manual" });
   if (!response.ok) throw new Error(`${response.status} WMO CAP`);
   const xml = await readLimitedText(response, 5_000_000, "WMO CAP");
+  await recordSourceFetch(url, response, xml, startedAt, null, "WMO SWIC/CAP");
   return parseCapFeed(xml, "WMO SWIC/CAP", publicSourceUrl(url, "https://severeweather.wmo.int/feeds.html"));
 }
 
 async function fetchGlofas(): Promise<DisasterEvent[]> {
   const url = process.env.GLOFAS_EVENT_FEED_URL;
   if (!url) return [];
-  const data = await fetchJson(url) as { features?: Array<{ id?: string | number; geometry?: { type?: string; coordinates?: unknown }; properties?: Record<string, unknown> }> };
+  const data = await fetchJson(url, { sourceName: "Copernicus GloFAS" }) as { features?: Array<{ id?: string | number; geometry?: { type?: string; coordinates?: unknown }; properties?: Record<string, unknown> }> };
   return (data.features ?? []).flatMap((feature) => {
     const p = feature.properties ?? {};
     const issuedAt = validIso(p.issuedAt ?? p.issued_at ?? p.datetime ?? p.date);
@@ -1668,6 +1852,7 @@ function finalize(event: DisasterEvent): DisasterEvent {
   const policyNeedsReview = timeline.requiresReview;
   return {
     ...event,
+    impactRisk: assessImpactRisk(event),
     scope,
     priority: priority.total,
     priorityBreakdown: {
