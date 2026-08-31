@@ -127,6 +127,7 @@ export type EventReviewSaveInput = {
 let schemaReady: Promise<void> | null = null;
 let databaseReady: Promise<DatabaseLike> | null = null;
 let lastRetentionPruneAt = 0;
+const operationalQueryBatchSize = 80;
 
 type DatabaseStatement = {
   bind(...values: unknown[]): DatabaseStatement;
@@ -222,6 +223,49 @@ function database() {
     databaseReady = loadCloudflareDatabase().then((db) => db ?? loadNodeDatabase());
   }
   return databaseReady;
+}
+
+function evidenceReferencesBySource(events: DisasterEvent[]) {
+  const references = new Map<string, Set<string>>();
+  for (const event of events) {
+    for (const evidence of event.evidence) {
+      if (!isValidSourceEventId(evidence.sourceEventId)) continue;
+      const sourceReferences = references.get(evidence.source) ?? new Set<string>();
+      sourceReferences.add(evidence.sourceEventId);
+      references.set(evidence.source, sourceReferences);
+    }
+  }
+  return references;
+}
+
+async function loadRelevantTombstones(db: DatabaseLike, events: DisasterEvent[]) {
+  const rows: { source: string; source_event_id: string }[] = [];
+  for (const [source, sourceEventIds] of evidenceReferencesBySource(events)) {
+    const ids = [...sourceEventIds];
+    for (let offset = 0; offset < ids.length; offset += operationalQueryBatchSize) {
+      const batch = ids.slice(offset, offset + operationalQueryBatchSize);
+      const placeholders = batch.map(() => "?").join(",");
+      const result = await db.prepare(`SELECT source, source_event_id FROM event_tombstones WHERE source = ? AND source_event_id IN (${placeholders})`)
+        .bind(source, ...batch).all<{ source: string; source_event_id: string }>();
+      rows.push(...result.results);
+    }
+  }
+  return rows;
+}
+
+async function loadRelevantClaims(db: DatabaseLike, events: DisasterEvent[]) {
+  const rows: { source: string; source_event_id: string; master_event_id: string; hazard: string }[] = [];
+  for (const [source, sourceEventIds] of evidenceReferencesBySource(events)) {
+    const ids = [...sourceEventIds];
+    for (let offset = 0; offset < ids.length; offset += operationalQueryBatchSize) {
+      const batch = ids.slice(offset, offset + operationalQueryBatchSize);
+      const placeholders = batch.map(() => "?").join(",");
+      const result = await db.prepare(`SELECT source, source_event_id, master_event_id, hazard FROM event_source_claims WHERE source = ? AND source_event_id IN (${placeholders})`)
+        .bind(source, ...batch).all<{ source: string; source_event_id: string; master_event_id: string; hazard: string }>();
+      rows.push(...result.results);
+    }
+  }
+  return rows;
 }
 
 export function ensureOperationalSchema() {
@@ -322,10 +366,12 @@ export async function persistCanonicalEvents(events: DisasterEvent[]): Promise<D
     await ensureOperationalSchema();
     const db = await database();
     const syncMarker = new Date().toISOString();
-    const tombstones = await db.prepare(`SELECT source, source_event_id FROM event_tombstones`).all<{ source: string; source_event_id: string }>();
-    const blockedEvidence = new Set(tombstones.results.map((item) => `${item.source}|${item.source_event_id}`));
-    const claimsResult = await db.prepare(`SELECT source, source_event_id, master_event_id, hazard FROM event_source_claims`).all<{ source: string; source_event_id: string; master_event_id: string; hazard: string }>();
-    const claims = new Map(claimsResult.results.map((item) => [`${item.source}|${item.source_event_id}`, item]));
+    const [tombstones, claimRows] = await Promise.all([
+      loadRelevantTombstones(db, events),
+      loadRelevantClaims(db, events),
+    ]);
+    const blockedEvidence = new Set(tombstones.map((item) => `${item.source}|${item.source_event_id}`));
+    const claims = new Map(claimRows.map((item) => [`${item.source}|${item.source_event_id}`, item]));
     const acceptedEvents: DisasterEvent[] = [];
     for (const originalEvent of events) {
       if (eventHasInvalidIdentity(originalEvent)) continue;
@@ -367,7 +413,7 @@ export async function persistCanonicalEvents(events: DisasterEvent[]): Promise<D
     // is more dangerous than rejecting an oversized run because task/event
     // provenance depends on canonical rows and evidence changing together.
     if (statements.length) await db.batch(statements);
-    await resolveClaimAliases(db);
+    await resolveClaimAliases(db, canonicalEvents.map((event) => event.masterEventId));
     await db.prepare(`UPDATE canonical_events SET lifecycle_status = CASE WHEN observation_expires_at <= ? THEN 'archived' ELSE 'monitoring' END WHERE synced_at < ? AND lifecycle_status IN ('active', 'monitoring')`)
       .bind(syncMarker, syncMarker).run();
     await pruneOperationalDataIfDue(db, Date.now());
@@ -660,32 +706,39 @@ function deduplicateNewest<T>(items: T[], key: (item: T) => string, timestamp: (
   return [...result.values()].sort((left, right) => Date.parse(timestamp(right)) - Date.parse(timestamp(left)));
 }
 
-async function resolveClaimAliases(db: DatabaseLike) {
-  const aliases = await db.prepare(`SELECT c.id, c.hazard, c.payload_json, COUNT(e.id) AS evidence_count, COUNT(sc.source_event_id) AS claimed_count, COUNT(DISTINCT sc.master_event_id) AS target_count, MIN(sc.master_event_id) AS target_id
-    FROM canonical_events c
-    JOIN event_evidence e ON e.master_event_id = c.id
-    LEFT JOIN event_source_claims sc ON sc.source = e.source AND sc.source_event_id = e.source_event_id AND sc.hazard = c.hazard
-    WHERE c.lifecycle_status IN ('active','monitoring')
-    GROUP BY c.id, c.hazard, c.payload_json`)
-    .all<{ id: string; hazard: string; payload_json: string; evidence_count: number; claimed_count: number; target_count: number; target_id: string | null }>();
+async function resolveClaimAliases(db: DatabaseLike, affectedMasterIds: string[]) {
+  const uniqueIds = [...new Set(affectedMasterIds)];
+  for (let offset = 0; offset < uniqueIds.length; offset += operationalQueryBatchSize) {
+    const batch = uniqueIds.slice(offset, offset + operationalQueryBatchSize);
+    const placeholders = batch.map(() => "?").join(",");
+    const aliases = await db.prepare(`SELECT c.id, c.hazard, COUNT(e.id) AS evidence_count, COUNT(sc.source_event_id) AS claimed_count, COUNT(DISTINCT sc.master_event_id) AS target_count, MIN(sc.master_event_id) AS target_id
+      FROM canonical_events c
+      JOIN event_evidence e ON e.master_event_id = c.id
+      LEFT JOIN event_source_claims sc ON sc.source = e.source AND sc.source_event_id = e.source_event_id AND sc.hazard = c.hazard
+      WHERE c.lifecycle_status IN ('active','monitoring') AND c.id IN (${placeholders})
+      GROUP BY c.id, c.hazard`)
+      .bind(...batch)
+      .all<{ id: string; hazard: string; evidence_count: number; claimed_count: number; target_count: number; target_id: string | null }>();
 
-  for (const alias of aliases.results) {
-    if (!alias.target_id || alias.target_id === alias.id || Number(alias.evidence_count) === 0 || Number(alias.claimed_count) !== Number(alias.evidence_count) || Number(alias.target_count) !== 1) continue;
-    const target = await db.prepare(`SELECT id FROM canonical_events WHERE id = ? AND hazard = ?`).bind(alias.target_id, alias.hazard).first<{ id: string }>();
-    if (!target) continue;
-    const taskRows = await db.prepare(`SELECT task_id, owner, status, revision, payload_json FROM satellite_tasks WHERE master_event_id = ? AND status IN ('candidate','reviewed','scheduled','submitted')`)
-      .bind(alias.id).all<LifecycleTaskRow>();
-    const now = new Date().toISOString();
-    const reason = `历史别名已收敛到主事件 ${alias.target_id}`;
-    let event: unknown = null;
-    try { event = JSON.parse(alias.payload_json); } catch { /* keep an auditable null payload */ }
-    const statements: DatabaseStatement[] = [
-      db.prepare(`UPDATE canonical_events SET lifecycle_status='resolved', observation_expires_at=?, synced_at=? WHERE id=? AND lifecycle_status IN ('active','monitoring')`).bind(now, now, alias.id),
-      db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at) VALUES (?, 'event_merged', ?, ?, ?)`)
-        .bind(`event_merged:${alias.id}:${now}`, alias.target_id, JSON.stringify({ fromMasterEventId: alias.id, toMasterEventId: alias.target_id, reason, event }), now),
-    ];
-    for (const task of taskRows.results) statements.push(...lifecycleTaskTransitionStatements(db, task, alias.id, now, `${reason}；旧任务必须重新核对 AOI`));
-    await db.batch(statements);
+    for (const alias of aliases.results) {
+      if (!alias.target_id || alias.target_id === alias.id || Number(alias.evidence_count) === 0 || Number(alias.claimed_count) !== Number(alias.evidence_count) || Number(alias.target_count) !== 1) continue;
+      const target = await db.prepare(`SELECT id FROM canonical_events WHERE id = ? AND hazard = ?`).bind(alias.target_id, alias.hazard).first<{ id: string }>();
+      if (!target) continue;
+      const canonical = await db.prepare(`SELECT payload_json FROM canonical_events WHERE id = ?`).bind(alias.id).first<{ payload_json: string }>();
+      const taskRows = await db.prepare(`SELECT task_id, owner, status, revision, payload_json FROM satellite_tasks WHERE master_event_id = ? AND status IN ('candidate','reviewed','scheduled','submitted')`)
+        .bind(alias.id).all<LifecycleTaskRow>();
+      const now = new Date().toISOString();
+      const reason = `历史别名已收敛到主事件 ${alias.target_id}`;
+      let event: unknown = null;
+      try { event = canonical ? JSON.parse(canonical.payload_json) : null; } catch { /* keep an auditable null payload */ }
+      const statements: DatabaseStatement[] = [
+        db.prepare(`UPDATE canonical_events SET lifecycle_status='resolved', observation_expires_at=?, synced_at=? WHERE id=? AND lifecycle_status IN ('active','monitoring')`).bind(now, now, alias.id),
+        db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at) VALUES (?, 'event_merged', ?, ?, ?)`)
+          .bind(`event_merged:${alias.id}:${now}`, alias.target_id, JSON.stringify({ fromMasterEventId: alias.id, toMasterEventId: alias.target_id, reason, event }), now),
+      ];
+      for (const task of taskRows.results) statements.push(...lifecycleTaskTransitionStatements(db, task, alias.id, now, `${reason}；旧任务必须重新核对 AOI`));
+      await db.batch(statements);
+    }
   }
 }
 
@@ -1319,23 +1372,30 @@ async function hasActiveEvidence(db: DatabaseLike, masterEventId: string) {
 }
 
 async function quarantineInvalidOperationalRecords(db: DatabaseLike) {
-  const rows = await db.prepare(`SELECT id, payload_json FROM canonical_events WHERE lifecycle_status IN ('active', 'monitoring')`).all<{ id: string; payload_json: string }>();
   const now = new Date().toISOString();
-  for (const row of rows.results) {
-    let event: DisasterEvent;
-    try { event = JSON.parse(row.payload_json) as DisasterEvent; } catch { continue; }
-    if (!eventHasInvalidIdentity(event)) continue;
-    const tasks = await db.prepare(`SELECT task_id, owner, status, revision, payload_json FROM satellite_tasks WHERE master_event_id=? AND status IN ('candidate','reviewed','scheduled','submitted')`)
-      .bind(row.id).all<LifecycleTaskRow>();
-    const statements: DatabaseStatement[] = [
-      db.prepare(`INSERT INTO event_quarantine (master_event_id, reason, payload_json, quarantined_at) VALUES (?, ?, ?, ?) ON CONFLICT(master_event_id) DO UPDATE SET reason=excluded.reason, payload_json=excluded.payload_json, quarantined_at=excluded.quarantined_at`)
-        .bind(row.id, "invalid source identity", row.payload_json, now),
-      db.prepare(`UPDATE canonical_events SET lifecycle_status='resolved', observation_expires_at=?, synced_at=? WHERE id=?`).bind(now, now, row.id),
-      db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at) VALUES (?, 'event_quarantined', ?, ?, ?)`)
-        .bind(`event_quarantined:${row.id}:${now}`, row.id, JSON.stringify({ reason: "invalid source identity", event }), now),
-    ];
-    for (const task of tasks.results) statements.push(...lifecycleTaskTransitionStatements(db, task, row.id, now, "主事件身份异常并已隔离"));
-    await db.batch(statements);
+  let cursor = "";
+  while (true) {
+    const rows = await db.prepare(`SELECT id, payload_json FROM canonical_events WHERE lifecycle_status IN ('active', 'monitoring') AND id > ? ORDER BY id LIMIT ?`)
+      .bind(cursor, operationalQueryBatchSize).all<{ id: string; payload_json: string }>();
+    if (!rows.results.length) break;
+    cursor = rows.results[rows.results.length - 1].id;
+    for (const row of rows.results) {
+      let event: DisasterEvent;
+      try { event = JSON.parse(row.payload_json) as DisasterEvent; } catch { continue; }
+      if (!eventHasInvalidIdentity(event)) continue;
+      const tasks = await db.prepare(`SELECT task_id, owner, status, revision, payload_json FROM satellite_tasks WHERE master_event_id=? AND status IN ('candidate','reviewed','scheduled','submitted')`)
+        .bind(row.id).all<LifecycleTaskRow>();
+      const statements: DatabaseStatement[] = [
+        db.prepare(`INSERT INTO event_quarantine (master_event_id, reason, payload_json, quarantined_at) VALUES (?, ?, ?, ?) ON CONFLICT(master_event_id) DO UPDATE SET reason=excluded.reason, payload_json=excluded.payload_json, quarantined_at=excluded.quarantined_at`)
+          .bind(row.id, "invalid source identity", row.payload_json, now),
+        db.prepare(`UPDATE canonical_events SET lifecycle_status='resolved', observation_expires_at=?, synced_at=? WHERE id=?`).bind(now, now, row.id),
+        db.prepare(`INSERT OR IGNORE INTO operational_changes (id, change_type, master_event_id, payload_json, created_at) VALUES (?, 'event_quarantined', ?, ?, ?)`)
+          .bind(`event_quarantined:${row.id}:${now}`, row.id, JSON.stringify({ reason: "invalid source identity", event }), now),
+      ];
+      for (const task of tasks.results) statements.push(...lifecycleTaskTransitionStatements(db, task, row.id, now, "主事件身份异常并已隔离"));
+      await db.batch(statements);
+    }
+    if (rows.results.length < operationalQueryBatchSize) break;
   }
 }
 
