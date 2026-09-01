@@ -221,3 +221,31 @@ test("marks an archived high-risk prediction in a verified no-event window as a 
   assert.equal(report.metrics.forecastFalseAlarmRatePercent, 100);
   assert.equal(report.metrics.forecastHits, 0);
 });
+
+test("replays a regional screening index without treating it as probability calibration", () => {
+  const regionalCase = forecastBenchmark({
+    caseId: "benchmark-regional-screening",
+    requiredSource: "天巡区域滑坡试验筛查",
+    minimumForecastRiskPercent: 65,
+  });
+  const report = evaluateDetectionBenchmarks({
+    runId: "evaluation-run-regional-screening",
+    computedAt: "2026-09-01T13:00:00.000Z",
+    cases: [regionalCase],
+    candidatesByCase: {},
+    snapshotTimes: [],
+    forecastObservationsByCase: { [regionalCase.caseId]: [{
+      productId: "regional-cell-20260831-24h",
+      capturedAt: "2026-08-31T14:00:00.000Z",
+      validFrom: "2026-08-31T14:00:00.000Z",
+      validTo: regionalCase.occurredAt,
+      riskPercent: 70,
+      scoreKind: "screening_index",
+    }] },
+  });
+  assert.equal(report.results[0].status, "detected");
+  assert.equal(report.results[0].forecastRiskPercent, 70);
+  assert.equal(report.results[0].forecastScoreKind, "screening_index");
+  assert.equal(report.metrics.forecastBrierScore, null);
+  assert.equal(report.forecastCalibration.recommendationStatus, "no_archived_probabilities");
+});

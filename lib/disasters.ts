@@ -141,6 +141,8 @@ export type DisasterEvent = {
   geometryType: "Point" | "LineString" | "Polygon" | "MultiPolygon";
   geometry: EventGeometry;
   cycloneForecast?: CycloneForecast;
+  /** Structured regional landslide screening context; an experimental signal, never an official warning. */
+  regionalLandslideScreening?: import("./landslide-regional-screening.ts").RegionalLandslideScreeningProduct;
   locationQuality: "precise" | "estimated" | "representative" | "unknown";
   locationAccuracyKm: number;
   aoiApprovalRequired: boolean;

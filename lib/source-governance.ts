@@ -40,9 +40,9 @@ const governanceOverrides: Record<string, Partial<SourceGovernance>> = {
     authorityClass: "scientific",
     pollIntervalMinutes: 360,
     latencySloMinutes: 420,
-    updateSemantics: "按UTC六小时时次更新重庆/江苏固定试验格；同一区域与预报时效使用稳定事件编号形成版本记录，未命中格网不解释为低风险。",
-    geometrySemantics: "CMA GRAPES Global降雨条件与Copernicus DEM坡度共同命中的试验筛查格，不是滑坡概率、滑坡体边界、官方预警或省域完整覆盖。",
-    licenseNote: "试验模型输出；保留Open-Meteo与Copernicus DEM归属，正式业务需替换为具服务保障的数据链路并完成地方样本校准。",
+    updateSemantics: "按UTC六小时时次更新重庆/江苏9个哨点格；哨点达到条件时最多增加16个15公里加密格。每个格网的24/48/72小时结果独立归档，同一区域与预报时效使用稳定事件编号形成版本记录；未计算格网不解释为低风险。",
+    geometrySemantics: "CMA GRAPES Global降雨、模式土壤湿度趋势与Copernicus DEM坡度共同命中的哨点/条件加密格；ESA WorldCover只提供静态地表背景。产品不是滑坡概率、滑坡体边界、官方预警或省域完整覆盖。",
+    licenseNote: "试验模型输出；保留Open-Meteo、Copernicus DEM与ESA WorldCover 2021 v200归属，正式业务需替换为具服务保障的数据链路并完成地方样本校准。",
   },
   "Copernicus EMS Rapid Mapping": {
     pollIntervalMinutes: 30,

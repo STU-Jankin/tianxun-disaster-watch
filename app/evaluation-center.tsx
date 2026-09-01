@@ -3,12 +3,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { hazardMeta, hazardSubtypeLabels, type HazardSubtype, type HazardType } from "../lib/disasters";
 import type { DetectionEvaluationReport, EvaluationBenchmarkCase, EvaluationObjective, EvaluationOutcome } from "../lib/evaluation-center";
+import { REGIONAL_LANDSLIDE_SCREENING_SOURCE } from "../lib/landslide-regional-screening";
 
 type EvaluationPayload = {
   cases: EvaluationBenchmarkCase[];
   runs: DetectionEvaluationReport[];
   latest: DetectionEvaluationReport | null;
   forecastArchive?: { productCount: number; firstProductAt: string | null; lastProductAt: string | null; archivedBytes: number };
+  regionalForecastArchive?: { snapshotCount: number; cycleCount: number; firstCycleAt: string | null; lastCycleAt: string | null };
   officialPilotCatalog?: { catalog: string; datasetUrl: string; targetCount: number; importedCount: number; verificationPolicy: "draft_only"; comparisonModel: string };
   lhasaV1Historical?: {
     datasetUrl: string;
@@ -371,12 +373,12 @@ export function EvaluationCenter({ open, role, onClose }: { open: boolean; role:
     <div className="evaluation-body">
       <section className="evaluation-principle">
         <strong>只报告能够证明的指标</strong>
-        <p>事件检测和事前预测分开统计。实时地图只显示高风险区；评测独立保存完整概率栅格，并用同口径事件样本和无事件对照校准阈值。</p>
+        <p>事件检测和事前筛查分开统计。NASA 概率产品用于概率校准；天巡区域格网保存完整筛查指数，用于重庆、江苏试验区逐案回放，不把指数冒充概率。</p>
       </section>
 
       <section className="evaluation-archive-status">
-        <div><span>完整概率归档</span><strong>{payload.forecastArchive?.productCount ?? 0} 期</strong></div>
-        <p>{payload.forecastArchive?.lastProductAt ? `最近产品 ${formatDateTime(payload.forecastArchive.lastProductAt)} · ${formatBytes(payload.forecastArchive.archivedBytes)}` : "归档将在下一次成功读取NASA LHASA产品后开始；此前只能验证80%以上实时筛查结果。"}</p>
+        <div className="evaluation-archive-row"><div><span>NASA 完整概率归档</span><strong>{payload.forecastArchive?.productCount ?? 0} 期</strong></div><p>{payload.forecastArchive?.lastProductAt ? `最近产品 ${formatDateTime(payload.forecastArchive.lastProductAt)} · ${formatBytes(payload.forecastArchive.archivedBytes)}` : "下一次成功读取 NASA LHASA 产品后开始归档。"}</p></div>
+        <div className="evaluation-archive-row"><div><span>天巡区域筛查格网</span><strong>{payload.regionalForecastArchive?.snapshotCount ?? 0} 格次</strong></div><p>{payload.regionalForecastArchive?.lastCycleAt ? `${payload.regionalForecastArchive.cycleCount} 个预报周期 · 最近 ${formatDateTime(payload.regionalForecastArchive.lastCycleAt)}` : "下一次成功计算重庆、江苏区域筛查后开始归档。"}</p></div>
       </section>
 
       <section className="evaluation-official-pilot">
@@ -403,7 +405,7 @@ export function EvaluationCenter({ open, role, onClose }: { open: boolean; role:
           <Metric label="事件检测召回率" value={percent(report?.metrics.recallPercent)} detail={report ? `${report.metrics.detectionHits ?? 0}/${report.metrics.detectionEligibleCases ?? 0} 按时发现` : "等待评测"} />
           <Metric label="滑坡预测命中率" value={percent(report?.metrics.forecastHitRatePercent)} detail={report ? `${report.metrics.forecastHits ?? 0}/${report.metrics.forecastEligibleCases ?? 0} 事前命中` : "等待评测"} />
           <Metric label="滑坡预测精确率" value={percent(report?.metrics.forecastPrecisionPercent)} detail={report?.metrics.precisionAvailable ? `${report.metrics.forecastFalseAlarms}/${report.metrics.forecastNegativeEligibleCases} 个对照误报` : "需要同口径无事件对照"} />
-          <Metric label="Brier 分数" value={decimal(report?.metrics.forecastBrierScore)} detail="越接近0越好；需完整概率" />
+          <Metric label="Brier 分数" value={decimal(report?.metrics.forecastBrierScore)} detail="越接近0越好；仅含概率产品" />
           <Metric label="预测提前量中位数" value={minutesAsLead(report?.metrics.medianForecastLeadMinutes)} detail="以系统首次保存预测为准" />
           <Metric label="时延中位数" value={minutes(report?.metrics.medianLatencyMinutes)} detail={report?.metrics.p95LatencyMinutes === null || report?.metrics.p95LatencyMinutes === undefined ? "暂无 P95" : `P95 ${minutes(report.metrics.p95LatencyMinutes)}`} />
           <Metric label="位置误差中位数" value={distance(report?.metrics.medianLocationErrorKm)} detail="按样本代表点计算" />
@@ -414,7 +416,7 @@ export function EvaluationCenter({ open, role, onClose }: { open: boolean; role:
       </section>
 
       <section className="evaluation-calibration">
-        <div className="evaluation-section-title"><div><span>滑坡阈值校准</span><strong>{calibration?.recommendedThresholdPercent ? `建议 ${calibration.recommendedThresholdPercent}%` : "暂不推荐阈值"}</strong></div></div>
+        <div className="evaluation-section-title"><div><span>滑坡概率阈值校准</span><strong>{calibration?.recommendedThresholdPercent ? `建议 ${calibration.recommendedThresholdPercent}%` : "暂不推荐阈值"}</strong></div></div>
         {!calibration ? <div className="evaluation-empty">运行新版评测后显示50%–100%阈值扫描和概率可靠性。</div> : <>
           <p className={`evaluation-calibration-status ${calibration.recommendationStatus}`}>{calibration.recommendationReason}</p>
           {calibration.groups?.length ? <div className="evaluation-calibration-groups">{calibration.groups.map((group) => <div key={group.calibrationGroup}><strong>{group.calibrationGroup}</strong><span>{group.positiveCases} 事件 / {group.negativeCases} 对照</span><b>{group.recommendedThresholdPercent ? `${group.recommendedThresholdPercent}%` : "样本不足"}</b></div>)}</div> : null}
@@ -423,7 +425,7 @@ export function EvaluationCenter({ open, role, onClose }: { open: boolean; role:
             {calibration.thresholdScores.map((score) => <div role="row" key={score.thresholdPercent} className={score.thresholdPercent === calibration.recommendedThresholdPercent ? "recommended" : ""}><span>{score.thresholdPercent}%</span><span>{percent(score.precisionPercent)}</span><span>{percent(score.recallPercent)}</span><span>{percent(score.falseAlarmRatePercent)}</span><span>{percent(score.f1Percent)}</span></div>)}
           </div>
           <details className="evaluation-reliability"><summary>查看概率可靠性</summary>{calibration.reliabilityBins.map((bin) => <div key={bin.minimumPercent}><span>{bin.minimumPercent}–{bin.maximumPercent}%</span><small>{bin.sampleCount} 个样本</small><b>预测均值 {percent(bin.meanForecastPercent)} / 实际发生 {percent(bin.observedEventRatePercent)}</b></div>)}</details>
-          <small className="evaluation-source-note">只有至少5个已核验事件和5个同口径无事件对照时才给出探索性建议；正式启用仍需独立留出样本复验。</small>
+          <small className="evaluation-source-note">只纳入 NASA 等完整概率产品；天巡区域筛查指数不参与概率可靠性或 Brier 计算。只有至少5个已核验事件和5个同口径无事件对照时才给出探索性建议；正式启用仍需独立留出样本复验。</small>
         </>}
       </section>
 
@@ -434,9 +436,9 @@ export function EvaluationCenter({ open, role, onClose }: { open: boolean; role:
           <p>{result.reason}</p>
           {["detected", "false_alarm", "correct_rejection"].includes(result.status) ? <dl>
             <div><dt>{result.objective === "landslide_forecast" ? "预测提前量" : "发现时延"}</dt><dd>{result.objective === "landslide_forecast" ? minutesAsLead(result.forecastLeadMinutes) : minutes(result.latencyMinutes!)}</dd></div>
-            <div><dt>{result.objective === "landslide_forecast" ? "空间取值" : "位置误差"}</dt><dd>{result.objective === "landslide_forecast" ? result.spatialMatch === "raster_cell" ? "核验点所在原始概率格" : result.spatialMatch === "geometry_contains" ? "预测面覆盖" : `点容差 · 中心距 ${distance(result.locationErrorKm)}` : distance(result.locationErrorKm!)}</dd></div>
+            <div><dt>{result.objective === "landslide_forecast" ? "空间取值" : "位置误差"}</dt><dd>{result.objective === "landslide_forecast" ? result.spatialMatch === "raster_cell" ? result.forecastScoreKind === "screening_index" ? "核验点所在区域筛查格" : "核验点所在原始概率格" : result.spatialMatch === "geometry_contains" ? "预测面覆盖" : `点容差 · 中心距 ${distance(result.locationErrorKm)}` : distance(result.locationErrorKm!)}</dd></div>
             {result.matchedTitle ? <div><dt>匹配产品</dt><dd>{result.matchedTitle}</dd></div> : null}
-            {result.objective === "landslide_forecast" ? <div><dt>风险值</dt><dd>{result.forecastRiskPercent === undefined ? "未提供" : `${result.forecastRiskPercent}%`}</dd></div> : result.expectedSeverity ? <div><dt>等级核对</dt><dd>{result.severityMet ? "达到" : "未达到"} · {result.detectedSeverity}</dd></div> : null}
+            {result.objective === "landslide_forecast" ? <div><dt>{result.forecastScoreKind === "screening_index" ? "筛查指数" : "风险概率"}</dt><dd>{result.forecastRiskPercent === undefined ? "未提供" : `${result.forecastRiskPercent}${result.forecastScoreKind === "screening_index" ? "" : "%"}`}</dd></div> : result.expectedSeverity ? <div><dt>等级核对</dt><dd>{result.severityMet ? "达到" : "未达到"} · {result.detectedSeverity}</dd></div> : null}
           </dl> : null}
         </article>)}
       </section>
@@ -450,7 +452,7 @@ export function EvaluationCenter({ open, role, onClose }: { open: boolean; role:
       <section className="evaluation-cases">
         <div className="evaluation-section-title"><div><span>权威基准库</span><strong>{payload.cases.length} 个样本</strong></div>{role === "admin" ? <div className="evaluation-import-tools"><button type="button" onClick={downloadLandslideTemplate}>下载滑坡模板</button><label>导入 JSON<input type="file" accept="application/json,.json" onChange={(event) => void importLandslideCases(event)} disabled={state === "saving"} /></label></div> : null}</div>
         {payload.cases.length ? payload.cases.map((benchmark) => <article key={benchmark.caseId}>
-          <div><span className={benchmark.verificationStatus}>{benchmark.verificationStatus === "verified" ? "已核验" : "草稿"}</span><strong>{benchmark.title}</strong><small>{benchmark.objective === "landslide_forecast" ? `${benchmark.outcome === "no_event" ? "无事件对照" : "真实事件"} · ${benchmark.hazardSubtype ? hazardSubtypeLabels[benchmark.hazardSubtype] : "滑坡"} · ${benchmark.minimumForecastRiskPercent ?? 80}% 起${benchmark.calibrationGroup ? ` · ${benchmark.calibrationGroup}` : ""}` : `${hazardMeta[benchmark.hazard].label}检测`} · {formatDateTime(benchmark.occurredAt)} · {benchmark.objective === "landslide_forecast" ? `提前 ${benchmark.detectionDeadlineMinutes}–${benchmark.acceptedLeadMinutes} min` : `容差 ${benchmark.locationToleranceKm} km / ${benchmark.eventTimeToleranceHours} h`}</small></div>
+          <div><span className={benchmark.verificationStatus}>{benchmark.verificationStatus === "verified" ? "已核验" : "草稿"}</span><strong>{benchmark.title}</strong><small>{benchmark.objective === "landslide_forecast" ? `${benchmark.outcome === "no_event" ? "无事件对照" : "真实事件"} · ${benchmark.hazardSubtype ? hazardSubtypeLabels[benchmark.hazardSubtype] : "滑坡"} · ${benchmark.requiredSource === REGIONAL_LANDSLIDE_SCREENING_SOURCE ? `指数 ${benchmark.minimumForecastRiskPercent ?? 80} 起` : `${benchmark.minimumForecastRiskPercent ?? 80}% 起`}${benchmark.calibrationGroup ? ` · ${benchmark.calibrationGroup}` : ""}` : `${hazardMeta[benchmark.hazard].label}检测`} · {formatDateTime(benchmark.occurredAt)} · {benchmark.objective === "landslide_forecast" ? `提前 ${benchmark.detectionDeadlineMinutes}–${benchmark.acceptedLeadMinutes} min` : `容差 ${benchmark.locationToleranceKm} km / ${benchmark.eventTimeToleranceHours} h`}</small></div>
           <a href={benchmark.provenanceUrl} target="_blank" rel="noreferrer">权威依据 ↗</a>
           {role === "admin" ? <button type="button" onClick={() => void removeCase(benchmark)} disabled={state === "saving"}>删除</button> : null}
         </article>) : <div className="evaluation-empty">暂无基准样本。样本必须来自可追溯的权威公告或核验目录。</div>}
@@ -467,14 +469,14 @@ export function EvaluationCenter({ open, role, onClose }: { open: boolean; role:
           <label>纬度<input required type="number" min="-90" max="90" step="0.0001" value={form.latitude} onChange={(event) => setForm((current) => ({ ...current, latitude: event.target.value }))} /></label>
           <label>经度<input required type="number" min="-180" max="180" step="0.0001" value={form.longitude} onChange={(event) => setForm((current) => ({ ...current, longitude: event.target.value }))} /></label>
           <label className="wide">权威来源链接<input required type="url" maxLength={1500} value={form.provenanceUrl} onChange={(event) => setForm((current) => ({ ...current, provenanceUrl: event.target.value }))} placeholder="https://…" /></label>
-          {form.objective === "event_detection" ? <label>期望等级<select value={form.expectedSeverity} onChange={(event) => setForm((current) => ({ ...current, expectedSeverity: event.target.value as EvaluationForm["expectedSeverity"] }))}><option value="">不核对等级</option><option value="blue">蓝色</option><option value="yellow">黄色</option><option value="orange">橙色</option><option value="red">红色</option></select></label> : <label>验收阈值 %<input required type="number" min="50" max="100" step="1" value={form.minimumForecastRiskPercent} onChange={(event) => setForm((current) => ({ ...current, minimumForecastRiskPercent: event.target.value }))} /></label>}
-          <label>指定来源<input maxLength={120} value={form.requiredSource} onChange={(event) => setForm((current) => ({ ...current, requiredSource: event.target.value }))} placeholder={form.objective === "landslide_forecast" ? "NASA LHASA" : "留空表示任一来源"} /></label>
+          {form.objective === "event_detection" ? <label>期望等级<select value={form.expectedSeverity} onChange={(event) => setForm((current) => ({ ...current, expectedSeverity: event.target.value as EvaluationForm["expectedSeverity"] }))}><option value="">不核对等级</option><option value="blue">蓝色</option><option value="yellow">黄色</option><option value="orange">橙色</option><option value="red">红色</option></select></label> : <label>{form.requiredSource === REGIONAL_LANDSLIDE_SCREENING_SOURCE ? "筛查指数阈值" : "概率验收阈值 %"}<input required type="number" min="50" max="100" step="1" value={form.minimumForecastRiskPercent} onChange={(event) => setForm((current) => ({ ...current, minimumForecastRiskPercent: event.target.value }))} /></label>}
+          <label>指定来源{form.objective === "landslide_forecast" ? <select value={form.requiredSource} onChange={(event) => setForm((current) => ({ ...current, requiredSource: event.target.value }))}><option value="NASA LHASA">NASA LHASA 概率产品</option><option value={REGIONAL_LANDSLIDE_SCREENING_SOURCE}>天巡区域筛查（重庆/江苏）</option></select> : <input maxLength={120} value={form.requiredSource} onChange={(event) => setForm((current) => ({ ...current, requiredSource: event.target.value }))} placeholder="留空表示任一来源" />}</label>
           <details className="wide evaluation-criteria"><summary>匹配与时效口径</summary><div>
             <label>位置容差 km<input required type="number" min="0.1" max="1000" step="0.1" value={form.locationToleranceKm} onChange={(event) => setForm((current) => ({ ...current, locationToleranceKm: event.target.value }))} /></label>
             {form.objective === "event_detection" ? <label>事件时间容差 h<input required type="number" min="0.1" max="168" step="0.1" value={form.eventTimeToleranceHours} onChange={(event) => setForm((current) => ({ ...current, eventTimeToleranceHours: event.target.value }))} /></label> : null}
             <label>{form.objective === "landslide_forecast" ? "最大预测提前量 min" : "允许提前发现 min"}<input required type="number" min="0" max="10080" step="1" value={form.acceptedLeadMinutes} onChange={(event) => setForm((current) => ({ ...current, acceptedLeadMinutes: event.target.value }))} /></label>
             <label>{form.objective === "landslide_forecast" ? "最小有效提前量 min" : "检测时限 min"}<input required type="number" min={form.objective === "landslide_forecast" ? "0" : "1"} max="10080" step="1" value={form.detectionDeadlineMinutes} onChange={(event) => setForm((current) => ({ ...current, detectionDeadlineMinutes: event.target.value }))} /></label>
-          </div><p>{form.objective === "landslide_forecast" ? "命中必须同时满足：系统事前已保存、预测有效期覆盖真实事件时刻、预测面或点容差命中核验位置、风险值达到阈值。" : "默认值按灾种用于第一轮验收，正式结论前应根据官方公告时效和来源更新频率校准。"}</p></details>
+          </div><p>{form.objective === "landslide_forecast" ? form.requiredSource === REGIONAL_LANDSLIDE_SCREENING_SOURCE ? "命中必须同时满足：格网快照在事件前已保存、有效期覆盖发生时刻、核验点落在原始筛查格内、指数达到阈值。筛查指数不是发生概率。" : "命中必须同时满足：系统事前已保存、预测有效期覆盖真实事件时刻、原始概率格覆盖核验位置、概率达到阈值。" : "默认值按灾种用于第一轮验收，正式结论前应根据官方公告时效和来源更新频率校准。"}</p></details>
           <label className="wide">备注<textarea maxLength={500} rows={3} value={form.notes} onChange={(event) => setForm((current) => ({ ...current, notes: event.target.value }))} placeholder={form.outcome === "no_event" ? "必须记录所查核验目录、区域、时间范围和确认无事件的依据" : "记录公告编号、核验说明或特殊匹配口径"} /></label>
           <label className="evaluation-verification wide"><input type="checkbox" checked={form.verificationStatus === "verified"} onChange={(event) => setForm((current) => ({ ...current, verificationStatus: event.target.checked ? "verified" : "draft" }))} />{form.outcome === "no_event" ? "我已按相同目录和时空口径确认该窗口无事件" : "我已核对事件、时间、坐标和来源；该样本可进入正式指标"}</label>
           <button className="evaluation-save" type="submit" disabled={state === "saving"}>{state === "saving" ? "保存中…" : "保存评测样本"}</button>

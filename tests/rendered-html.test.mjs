@@ -539,7 +539,7 @@ test("separates landslide forecast verification from event detection metrics", a
   const route = await readFile(new URL("../app/api/evaluation/route.ts", import.meta.url), "utf8");
   const migration = await readFile(new URL("../drizzle/0012_forecast_raster_calibration.sql", import.meta.url), "utf8");
   const historicalMigration = await readFile(new URL("../drizzle/0014_lhasa_v1_raster_replay.sql", import.meta.url), "utf8");
-  for (const text of ["滑坡预测命中率", "滑坡预测精确率", "Brier 分数", "下载滑坡模板", "tianxun.landslide-benchmark/v2", "无事件对照", "滑坡阈值校准", "官方历史试验库", "导入首批草稿", "单国最多2条"]) assert.ok(center.includes(text));
+  for (const text of ["滑坡预测命中率", "滑坡预测精确率", "Brier 分数", "下载滑坡模板", "tianxun.landslide-benchmark/v2", "无事件对照", "滑坡概率阈值校准", "官方历史试验库", "导入首批草稿", "单国最多2条", "天巡区域筛查（重庆/江苏）"]) assert.ok(center.includes(text));
   assert.match(evaluation, /event\.validTo/);
   assert.match(evaluation, /geometryContainsPoint/);
   assert.match(evaluation, /forecastThresholdScores/);

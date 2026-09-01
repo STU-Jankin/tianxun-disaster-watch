@@ -2318,7 +2318,7 @@ function DetailPanel({ event, exposureAssessment, onExposureChange, currentUser,
       <div className="satellite-priority"><span>卫星观测优先级</span><strong>{event.priority}</strong><small>用于候选任务排序，不等于灾害影响风险</small></div>
     </div>
     <details className="priority-method"><summary>查看卫星优先级构成</summary><p>官方等级 {event.priorityBreakdown.severity} · 重点区域 {event.priorityBreakdown.scope} · 遥感可观测性 {event.priorityBreakdown.observability} · 时效 {event.priorityBreakdown.time} · 数据可信度 {event.priorityBreakdown.confidence ?? 0}</p></details>
-    {regionalScreening ? <section className="regional-landslide-notice"><div><span>REGIONAL PILOT</span><strong>区域固定格网 · 试验筛查</strong></div><p>该风险面来自降雨条件与 DEM 坡度的联合筛查，不是官方预警，也不代表已经发生滑坡。当前阶段只允许保存卫星候选草稿；任务机会计算、导出和下发保持锁定。</p><small>需补齐地方官方预警、在册隐患点或人工 AOI 复核后，由后续经验证版本重新生成可规划事件。</small></section> : null}
+    {regionalScreening ? <><section className="regional-landslide-notice"><div><span>REGIONAL PILOT</span><strong>区域哨点 + 条件加密格 · 试验筛查</strong></div><p>该风险面来自降雨、模式土壤湿度趋势与 DEM 坡度的联合筛查；土地覆盖只作静态背景说明。它不是官方预警，也不代表已经发生滑坡。当前阶段只允许保存卫星候选草稿；任务机会计算、导出和下发保持锁定。</p><small>需补齐地方官方预警、在册隐患点或人工 AOI 复核后，由后续经验证版本重新生成可规划事件。</small></section>{event.regionalLandslideScreening ? <RegionalLandslideScreeningCard product={event.regionalLandslideScreening} /> : null}</> : null}
     {effectiveImpactRisk ? <section className="impact-risk-method"><h3>影响风险说明</h3><p>{effectiveImpactRisk.limitations}</p><small>模型：{effectiveImpactRisk.hazardModel.modelId} · 强度依据：{effectiveImpactRisk.hazardModel.intensityProxy} · 危险性区间 {effectiveImpactRisk.uncertainty.hazardIndexMin}–{effectiveImpactRisk.uncertainty.hazardIndexMax}</small>{effectiveImpactRisk.missingInputs.length ? <small>待补数据：{effectiveImpactRisk.missingInputs.join("、")}</small> : null}</section> : null}
     <ExposureAssessmentCard event={event} assessment={exposureAssessment} currentUser={currentUser} historicalReadOnly={historicalReadOnly} onChange={onExposureChange} />
     <div className={`event-integrity ${event.dispatchEligibility}`}>
@@ -2514,6 +2514,22 @@ function impactRiskLabel(level: NonNullable<DisasterEvent["impactRisk"]>["level"
   return level === "very_high" ? "极高" : level === "high" ? "高" : level === "moderate" ? "中" : level === "low" ? "低" : "待评估";
 }
 
+function RegionalLandslideScreeningCard({ product }: { product: NonNullable<DisasterEvent["regionalLandslideScreening"]> }) {
+  return <section className="regional-landslide-summary">
+    <div className="regional-summary-heading"><div><span>SCREENING SNAPSHOT</span><h3>本报次区域筛查</h3></div><strong>指数 {product.maximumScreeningIndex}/100</strong></div>
+    <dl>
+      <div><dt>计算格网</dt><dd>{product.sentinelCellCount} 哨点 + {product.adaptiveCellCount} 加密</dd></div>
+      <div><dt>达到门槛</dt><dd>{product.qualifyingCellCount}/{product.totalCellCount} 格</dd></div>
+      <div><dt>等级构成</dt><dd>{product.highCellCount} 高触发 · {product.elevatedCellCount} 加强关注</dd></div>
+      <div><dt>湿度增强证据</dt><dd>{product.soilMoistureRisingCellCount} 格</dd></div>
+      <div><dt>土地覆盖</dt><dd>{product.landCoverReadyCellCount}/{product.qualifyingCellCount} 格可用</dd></div>
+      <div><dt>72小时趋势</dt><dd>{product.trend72HourCellCount} 格，仅监视</dd></div>
+    </dl>
+    {product.dominantLandCoverLabels.length ? <p>静态地表背景：{product.dominantLandCoverLabels.join("、")}。土地覆盖不直接提高或降低触发等级。</p> : <p>土地覆盖本轮不可用；系统未据此把风险降级。</p>}
+    <details><summary>查看命中格网</summary><small>{product.cellLabels.join("、")}</small><small>最高24小时雨量/P95：{product.maximumRainfallExceedanceRatio.toFixed(2)}×。筛查指数不是滑坡概率，只能在同一模型版本内排序和回放。</small></details>
+  </section>;
+}
+
 function LandslideForecastCard({ event }: { event: DisasterEvent }) {
   const radiusKm = Math.min(20, Math.max(3, Number.isFinite(event.locationAccuracyKm) ? Math.ceil(event.locationAccuracyKm) : 10));
   const [load, setLoad] = useState<{ state: "loading" | "ready" | "error"; forecast?: LandslideForecastReady; message?: string }>({ state: "loading" });
@@ -2557,7 +2573,7 @@ function LandslideForecastCard({ event }: { event: DisasterEvent }) {
       <div className="landslide-horizons">{forecast.horizons.map((horizon) => <article key={horizon.leadHours} className={horizon.triggerLevel}>
         <div><b>未来 {horizon.leadHours}h</b><time>{formatTimeWithYear(horizon.validFrom)}—{formatTimeWithYear(horizon.validTo)}</time></div>
         <strong>{horizon.triggerLabel}</strong>
-        <dl><div><dt>24h预报雨量</dt><dd>{horizon.precipitationMm.toFixed(1)} mm</dd></div><div><dt>本地日雨P95</dt><dd>{horizon.localDailyP95Mm == null ? "—" : `${horizon.localDailyP95Mm.toFixed(1)} mm`}</dd></div><div><dt>相对P95</dt><dd>{horizon.rainfallExceedanceRatio == null ? "—" : `${horizon.rainfallExceedanceRatio.toFixed(2)}×`}</dd></div><div><dt>最大6h雨量</dt><dd>{horizon.maximumSixHourPrecipitationMm.toFixed(1)} mm</dd></div></dl>
+        <dl><div><dt>24h预报雨量</dt><dd>{horizon.precipitationMm.toFixed(1)} mm</dd></div><div><dt>本地日雨P95</dt><dd>{horizon.localDailyP95Mm == null ? "—" : `${horizon.localDailyP95Mm.toFixed(1)} mm`}</dd></div><div><dt>相对P95</dt><dd>{horizon.rainfallExceedanceRatio == null ? "—" : `${horizon.rainfallExceedanceRatio.toFixed(2)}×`}</dd></div><div><dt>最大6h雨量</dt><dd>{horizon.maximumSixHourPrecipitationMm.toFixed(1)} mm</dd></div><div><dt>土壤湿度趋势</dt><dd>{horizon.soilMoistureChange48h == null ? "—" : `${horizon.soilMoistureChange48h >= 0 ? "+" : ""}${horizon.soilMoistureChange48h.toFixed(3)}`}</dd></div><div><dt>筛查指数</dt><dd>{horizon.screeningIndex == null ? "—" : `${horizon.screeningIndex}/100`}</dd></div></dl>
         <p>{horizon.action}</p>
         <details><summary>查看判定依据</summary>{horizon.basis.map((item) => <small key={item}>{item}</small>)}<small>可信度：{horizon.confidence === "medium" ? "中等，仅供试验筛查" : horizon.confidence === "low" ? "低，仅作趋势" : "输入不足"}</small></details>
       </article>)}</div>

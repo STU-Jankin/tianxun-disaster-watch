@@ -108,3 +108,24 @@ test("refuses to classify when terrain or climatology inputs are missing", async
   });
   assert.ok(result.horizons.every((item) => item.triggerLevel === "unclassified"));
 });
+
+test("uses a rising model-soil-moisture trend as at most one transparent enhancement step", async () => {
+  const { buildLandslideForecast, parseOpenMeteoLandslideForecast } = await forecastTools();
+  const payload = hourlyPayload();
+  payload.hourly.precipitation.fill(1.7, 0, 72);
+  payload.hourly.soil_moisture_9_to_27cm.fill(0.2, 0, 36);
+  payload.hourly.soil_moisture_27_to_81cm.fill(0.24, 0, 36);
+  payload.hourly.soil_moisture_9_to_27cm.fill(0.38, 36, 120);
+  payload.hourly.soil_moisture_27_to_81cm.fill(0.42, 36, 120);
+  const result = buildLandslideForecast({
+    series: parseOpenMeteoLandslideForecast(payload),
+    climatology: { dailyP95Mm: 80, validDayCount: 3_650 },
+    terrain: { state: "flat", provider: "Open-Meteo Elevation · Copernicus DEM", message: "test", maximumSlopeDeg: 22 },
+    radiusKm: 10,
+    fetchedAt: "2026-09-01T12:30:00.000Z",
+  });
+  assert.equal(result.horizons[0].soilMoistureSupport, "rising");
+  assert.equal(result.horizons[0].triggerLevel, "elevated");
+  assert.ok(result.horizons[0].screeningIndex >= 40 && result.horizons[0].screeningIndex <= 100);
+  assert.match(result.horizons[0].basis.join(" "), /最多一级|增强证据/);
+});

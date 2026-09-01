@@ -45,6 +45,7 @@ export type ForecastRiskObservation = {
   validFrom: string;
   validTo: string;
   riskPercent: number;
+  scoreKind?: "probability_percent" | "screening_index";
 };
 
 export type EvaluationSourceReliability = {
@@ -74,6 +75,7 @@ export type EvaluationCaseResult = {
   locationErrorKm?: number;
   spatialMatch?: "geometry_contains" | "point_tolerance" | "raster_cell";
   forecastRiskPercent?: number;
+  forecastScoreKind?: "probability_percent" | "screening_index";
   detectedSeverity?: EvaluationSeverity;
   expectedSeverity?: EvaluationSeverity;
   severityMet?: boolean;
@@ -218,7 +220,7 @@ export function evaluateDetectionBenchmarks(input: {
   const forecastNegativeEligible = eligible.filter((result) => result.objective === "landslide_forecast" && result.outcome === "no_event");
   const forecastFalseAlarms = forecastNegativeEligible.filter((result) => result.status === "false_alarm");
   const forecastPrecisionDenominator = forecastHits.length + forecastFalseAlarms.length;
-  const forecastCalibrationResults = [...forecastEligible, ...forecastNegativeEligible].filter((result) => result.forecastRiskPercent !== undefined);
+  const forecastCalibrationResults = [...forecastEligible, ...forecastNegativeEligible].filter((result) => result.forecastRiskPercent !== undefined && result.forecastScoreKind !== "screening_index");
   const forecastBrierScore = forecastCalibrationResults.length
     ? round(forecastCalibrationResults.reduce((total, result) => total + ((result.forecastRiskPercent ?? 0) / 100 - (result.outcome === "event" ? 1 : 0)) ** 2, 0) / forecastCalibrationResults.length, 4)
     : null;
@@ -317,6 +319,7 @@ export function evaluateDetectionBenchmarks(input: {
       "来源成功率表达抓取链路可用性，不等同于该来源对灾害事件的召回率或官方发布时效。",
       "滑坡/泥石流预测命中要求预测产品在真实事件发生前已被系统保存、有效期覆盖发生时刻，且预测面覆盖核验点或点目标落入配置容差。",
       "实时地图仍只展示达到业务阈值的高风险区；阈值扫描使用独立保存的完整概率栅格，不应将低风险格发布为灾害事件。",
+      "天巡区域滑坡试验筛查保存完整格网指数用于逐案命中/漏报核验，但指数不是概率，因此不进入Brier分数、概率可靠性曲线或NASA LHASA概率阈值标定。",
       "滑坡预测精确率、误报率、Brier 分数和推荐阈值只使用按同一时空规则核验的事件样本与无事件对照；样本不足时只展示探索性曲线，不给出推荐阈值。",
       "推荐阈值不得直接跨区域、跨季节复用；calibrationGroup 用于形成区域/季节分层，正式启用前应在独立留出样本上复验。",
     ],
@@ -424,14 +427,20 @@ function evaluateForecastObservationCase(
     })
     .sort((left, right) => Date.parse(left.capturedAt) - Date.parse(right.capturedAt));
   if (!valid.length) {
-    return { ...base, status: "insufficient_history", reason: "评测窗口内没有有效期覆盖核验时刻的完整概率栅格，不能判为漏报或正确排除。" };
+    return { ...base, status: "insufficient_history", reason: "评测窗口内没有有效期覆盖核验时刻的完整预测栅格或格网快照，不能判为漏报或正确排除。" };
   }
   const highestRisk = Math.max(...valid.map((item) => item.riskPercent));
+  const highestObservation = [...valid].sort((left, right) => right.riskPercent - left.riskPercent)[0];
+  const screeningIndex = highestObservation.scoreKind === "screening_index";
+  const valueLabel = screeningIndex ? "筛查指数" : "风险";
+  const unit = screeningIndex ? "" : "%";
+  const productLabel = screeningIndex ? "区域格网快照" : "完整概率栅格";
   const threshold = benchmark.minimumForecastRiskPercent ?? 80;
   const firstAboveThreshold = valid.find((item) => item.riskPercent >= threshold);
   const common = {
     ...base,
     forecastRiskPercent: highestRisk,
+    forecastScoreKind: highestObservation.scoreKind ?? "probability_percent" as const,
     spatialMatch: "raster_cell" as const,
   };
   if (base.outcome === "no_event") {
@@ -440,15 +449,15 @@ function evaluateForecastObservationCase(
         ...common,
         status: "false_alarm",
         detectedAt: firstAboveThreshold.capturedAt,
-        matchedTitle: `完整概率栅格 ${firstAboveThreshold.productId}`,
+        matchedTitle: `${productLabel} ${firstAboveThreshold.productId}`,
         forecastLeadMinutes: round((occurredAtMs - Date.parse(firstAboveThreshold.capturedAt)) / 60_000, 1),
-        reason: `已核验无事件对照在评测窗口内达到 ${highestRisk}%，高于 ${threshold}% 阈值，计为预测误报。`,
+        reason: `已核验无事件对照在评测窗口内的${valueLabel}达到 ${highestRisk}${unit}，高于 ${threshold}${unit} 阈值，计为预测误报。`,
       };
     }
     return {
       ...common,
       status: "correct_rejection",
-      reason: `完整概率栅格覆盖对照窗口，最高风险 ${highestRisk}%，未达到 ${threshold}% 阈值，计为正确排除。`,
+      reason: `${productLabel}覆盖对照窗口，最高${valueLabel} ${highestRisk}${unit}，未达到 ${threshold}${unit} 阈值，计为正确排除。`,
     };
   }
   if (firstAboveThreshold) {
@@ -457,15 +466,15 @@ function evaluateForecastObservationCase(
       ...common,
       status: "detected",
       detectedAt: firstAboveThreshold.capturedAt,
-      matchedTitle: `完整概率栅格 ${firstAboveThreshold.productId}`,
+      matchedTitle: `${productLabel} ${firstAboveThreshold.productId}`,
       forecastLeadMinutes: round(leadMinutes, 1),
-      reason: `系统在事件前 ${formatLead(leadMinutes)} 已归档完整概率栅格；核验位置风险最高 ${highestRisk}%，达到 ${threshold}% 阈值。`,
+      reason: `系统在事件前 ${formatLead(leadMinutes)} 已归档${productLabel}；核验位置${valueLabel}最高 ${highestRisk}${unit}，达到 ${threshold}${unit} 阈值。`,
     };
   }
   return {
     ...common,
     status: "missed",
-    reason: `完整概率栅格覆盖评测窗口，但核验位置最高风险仅 ${highestRisk}%，未达到 ${threshold}% 阈值。`,
+    reason: `${productLabel}覆盖评测窗口，但核验位置最高${valueLabel}仅 ${highestRisk}${unit}，未达到 ${threshold}${unit} 阈值。`,
   };
 }
 
@@ -522,7 +531,7 @@ function forecastRiskPercent(event: DisasterEvent) {
   return Number.isFinite(value) && value >= 0 && value <= 100 ? value : null;
 }
 
-function geometryContainsPoint(geometry: DisasterEvent["geometry"] | undefined, longitude: number, latitude: number) {
+export function geometryContainsPoint(geometry: DisasterEvent["geometry"] | undefined, longitude: number, latitude: number) {
   if (!geometry) return false;
   if (geometry.type === "Polygon") return polygonContainsPoint(geometry.coordinates as number[][][], longitude, latitude);
   if (geometry.type === "MultiPolygon") return (geometry.coordinates as number[][][][]).some((polygon) => polygonContainsPoint(polygon, longitude, latitude));

@@ -134,6 +134,30 @@ test("persists benchmark cases and reads spatial-temporal replay candidates", as
     assert.equal(forecastCandidates.length, 1);
     assert.equal(forecastCandidates[0].event.masterEventId, "ME-lhasa-1");
     assert.deepEqual(await database.evaluationSnapshotTimes("2026-09-01T00:00:00.000Z", "2026-09-01T02:00:00.000Z"), ["2026-09-01T01:00:00.000Z", "2026-09-01T02:00:00.000Z"]);
+    const regionalSnapshot = {
+      snapshotId: "regional-landslide:2026-09-01T00:00:00.000Z:cq-wanzhou:h24",
+      cycleAt: "2026-09-01T00:00:00.000Z",
+      modelVersion: "tianxun-regional-landslide-screening-v2",
+      regionId: "chongqing",
+      cellId: "cq-wanzhou",
+      cellMode: "sentinel",
+      leadHours: 24,
+      validFrom: "2026-09-01T00:00:00.000Z",
+      validTo: "2026-09-02T00:00:00.000Z",
+      triggerLevel: "elevated",
+      screeningIndex: 68,
+      latitude: 30.807,
+      longitude: 108.408,
+      radiusKm: 7.5,
+      geometry: { type: "Polygon", coordinates: [[[108.3, 30.7], [108.5, 30.7], [108.5, 30.9], [108.3, 30.9], [108.3, 30.7]]] },
+      inputs: { leadHours: 24, validFrom: "2026-09-01T00:00:00.000Z", validTo: "2026-09-02T00:00:00.000Z", precipitationMm: 80, maximumHourlyPrecipitationMm: 12, maximumSixHourPrecipitationMm: 45, localDailyP95Mm: 60, rainfallExceedanceRatio: 1.33, antecedent48HourPrecipitationMm: 50, antecedentLoadRatio: 0.42, soilMoistureFraction: 0.35, soilMoistureChange48h: 0.03, soilMoistureSupport: "rising", screeningIndex: 68, triggerLevel: "elevated", triggerLabel: "加强关注", confidence: "medium", automaticDispatchAllowed: false, action: "人工复核", basis: [] },
+      createdAt: "2026-09-01T00:00:00.000Z",
+    };
+    await database.persistRegionalLandslideForecastSnapshots([regionalSnapshot]);
+    const archivedRegional = await database.listRegionalLandslideForecastSnapshots("2026-08-31T23:00:00.000Z", "2026-09-01T01:00:00.000Z");
+    assert.equal(archivedRegional.length, 1);
+    assert.equal(archivedRegional[0].screeningIndex, 68);
+    assert.equal((await database.regionalLandslideArchiveStatus()).cycleCount, 1);
     assert.equal(await database.deleteEvaluationCase(benchmark.caseId), true);
     assert.equal(await database.deleteEvaluationCase(forecastBenchmark.caseId), true);
     assert.equal((await database.listEvaluationCases()).length, 0);

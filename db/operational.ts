@@ -23,6 +23,7 @@ import type { ForecastRasterStorageBackend } from "../lib/forecast-raster-storag
 import type { LhasaRiskRasterSummary } from "../lib/lhasa-nowcast.ts";
 import type { LhasaV1GranuleProbeRecord, LhasaV1GranuleStatus } from "../lib/lhasa-v1-history.ts";
 import type { LhasaV1CaseReadResult, LhasaV1ReadStatus } from "../lib/lhasa-v1-replay.ts";
+import type { RegionalLandslideForecastSnapshot } from "../lib/landslide-regional-screening.ts";
 
 type TaskRecord = Record<string, unknown> & {
   taskId: string;
@@ -378,6 +379,10 @@ export function ensureOperationalSchema() {
     `CREATE TABLE IF NOT EXISTS forecast_raster_products (product_id TEXT PRIMARY KEY NOT NULL, source_id TEXT NOT NULL, product_time TEXT NOT NULL, valid_from TEXT NOT NULL, valid_to TEXT NOT NULL, source_url TEXT NOT NULL, payload_sha256 TEXT NOT NULL, storage_key TEXT NOT NULL, storage_backend TEXT NOT NULL, content_type TEXT NOT NULL, byte_length INTEGER NOT NULL, source_width INTEGER NOT NULL, source_height INTEGER NOT NULL, group_pixels INTEGER NOT NULL, grid_width INTEGER NOT NULL, grid_height INTEGER NOT NULL, summary_json TEXT NOT NULL, archived_at TEXT NOT NULL)`,
     `CREATE UNIQUE INDEX IF NOT EXISTS forecast_raster_products_source_time_uidx ON forecast_raster_products (source_id, product_time)`,
     `CREATE INDEX IF NOT EXISTS forecast_raster_products_time_idx ON forecast_raster_products (product_time, source_id)`,
+    `CREATE TABLE IF NOT EXISTS regional_landslide_forecast_cells (snapshot_id TEXT PRIMARY KEY NOT NULL, cycle_at TEXT NOT NULL, model_version TEXT NOT NULL, region_id TEXT NOT NULL, cell_id TEXT NOT NULL, cell_mode TEXT NOT NULL, parent_cell_id TEXT, lead_hours INTEGER NOT NULL, valid_from TEXT NOT NULL, valid_to TEXT NOT NULL, trigger_level TEXT NOT NULL, screening_index INTEGER, latitude REAL NOT NULL, longitude REAL NOT NULL, radius_km REAL NOT NULL, geometry_json TEXT, inputs_json TEXT NOT NULL, land_cover_json TEXT, created_at TEXT NOT NULL)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS regional_landslide_cycle_cell_lead_uidx ON regional_landslide_forecast_cells (cycle_at, cell_id, lead_hours)`,
+    `CREATE INDEX IF NOT EXISTS regional_landslide_region_time_idx ON regional_landslide_forecast_cells (region_id, cycle_at)`,
+    `CREATE INDEX IF NOT EXISTS regional_landslide_validity_idx ON regional_landslide_forecast_cells (valid_from, valid_to)`,
   ];
   schemaReady = database().then(async (db) => {
     await db.batch(statements.map((statement) => db.prepare(statement)));
@@ -517,6 +522,7 @@ async function pruneOperationalDataIfDue(db: DatabaseLike, nowMs: number) {
       db.prepare(`DELETE FROM source_fetch_runs WHERE fetched_at < ?`).bind(new Date(nowMs - 30 * 86_400_000).toISOString()),
       db.prepare(`DELETE FROM source_payloads WHERE created_at < ? AND NOT EXISTS (SELECT 1 FROM source_fetch_runs r WHERE r.payload_sha256=source_payloads.payload_sha256)`).bind(new Date(nowMs - 30 * 86_400_000).toISOString()),
       db.prepare(`DELETE FROM ingestion_snapshots WHERE captured_at < ?`).bind(new Date(nowMs - 90 * 86_400_000).toISOString()),
+      db.prepare(`DELETE FROM regional_landslide_forecast_cells WHERE cycle_at < ?`).bind(auditCutoff),
     ]);
     lastRetentionPruneAt = nowMs;
   } catch (error) {
@@ -635,6 +641,71 @@ export async function forecastRasterArchiveStatus() {
     lastProductAt: row?.lastProductAt ? String(row.lastProductAt) : null,
     archivedBytes: Number(row?.archivedBytes ?? 0),
   };
+}
+
+export async function persistRegionalLandslideForecastSnapshots(snapshots: RegionalLandslideForecastSnapshot[]) {
+  if (!snapshots.length) return [];
+  await ensureOperationalSchema();
+  const db = await database();
+  const statements = snapshots.map((snapshot) => db.prepare(`INSERT INTO regional_landslide_forecast_cells (snapshot_id, cycle_at, model_version, region_id, cell_id, cell_mode, parent_cell_id, lead_hours, valid_from, valid_to, trigger_level, screening_index, latitude, longitude, radius_km, geometry_json, inputs_json, land_cover_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(snapshot_id) DO UPDATE SET trigger_level=excluded.trigger_level, screening_index=excluded.screening_index, geometry_json=excluded.geometry_json, inputs_json=excluded.inputs_json, land_cover_json=excluded.land_cover_json`)
+    .bind(snapshot.snapshotId, snapshot.cycleAt, snapshot.modelVersion, snapshot.regionId, snapshot.cellId, snapshot.cellMode, snapshot.parentCellId ?? null, snapshot.leadHours, snapshot.validFrom, snapshot.validTo, snapshot.triggerLevel, snapshot.screeningIndex, snapshot.latitude, snapshot.longitude, snapshot.radiusKm, snapshot.geometry ? JSON.stringify(snapshot.geometry) : null, JSON.stringify(snapshot.inputs), snapshot.landCover ? JSON.stringify(snapshot.landCover) : null, snapshot.createdAt));
+  for (let offset = 0; offset < statements.length; offset += operationalQueryBatchSize) await db.batch(statements.slice(offset, offset + operationalQueryBatchSize));
+  return snapshots;
+}
+
+export async function listRegionalLandslideForecastSnapshots(from?: string, to?: string, limit = 5_000): Promise<RegionalLandslideForecastSnapshot[]> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const boundedLimit = Math.max(1, Math.min(5_000, Math.round(limit)));
+  const select = `SELECT snapshot_id AS snapshotId, cycle_at AS cycleAt, model_version AS modelVersion, region_id AS regionId, cell_id AS cellId, cell_mode AS cellMode, parent_cell_id AS parentCellId, lead_hours AS leadHours, valid_from AS validFrom, valid_to AS validTo, trigger_level AS triggerLevel, screening_index AS screeningIndex, latitude, longitude, radius_km AS radiusKm, geometry_json AS geometryJson, inputs_json AS inputsJson, land_cover_json AS landCoverJson, created_at AS createdAt FROM regional_landslide_forecast_cells`;
+  const rows = from && to
+    ? await db.prepare(`${select} WHERE cycle_at BETWEEN ? AND ? ORDER BY cycle_at, cell_id, lead_hours LIMIT ?`).bind(from, to, boundedLimit).all<Record<string, unknown>>()
+    : await db.prepare(`${select} ORDER BY cycle_at DESC, cell_id, lead_hours LIMIT ?`).bind(boundedLimit).all<Record<string, unknown>>();
+  return rows.results.flatMap((row) => regionalLandslideSnapshotFromRow(row));
+}
+
+export async function regionalLandslideArchiveStatus() {
+  await ensureOperationalSchema();
+  const db = await database();
+  const row = await db.prepare(`SELECT COUNT(*) AS snapshotCount, COUNT(DISTINCT cycle_at) AS cycleCount, MIN(cycle_at) AS firstCycleAt, MAX(cycle_at) AS lastCycleAt FROM regional_landslide_forecast_cells`).first<Record<string, unknown>>();
+  return {
+    snapshotCount: Number(row?.snapshotCount ?? 0),
+    cycleCount: Number(row?.cycleCount ?? 0),
+    firstCycleAt: row?.firstCycleAt ? String(row.firstCycleAt) : null,
+    lastCycleAt: row?.lastCycleAt ? String(row.lastCycleAt) : null,
+  };
+}
+
+function regionalLandslideSnapshotFromRow(row: Record<string, unknown>): RegionalLandslideForecastSnapshot[] {
+  try {
+    const leadHours = Number(row.leadHours);
+    if (![24, 48, 72].includes(leadHours) || !["chongqing", "jiangsu"].includes(String(row.regionId)) || !["sentinel", "adaptive"].includes(String(row.cellMode))) return [];
+    return [{
+      snapshotId: String(row.snapshotId),
+      cycleAt: String(row.cycleAt),
+      modelVersion: String(row.modelVersion) as RegionalLandslideForecastSnapshot["modelVersion"],
+      regionId: String(row.regionId) as RegionalLandslideForecastSnapshot["regionId"],
+      cellId: String(row.cellId),
+      cellMode: String(row.cellMode) as RegionalLandslideForecastSnapshot["cellMode"],
+      parentCellId: row.parentCellId ? String(row.parentCellId) : undefined,
+      leadHours: leadHours as RegionalLandslideForecastSnapshot["leadHours"],
+      validFrom: String(row.validFrom),
+      validTo: String(row.validTo),
+      triggerLevel: String(row.triggerLevel) as RegionalLandslideForecastSnapshot["triggerLevel"],
+      screeningIndex: row.screeningIndex === null || row.screeningIndex === undefined ? null : Number(row.screeningIndex),
+      latitude: Number(row.latitude),
+      longitude: Number(row.longitude),
+      radiusKm: Number(row.radiusKm),
+      geometry: row.geometryJson ? JSON.parse(String(row.geometryJson)) : undefined,
+      inputs: JSON.parse(String(row.inputsJson)),
+      landCover: row.landCoverJson ? JSON.parse(String(row.landCoverJson)) : undefined,
+      createdAt: String(row.createdAt),
+    }];
+  } catch {
+    return [];
+  }
 }
 
 const forecastRasterSelectSql = `SELECT product_id AS productId, source_id AS sourceId, product_time AS productTime, valid_from AS validFrom, valid_to AS validTo, source_url AS sourceUrl, payload_sha256 AS payloadSha256, storage_key AS storageKey, storage_backend AS storageBackend, content_type AS contentType, byte_length AS byteLength, source_width AS sourceWidth, source_height AS sourceHeight, group_pixels AS groupPixels, grid_width AS gridWidth, grid_height AS gridHeight, summary_json AS summaryJson, archived_at AS archivedAt FROM forecast_raster_products`;

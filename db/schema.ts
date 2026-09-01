@@ -468,3 +468,29 @@ export const forecastRasterProducts = sqliteTable("forecast_raster_products", {
   uniqueIndex("forecast_raster_products_source_time_uidx").on(table.sourceId, table.productTime),
   index("forecast_raster_products_time_idx").on(table.productTime, table.sourceId),
 ]);
+
+export const regionalLandslideForecastCells = sqliteTable("regional_landslide_forecast_cells", {
+  snapshotId: text("snapshot_id").primaryKey(),
+  cycleAt: text("cycle_at").notNull(),
+  modelVersion: text("model_version").notNull(),
+  regionId: text("region_id").notNull(),
+  cellId: text("cell_id").notNull(),
+  cellMode: text("cell_mode").notNull(),
+  parentCellId: text("parent_cell_id"),
+  leadHours: integer("lead_hours").notNull(),
+  validFrom: text("valid_from").notNull(),
+  validTo: text("valid_to").notNull(),
+  triggerLevel: text("trigger_level").notNull(),
+  screeningIndex: integer("screening_index"),
+  latitude: real("latitude").notNull(),
+  longitude: real("longitude").notNull(),
+  radiusKm: real("radius_km").notNull(),
+  geometryJson: text("geometry_json"),
+  inputsJson: text("inputs_json").notNull(),
+  landCoverJson: text("land_cover_json"),
+  createdAt: text("created_at").notNull(),
+}, (table) => [
+  uniqueIndex("regional_landslide_cycle_cell_lead_uidx").on(table.cycleAt, table.cellId, table.leadHours),
+  index("regional_landslide_region_time_idx").on(table.regionId, table.cycleAt),
+  index("regional_landslide_validity_idx").on(table.validFrom, table.validTo),
+]);

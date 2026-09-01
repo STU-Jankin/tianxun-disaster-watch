@@ -14,7 +14,7 @@ import {
 import { normalizeAntimeridianGeometry, validateGeoGeometry } from "../../../lib/geo-geometry";
 import { latestByKey } from "../../../lib/latest-by-key";
 import { applyEventSourcePresence } from "../../../lib/event-presence";
-import { getForecastRasterProduct, listRetainedCanonicalEvents, persistCanonicalEvents, persistIngestionArtifacts, resolveCanonicalEventsByReferences, upsertForecastRasterProduct, type SourceFetchCapture } from "../../../db/operational";
+import { getForecastRasterProduct, listRetainedCanonicalEvents, persistCanonicalEvents, persistIngestionArtifacts, persistRegionalLandslideForecastSnapshots, resolveCanonicalEventsByReferences, upsertForecastRasterProduct, type SourceFetchCapture } from "../../../db/operational";
 import { circularGeometryCenter, cycloneSeverityFromKnots, firmsConfidenceScore, firmsHeatSeverity, latestTrackPoint } from "../../../lib/source-normalization";
 import { authorizeApiRequest } from "../../../lib/api-security";
 import { buildHourlyCycloneImpactField, buildJmaCycloneForecast, extractKmlFromKmz, parseNhcConeKml, parseNhcTrackKml, parseNhcWindRadiiKml } from "../../../lib/cyclone-forecast";
@@ -64,11 +64,14 @@ import { matchLandslidePilotRegion } from "../../../lib/landslide-pilot-regions"
 import {
   REGIONAL_LANDSLIDE_SCREENING_SOURCE,
   attachRegionalTerrainGeometry,
+  buildRegionalAdaptiveCells,
+  buildRegionalForecastSnapshots,
   buildRegionalLandslideScreeningProducts,
   isRegionalLandslideScreeningSource,
   regionalLandslidePilotCells,
   type RegionalLandslideCellResult,
 } from "../../../lib/landslide-regional-screening";
+import { sampleWorldCover, summarizeWorldCover, type WorldCoverProfile } from "../../../lib/worldcover";
 
 export const dynamic = "force-dynamic";
 
@@ -139,6 +142,7 @@ let usgsGroundFailureCache: { events: DisasterEvent[]; expiresAt: number } | nul
 let regionalLandslideScreeningCache: { events: DisasterEvent[]; expiresAt: number } | null = null;
 const regionalLandslideClimatologyCache = new Map<string, { value: OpenMeteoClimatology; expiresAt: number }>();
 const regionalLandslideTerrainCache = new Map<string, { value: LandslideTerrainResult; expiresAt: number }>();
+const regionalLandslideLandCoverCache = new Map<string, { value: WorldCoverProfile; expiresAt: number }>();
 const nveBoundaryCache = new Map<string, { geometry: { type: string; coordinates: unknown }; expiresAt: number }>();
 const memGeocodeCache = new Map<string, { coordinate: RoutingCoordinate; expiresAt: number }>();
 let activeRefreshId: string | null = null;
@@ -215,7 +219,7 @@ async function refreshEvents() {
       tier: "中国第二批",
       role: "预报",
       setupUrl: "https://open-meteo.com/en/docs",
-      successMessage: `在线；${regionalLandslidePilotCells.length} 个固定试验格每6小时筛查一次，只在24/48小时达到加强关注时形成风险面，72小时仅作趋势；禁止自动告警、自动计算和自动下发`,
+      successMessage: `在线；${regionalLandslidePilotCells.length} 个哨点格每6小时筛查，条件达到门槛时最多增加16个15公里加密格；融合降雨、土壤湿度趋势、DEM与ESA WorldCover背景，只在24/48小时达到加强关注时形成风险面，72小时仅作趋势；禁止自动告警、自动计算和自动下发`,
       fetcher: fetchRegionalLandslideScreening,
     },
     {
@@ -1100,9 +1104,27 @@ async function fetchRegionalLandslideScreening(): Promise<DisasterEvent[]> {
   if (regionalLandslideScreeningCache && regionalLandslideScreeningCache.expiresAt > now) return regionalLandslideScreeningCache.events;
   const cycleMs = Math.floor(now / (6 * 3_600_000)) * 6 * 3_600_000;
   const issuedAt = new Date(cycleMs).toISOString();
-  const settled = await mapWithConcurrency(regionalLandslidePilotCells, 3, (cell) => fetchRegionalLandslideCell(cell, issuedAt));
-  const results = settled.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
-  if (!results.length) throw new Error("重庆/江苏固定试验格输入均不可用");
+  const sentinelSettled = await mapWithConcurrency(regionalLandslidePilotCells, 3, (cell) => fetchRegionalLandslideCell(cell, issuedAt));
+  const sentinelResults = sentinelSettled.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+  if (!sentinelResults.length) throw new Error("重庆/江苏哨点试验格输入均不可用");
+  const adaptiveCells = buildRegionalAdaptiveCells(sentinelResults);
+  const adaptiveSettled = await mapWithConcurrency(adaptiveCells, 3, (cell) => fetchRegionalLandslideCell(cell, issuedAt));
+  const adaptiveResults = adaptiveSettled.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+  const rawResults = [...sentinelResults, ...adaptiveResults];
+  const enrichedSettled = await mapWithConcurrency(rawResults, 3, async (result) => {
+    try {
+      const landCover = await regionalLandslideLandCover(result);
+      return { ...result, landCover };
+    } catch {
+      return result;
+    }
+  });
+  const results = enrichedSettled.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+  try {
+    await persistRegionalLandslideForecastSnapshots(buildRegionalForecastSnapshots(results, issuedAt));
+  } catch (error) {
+    console.error("regional landslide forecast archive unavailable", error);
+  }
   const products = buildRegionalLandslideScreeningProducts(results, issuedAt);
   const events = products.map((product) => {
     const candidate: PublicEventCandidate = {
@@ -1128,6 +1150,7 @@ async function fetchRegionalLandslideScreening(): Promise<DisasterEvent[]> {
     const event = publicCandidateEvent(candidate, REGIONAL_LANDSLIDE_SCREENING_SOURCE, "regional-landslide");
     return {
       ...event,
+      regionalLandslideScreening: product,
       confidenceScore: Math.min(64, event.confidenceScore),
       confidenceLevel: "low" as const,
       observable: "conditional" as const,
@@ -1135,7 +1158,7 @@ async function fetchRegionalLandslideScreening(): Promise<DisasterEvent[]> {
       aoiApprovalRequired: true,
       observationTargets: ["潜在滑坡源区", "道路切坡", "沟道堵塞", "灾前参考影像"],
       recommendedSensors: ["高分光学", "SAR"],
-      description: `${event.description} 本轮覆盖 ${results.length}/${regionalLandslidePilotCells.length} 个固定格；未计算格网不作低风险解释。`,
+      description: `${event.description} 本轮完成 ${sentinelResults.length}/${regionalLandslidePilotCells.length} 个哨点格和 ${adaptiveResults.length}/${adaptiveCells.length} 个条件加密格；未计算格网不作低风险解释。`,
     };
   });
   regionalLandslideScreeningCache = { events, expiresAt: cycleMs + 6 * 3_600_000 };
@@ -1217,6 +1240,29 @@ async function regionalLandslideTerrain(cellId: string, plan: ReturnType<typeof 
   regionalLandslideTerrainCache.set(cellId, { value, expiresAt: Date.now() + 30 * 86_400_000 });
   return value;
 }
+
+async function regionalLandslideLandCover(result: RegionalLandslideCellResult) {
+  const cached = regionalLandslideLandCoverCache.get(result.cell.id);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  const geometry = result.forecast.terrain.state === "ready"
+    ? (result.forecast as LandslideForecastReadyWithGeometry).terrainGeometry
+    : undefined;
+  if (!geometry) throw new Error("无DEM候选面，不运行土地覆盖采样");
+  const terrain = regionalLandslideTerrainCache.get(result.cell.id)?.value;
+  if (!terrain || terrain.state !== "ready") throw new Error("无可采样的DEM坡面单元");
+  const points = terrain.cells.filter((cell) => cell.selected).map((cell) => ({
+    id: `${result.cell.id}:${cell.row}:${cell.column}`,
+    longitude: cell.longitude,
+    latitude: cell.latitude,
+  }));
+  if (!points.length) throw new Error("DEM坡面单元为空");
+  const samples = await sampleWorldCover(points);
+  const value = summarizeWorldCover(samples);
+  regionalLandslideLandCoverCache.set(result.cell.id, { value, expiresAt: Date.now() + 180 * 86_400_000 });
+  return value;
+}
+
+type LandslideForecastReadyWithGeometry = ReturnType<typeof buildLandslideForecast> & { terrainGeometry?: DisasterEvent["geometry"] };
 
 async function mapWithConcurrency<T, R>(values: T[], limit: number, mapper: (value: T) => Promise<R>) {
   const results = new Array<PromiseSettledResult<R>>(values.length);

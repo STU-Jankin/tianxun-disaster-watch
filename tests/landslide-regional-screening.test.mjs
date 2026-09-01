@@ -5,6 +5,8 @@ import {
   REGIONAL_LANDSLIDE_SCREENING_PRODUCT,
   REGIONAL_LANDSLIDE_SCREENING_SOURCE,
   attachRegionalTerrainGeometry,
+  buildRegionalAdaptiveCells,
+  buildRegionalForecastSnapshots,
   buildRegionalLandslideScreeningProducts,
   isRegionalLandslideScreeningSource,
   regionalLandslidePilotCells,
@@ -25,6 +27,9 @@ function forecast(levels, longitude = 108.4, latitude = 30.8) {
     antecedent48HourPrecipitationMm: 50,
     antecedentLoadRatio: 0.42,
     soilMoistureFraction: 0.3,
+    soilMoistureChange48h: levels[leadHours] === "high" ? 0.04 : 0.01,
+    soilMoistureSupport: levels[leadHours] === "high" ? "rising" : "steady",
+    screeningIndex: levels[leadHours] === "high" ? 88 : levels[leadHours] === "elevated" ? 68 : levels[leadHours] === "watch" ? 48 : 20,
     triggerLevel: levels[leadHours],
     triggerLabel: levels[leadHours],
     confidence: leadHours === 72 ? "low" : "medium",
@@ -34,7 +39,7 @@ function forecast(levels, longitude = 108.4, latitude = 30.8) {
   }));
   const value = {
     state: "ready",
-    product: "tianxun-rainfall-trigger-screening-v1",
+    product: "tianxun-rainfall-trigger-screening-v2",
     modelStatus: "experimental_unvalidated",
     provider: "test",
     weatherModel: { id: "cma_grapes_global", label: "CMA GRAPES Global", nativeResolutionKm: 15, updateIntervalHours: 6, selectionReason: "test" },
@@ -97,4 +102,28 @@ test("regional source identity is exact and safe for compound source labels", ()
   assert.equal(isRegionalLandslideScreeningSource(REGIONAL_LANDSLIDE_SCREENING_SOURCE), true);
   assert.equal(isRegionalLandslideScreeningSource(`${REGIONAL_LANDSLIDE_SCREENING_SOURCE} · CMA GRAPES Global`), true);
   assert.equal(isRegionalLandslideScreeningSource("NASA LHASA"), false);
+});
+
+test("adaptive refinement is bounded and only expands active sentinel cells", () => {
+  const active = regionalLandslidePilotCells[0];
+  const quiet = regionalLandslidePilotCells[1];
+  const cells = buildRegionalAdaptiveCells([
+    { cell: active, forecast: forecast({ 24: "elevated", 48: "watch", 72: "watch" }, active.longitude, active.latitude) },
+    { cell: quiet, forecast: forecast({ 24: "low_signal", 48: "low_signal", 72: "low_signal" }, quiet.longitude, quiet.latitude) },
+  ]);
+  assert.ok(cells.length > 0 && cells.length <= 4);
+  assert.ok(cells.every((cell) => cell.mode === "adaptive" && cell.parentCellId === active.id));
+  assert.ok(cells.every((cell) => !regionalLandslidePilotCells.some((seed) => Math.abs(seed.latitude - cell.latitude) < 0.01 && Math.abs(seed.longitude - cell.longitude) < 0.01)));
+});
+
+test("archives every lead and low-signal cell instead of keeping only published risk events", () => {
+  const cell = regionalLandslidePilotCells[0];
+  const snapshots = buildRegionalForecastSnapshots([
+    { cell, forecast: forecast({ 24: "low_signal", 48: "watch", 72: "elevated" }, cell.longitude, cell.latitude) },
+  ], issuedAt);
+  assert.equal(snapshots.length, 3);
+  assert.deepEqual(snapshots.map((item) => item.leadHours), [24, 48, 72]);
+  assert.equal(snapshots[0].cellMode, "sentinel");
+  assert.equal(snapshots[0].screeningIndex, 20);
+  assert.match(snapshots[0].snapshotId, /regional-landslide:/);
 });

@@ -9,19 +9,22 @@ import {
   listEvaluationRuns,
   listForecastRasterProducts,
   listLhasaV1GranuleProbes,
+  listRegionalLandslideForecastSnapshots,
   persistEvaluationRun,
+  regionalLandslideArchiveStatus,
   upsertEvaluationCase,
   upsertLhasaV1GranuleProbe,
   updateLhasaV1GranuleRead,
 } from "../../../db/operational";
 import { apiActor, ApiInputError, authorizeApiRequest, enforceRateLimit, readJsonObject, rejectCrossOriginBrowserWrite } from "../../../lib/api-security";
-import { evaluateDetectionBenchmarks, evaluationCoverageGapMinutes, evaluationWindow, type EvaluationBenchmarkCase, type EvaluationObjective } from "../../../lib/evaluation-center";
+import { evaluateDetectionBenchmarks, evaluationCoverageGapMinutes, evaluationWindow, geometryContainsPoint, haversineKm, type EvaluationBenchmarkCase, type EvaluationObjective } from "../../../lib/evaluation-center";
 import type { HazardSubtype, HazardType } from "../../../lib/disasters";
 import { decodeLhasaRiskPng, lhasaRiskAtLocation } from "../../../lib/lhasa-nowcast";
 import { readForecastRasterObject, storeForecastRasterObject } from "../../../lib/forecast-raster-storage";
 import { buildNasaGlcPilot, nasaGlcCsvUrl, nasaGlcDatasetUrl, nasaGlcMaximumCsvBytes, nasaGlcPilotLimit, nasaGlcPilotPrefix } from "../../../lib/official-landslide-benchmark";
 import { lhasaV1CollectionConceptId, lhasaV1CoverageEnd, lhasaV1CoverageStart, lhasaV1DatasetUrl, lhasaV1Doi, lhasaV1ProductDate, probeLhasaV1Granule, type LhasaV1GranuleMetadata, type LhasaV1GranuleProbeRecord } from "../../../lib/lhasa-v1-history";
 import { downloadLhasaV1GeoTiff, lhasaV1MaximumBatchProducts, readLhasaV1CaseWindows, type LhasaV1ReadStatus } from "../../../lib/lhasa-v1-replay";
+import { REGIONAL_LANDSLIDE_SCREENING_SOURCE, type RegionalLandslideForecastSnapshot } from "../../../lib/landslide-regional-screening";
 
 export const dynamic = "force-dynamic";
 
@@ -29,16 +32,18 @@ const hazards = new Set<HazardType>(["earthquake", "tsunami", "wildfire", "flood
 const severities = new Set(["blue", "yellow", "orange", "red"]);
 const objectives = new Set<EvaluationObjective>(["event_detection", "landslide_forecast"]);
 const landslideSubtypes = new Set<HazardSubtype>(["landslide", "debris_flow", "rockfall", "slope_failure", "mass_movement"]);
+const landslideForecastSources = new Set(["NASA LHASA", REGIONAL_LANDSLIDE_SCREENING_SOURCE]);
 
 export async function GET(request: Request) {
   const unauthorized = await authorizeApiRequest(request, "viewer");
   if (unauthorized) return unauthorized;
-  const [cases, runs, forecastArchive, lhasaV1Probes] = await Promise.all([listEvaluationCases(), listEvaluationRuns(10), forecastRasterArchiveStatus(), listLhasaV1GranuleProbes()]);
+  const [cases, runs, forecastArchive, regionalForecastArchive, lhasaV1Probes] = await Promise.all([listEvaluationCases(), listEvaluationRuns(10), forecastRasterArchiveStatus(), regionalLandslideArchiveStatus(), listLhasaV1GranuleProbes()]);
   return Response.json({
     cases,
     runs,
     latest: runs[0] ?? null,
     forecastArchive,
+    regionalForecastArchive,
     officialPilotCatalog: {
       catalog: "NASA Global Landslide Catalog",
       datasetUrl: nasaGlcDatasetUrl,
@@ -251,13 +256,18 @@ export async function POST(request: Request) {
         evaluationSourceReliability(from, to),
       ]);
       const forecastCases = cases.filter((benchmark) => benchmark.objective === "landslide_forecast" && benchmark.verificationStatus === "verified");
-      const forecastProducts = forecastCases.length ? await listForecastRasterProducts(from, to, 1_500) : [];
-      const forecastObservationsByCase: Record<string, Array<{ productId: string; capturedAt: string; validFrom: string; validTo: string; riskPercent: number }>> = {};
+      const regionalForecastCases = forecastCases.filter((benchmark) => benchmark.requiredSource?.trim() === REGIONAL_LANDSLIDE_SCREENING_SOURCE);
+      const probabilityForecastCases = forecastCases.filter((benchmark) => benchmark.requiredSource?.trim() !== REGIONAL_LANDSLIDE_SCREENING_SOURCE);
+      const [forecastProducts, regionalSnapshots] = await Promise.all([
+        probabilityForecastCases.length ? listForecastRasterProducts(from, to, 1_500) : [],
+        regionalForecastCases.length ? listRegionalLandslideForecastSnapshots(from, to, 5_000) : [],
+      ]);
+      const forecastObservationsByCase: Record<string, Array<{ productId: string; capturedAt: string; validFrom: string; validTo: string; riskPercent: number; scoreKind?: "probability_percent" | "screening_index" }>> = {};
       let forecastArchiveUnreadableCount = 0;
-      if (forecastProducts.length) {
+      if (forecastProducts.length || regionalSnapshots.length) {
         for (const benchmark of forecastCases) forecastObservationsByCase[benchmark.caseId] = [];
         for (const product of forecastProducts) {
-          const relevantCases = forecastCases.filter((benchmark) => {
+          const relevantCases = probabilityForecastCases.filter((benchmark) => {
             const window = evaluationWindow(benchmark);
             return Date.parse(product.archivedAt) >= Date.parse(window.startAt)
               && Date.parse(product.archivedAt) <= Date.parse(window.expectedBy)
@@ -279,12 +289,32 @@ export async function POST(request: Request) {
                 validFrom: product.validFrom,
                 validTo: product.validTo,
                 riskPercent,
+                scoreKind: "probability_percent",
               });
             }
           } catch (error) {
             forecastArchiveUnreadableCount += 1;
             console.error(`forecast archive ${product.productId} could not be replayed`, error);
           }
+        }
+        for (const snapshot of regionalSnapshots) {
+          if (snapshot.screeningIndex === null) continue;
+          const relevantCases = regionalForecastCases.filter((benchmark) => {
+            const window = evaluationWindow(benchmark);
+            return Date.parse(snapshot.cycleAt) >= Date.parse(window.startAt)
+              && Date.parse(snapshot.cycleAt) <= Date.parse(window.expectedBy)
+              && Date.parse(snapshot.validFrom) <= Date.parse(benchmark.occurredAt)
+              && Date.parse(snapshot.validTo) >= Date.parse(benchmark.occurredAt)
+              && regionalSnapshotCovers(snapshot, benchmark.longitude, benchmark.latitude, benchmark.locationToleranceKm);
+          });
+          for (const benchmark of relevantCases) forecastObservationsByCase[benchmark.caseId].push({
+            productId: snapshot.snapshotId,
+            capturedAt: snapshot.cycleAt,
+            validFrom: snapshot.validFrom,
+            validTo: snapshot.validTo,
+            riskPercent: snapshot.screeningIndex,
+            scoreKind: "screening_index",
+          });
         }
       }
       const report = evaluateDetectionBenchmarks({
@@ -294,7 +324,7 @@ export async function POST(request: Request) {
         candidatesByCase,
         snapshotTimes,
         sourceSuccessTimesByCase,
-        forecastObservationsByCase: forecastProducts.length ? forecastObservationsByCase : undefined,
+        forecastObservationsByCase: forecastProducts.length || regionalSnapshots.length ? forecastObservationsByCase : undefined,
         forecastArchiveProductCount: forecastProducts.length,
         forecastArchiveUnreadableCount,
         historyDays,
@@ -403,8 +433,10 @@ function benchmarkFromInput(value: unknown, actor: string): EvaluationBenchmarkC
   const acceptedLeadMinutes = integer(input.acceptedLeadMinutes, objective === "landslide_forecast" ? "最大预测提前量" : "允许提前发现时间", 0, 10_080);
   const detectionDeadlineMinutes = integer(input.detectionDeadlineMinutes, objective === "landslide_forecast" ? "最小有效提前量" : "检测时限", objective === "landslide_forecast" ? 0 : 1, 10_080);
   if (objective === "landslide_forecast" && acceptedLeadMinutes <= detectionDeadlineMinutes) throw new ApiInputError("最大预测提前量必须大于最小有效提前量", 400);
+  const requiredSource = objective === "landslide_forecast" ? optionalText(input.requiredSource, 120) ?? "NASA LHASA" : optionalText(input.requiredSource, 120);
+  if (objective === "landslide_forecast" && !landslideForecastSources.has(requiredSource!)) throw new ApiInputError("滑坡预测评测来源仅支持 NASA LHASA 或天巡区域试验筛查", 400);
   const minimumForecastRiskPercent = objective === "landslide_forecast"
-    ? finiteNumber(input.minimumForecastRiskPercent ?? 80, "最低预测风险值", 50, 100)
+    ? finiteNumber(input.minimumForecastRiskPercent ?? 80, requiredSource === REGIONAL_LANDSLIDE_SCREENING_SOURCE ? "最低筛查指数" : "最低预测风险值", 50, 100)
     : undefined;
   const notes = optionalText(input.notes, 500) ?? "";
   if (outcome === "no_event" && verificationStatus === "verified" && notes.length < 10) throw new ApiInputError("已核验无事件对照必须在备注中说明核验目录和时间范围", 400);
@@ -424,7 +456,7 @@ function benchmarkFromInput(value: unknown, actor: string): EvaluationBenchmarkC
     acceptedLeadMinutes,
     detectionDeadlineMinutes,
     expectedSeverity: expectedSeverity as EvaluationBenchmarkCase["expectedSeverity"],
-    requiredSource: objective === "landslide_forecast" ? optionalText(input.requiredSource, 120) ?? "NASA LHASA" : optionalText(input.requiredSource, 120),
+    requiredSource,
     minimumForecastRiskPercent,
     provenanceUrl,
     notes,
@@ -476,4 +508,9 @@ function sourceUrl(value: unknown) {
 
 function privateHeaders() {
   return { "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" };
+}
+
+function regionalSnapshotCovers(snapshot: RegionalLandslideForecastSnapshot, longitude: number, latitude: number, toleranceKm: number) {
+  if (snapshot.geometry) return geometryContainsPoint(snapshot.geometry, longitude, latitude);
+  return haversineKm(snapshot.latitude, snapshot.longitude, latitude, longitude) <= Math.max(snapshot.radiusKm, toleranceKm);
 }
