@@ -9,6 +9,7 @@ type EvaluationPayload = {
   runs: DetectionEvaluationReport[];
   latest: DetectionEvaluationReport | null;
   forecastArchive?: { productCount: number; firstProductAt: string | null; lastProductAt: string | null; archivedBytes: number };
+  officialPilotCatalog?: { catalog: string; datasetUrl: string; targetCount: number; importedCount: number; verificationPolicy: "draft_only"; comparisonModel: string };
   error?: string;
 };
 type EvaluationForm = {
@@ -211,6 +212,25 @@ export function EvaluationCenter({ open, role, onClose }: { open: boolean; role:
     }
   };
 
+  const importOfficialPilot = async () => {
+    setState("saving");
+    setMessage("");
+    try {
+      const response = await fetch("/api/evaluation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "import_official_landslide_pilot" }),
+      });
+      const result = await response.json() as { imported?: number; added?: number; refreshed?: number; stats?: { eligibleRows: number; countries: number }; error?: string };
+      if (!response.ok || !result.imported) throw new Error(result.error || "官方试验库导入失败");
+      await load();
+      setMessage(`NASA GLC试验库已导入${result.imported}条草稿：新增${result.added ?? 0}条、刷新${result.refreshed ?? 0}条，覆盖${result.stats?.countries ?? 0}个国家。请逐条核对后再标记为已核验。`);
+    } catch (error) {
+      setState("error");
+      setMessage(error instanceof Error ? error.message : "官方试验库导入失败");
+    }
+  };
+
   const runEvaluation = async () => {
     setState("running");
     setMessage("");
@@ -260,6 +280,14 @@ export function EvaluationCenter({ open, role, onClose }: { open: boolean; role:
       <section className="evaluation-archive-status">
         <div><span>完整概率归档</span><strong>{payload.forecastArchive?.productCount ?? 0} 期</strong></div>
         <p>{payload.forecastArchive?.lastProductAt ? `最近产品 ${formatDateTime(payload.forecastArchive.lastProductAt)} · ${formatBytes(payload.forecastArchive.archivedBytes)}` : "归档将在下一次成功读取NASA LHASA产品后开始；此前只能验证80%以上实时筛查结果。"}</p>
+      </section>
+
+      <section className="evaluation-official-pilot">
+        <div className="evaluation-section-title"><div><span>官方历史试验库</span><strong>{payload.officialPilotCatalog?.importedCount ?? 0}/{payload.officialPilotCatalog?.targetCount ?? 20} 条</strong></div>{role === "admin" ? <button type="button" onClick={() => void importOfficialPilot()} disabled={state === "saving" || state === "running"}>{state === "saving" ? "正在处理…" : (payload.officialPilotCatalog?.importedCount ?? 0) >= (payload.officialPilotCatalog?.targetCount ?? 20) ? "重新核对目录" : "导入首批草稿"}</button> : null}</div>
+        <p>从 NASA Global Landslide Catalog 在线读取，严格限定降雨诱因、2000—2020年、HTTPS原始来源以及 exact/1 km/5 km 定位精度，再按灾种和国家有界抽样。</p>
+        <div className="evaluation-pilot-rules"><span>13 条 landslide</span><span>5 条 mudslide</span><span>2 条 debris flow</span><span>单国最多2条</span><span>同源/同日近邻去重</span><span>全部先标记草稿</span></div>
+        <small>类别名称沿用 NASA 原始目录；严格条件下 debris_flow 仅有2条合格记录，因此不为凑数放宽定位或来源要求。目录正样本不自动等同于权威核验，也不会自动生成“无事件”对照；日期级记录以12:00 UTC占位，必须核对原始报道、当地时区和灾种。历史回放还需另行接入NASA LHASA v1栅格。</small>
+        <a href={payload.officialPilotCatalog?.datasetUrl ?? "https://data.nasa.gov/dataset/global-landslide-catalog-export"} target="_blank" rel="noreferrer">查看 NASA 官方目录 ↗</a>
       </section>
 
       {state === "loading" && !payload.cases.length ? <div className="evaluation-empty">正在读取评测资料…</div> : null}

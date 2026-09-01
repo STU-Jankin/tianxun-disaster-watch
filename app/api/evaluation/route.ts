@@ -16,6 +16,7 @@ import { evaluateDetectionBenchmarks, evaluationCoverageGapMinutes, evaluationWi
 import type { HazardSubtype, HazardType } from "../../../lib/disasters";
 import { decodeLhasaRiskPng, lhasaRiskAtLocation } from "../../../lib/lhasa-nowcast";
 import { readForecastRasterObject } from "../../../lib/forecast-raster-storage";
+import { buildNasaGlcPilot, nasaGlcCsvUrl, nasaGlcDatasetUrl, nasaGlcMaximumCsvBytes, nasaGlcPilotLimit, nasaGlcPilotPrefix } from "../../../lib/official-landslide-benchmark";
 
 export const dynamic = "force-dynamic";
 
@@ -28,7 +29,20 @@ export async function GET(request: Request) {
   const unauthorized = await authorizeApiRequest(request, "viewer");
   if (unauthorized) return unauthorized;
   const [cases, runs, forecastArchive] = await Promise.all([listEvaluationCases(), listEvaluationRuns(10), forecastRasterArchiveStatus()]);
-  return Response.json({ cases, runs, latest: runs[0] ?? null, forecastArchive }, { headers: privateHeaders() });
+  return Response.json({
+    cases,
+    runs,
+    latest: runs[0] ?? null,
+    forecastArchive,
+    officialPilotCatalog: {
+      catalog: "NASA Global Landslide Catalog",
+      datasetUrl: nasaGlcDatasetUrl,
+      targetCount: nasaGlcPilotLimit,
+      importedCount: cases.filter((item) => item.caseId.startsWith(nasaGlcPilotPrefix)).length,
+      verificationPolicy: "draft_only",
+      comparisonModel: "NASA LHASA v1 historical",
+    },
+  }, { headers: privateHeaders() });
 }
 
 export async function POST(request: Request) {
@@ -61,6 +75,30 @@ export async function POST(request: Request) {
       if (existingCases.length + addedCount > 100) throw new ApiInputError("导入后将超过 100 个样本上限，请先清理旧样本", 409);
       for (const benchmark of benchmarks) await upsertEvaluationCase(benchmark);
       return Response.json({ imported: benchmarks.length, cases: benchmarks }, { headers: privateHeaders() });
+    }
+    if (action === "import_official_landslide_pilot") {
+      const response = await fetch(nasaGlcCsvUrl, {
+        headers: { "Accept": "text/csv" },
+        redirect: "follow",
+        signal: AbortSignal.timeout(60_000),
+      });
+      if (!response.ok) throw new ApiInputError(`NASA GLC目录暂不可用（HTTP ${response.status}）`, 503);
+      const csv = await readBoundedCatalogText(response, nasaGlcMaximumCsvBytes);
+      const pilot = buildNasaGlcPilot(csv, nasaGlcPilotLimit);
+      const actor = await apiActor(request);
+      const benchmarks = pilot.cases.map((item) => benchmarkFromInput(item as unknown as Record<string, unknown>, actor));
+      const existingCases = await listEvaluationCases();
+      const existingIds = new Set(existingCases.map((item) => item.caseId));
+      const addedCount = benchmarks.filter((item) => !existingIds.has(item.caseId)).length;
+      if (existingCases.length + addedCount > 100) throw new ApiInputError(`官方试验库需要新增 ${addedCount} 条，导入后将超过100条上限，请先清理旧草稿`, 409);
+      for (const benchmark of benchmarks) await upsertEvaluationCase({ ...benchmark, verificationStatus: "draft" });
+      return Response.json({
+        imported: benchmarks.length,
+        added: addedCount,
+        refreshed: benchmarks.length - addedCount,
+        stats: pilot.stats,
+        policy: "所有目录记录均以草稿导入；禁止自动进入正式指标",
+      }, { headers: privateHeaders() });
     }
     if (action === "delete_case") {
       const caseId = text(body.caseId, "样本编号", 120);
@@ -153,6 +191,33 @@ export async function POST(request: Request) {
     console.error("evaluation center operation failed", error);
     return Response.json({ error: "评测中心暂不可用，请稍后重试" }, { status: 503, headers: privateHeaders() });
   }
+}
+
+async function readBoundedCatalogText(response: Response, maximumBytes: number) {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maximumBytes) throw new ApiInputError("NASA GLC目录超过12 MB安全上限", 503);
+  if (!response.body) throw new ApiInputError("NASA GLC目录未返回数据", 503);
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > maximumBytes) {
+      await reader.cancel();
+      throw new ApiInputError("NASA GLC目录超过12 MB安全上限", 503);
+    }
+    chunks.push(value);
+  }
+  if (!response.headers.get("content-encoding") && declared > 0 && total !== declared) {
+    throw new ApiInputError(`NASA GLC目录下载不完整（收到${total}字节，应为${declared}字节）`, 503);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 }
 
 function benchmarkFromInput(value: unknown, actor: string): EvaluationBenchmarkCase {
