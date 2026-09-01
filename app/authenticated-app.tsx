@@ -152,23 +152,16 @@ export function LoginScreen({ configured, serviceUnavailable = false }: { config
   const describedBy = [capsLock ? "login-caps-lock" : "", error ? "login-error" : ""].filter(Boolean).join(" ") || undefined;
   return <main className="login-shell">
     <section className="login-visual" aria-hidden="true">
-      <div className="login-grid" />
-      <div className="login-orbit orbit-one" />
-      <div className="login-orbit orbit-two" />
-      <div className="login-earth">
-        <span className="login-target target-one" />
-        <span className="login-target target-two" />
-        <span className="login-coverage"><b>候选观测区</b></span>
-      </div>
+      <div className="login-mission-scene" />
       <div className="login-visual-copy">
-        <span>全球灾害监测与卫星任务规划</span>
-        <h2>发现灾害，判断卫星何时能拍</h2>
-        <p>汇聚多源灾害信息，筛选遥感可观测事件，并生成卫星任务候选。</p>
+        <span className="login-visual-kicker"><i /> 全球灾情 × 在轨资源</span>
+        <h2>从灾害发现，到卫星成像窗口</h2>
+        <p>汇聚权威灾情、影响范围与轨道机会，形成可复核的观测任务候选。</p>
       </div>
       <ol className="login-workflow">
-        <li><b>01</b><span>发现事件</span></li>
-        <li><b>02</b><span>判断可观测性</span></li>
-        <li><b>03</b><span>生成任务候选</span></li>
+        <li><b>01</b><span>多源灾情发现</span></li>
+        <li><b>02</b><span>遥感可观测研判</span></li>
+        <li><b>03</b><span>卫星任务规划</span></li>
       </ol>
     </section>
     <section className="login-panel" aria-labelledby="login-title">

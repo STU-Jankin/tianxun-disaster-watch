@@ -494,8 +494,13 @@ test("implements a server-side login, revocable sessions and password-hash confi
 test("keeps the login form reachable on tablets and short mobile viewports", async () => {
   const { readFile } = await import("node:fs/promises");
   const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  const login = await readFile(new URL("../app/authenticated-app.tsx", import.meta.url), "utf8");
   assert.match(css, /\.login-shell\s*\{[^}]*height:\s*100dvh[^}]*overflow-y:\s*auto/);
   assert.match(css, /@media \(max-width: 900px\)\s*\{[\s\S]*?\.login-shell\s*\{\s*grid-template-columns:\s*1fr/);
+  assert.match(css, /url\("\/login-hero-v7\.webp"\)/);
+  assert.match(css, /@media \(max-width: 720px\)[\s\S]*?\.login-visual-copy p, \.login-workflow\s*\{\s*display:\s*none/);
+  assert.match(login, /从灾害发现，到卫星成像窗口/);
+  assert.doesNotMatch(login, /login-earth|login-orbit/);
   assert.match(css, /\.topbar \.brand-logo-frame\s*\{\s*display:\s*none/);
   assert.doesNotMatch(css, /@media \(max-width: 360px\)[\s\S]*?\n\s*\.brand-logo-frame\s*\{\s*display:\s*none/);
 });
