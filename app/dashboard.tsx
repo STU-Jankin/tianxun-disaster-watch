@@ -33,6 +33,7 @@ import { isRoadDisruptionList, normalizeRoadDisruptionGeoJson, roadDisruptionFea
 import { infrastructureKindLabel, isInfrastructureAssessment, type InfrastructureAssessment } from "../lib/osm-infrastructure";
 import { deriveLandslideWorkflow, landslideSarTemplates, type LandslideSarTemplate, type LandslideTerrainResult, type LandslideTerrainScreening } from "../lib/landslide-planning";
 import type { LandslideForecastReady, LandslideForecastResponse } from "../lib/landslide-forecast";
+import { isRegionalLandslideScreeningSource } from "../lib/landslide-regional-screening";
 import { sarImagingModeOptions, sarPayloadProfiles, type SarImagingModeId } from "../lib/satellite-payloads";
 import { cycloneTrackingGeometry, cycloneTrackingSliceAt, nearestCycloneFrameIndex, type CycloneTrackingTarget } from "../lib/cyclone-tracking-target";
 import type { MissionPlanningProblem, MissionPlanningSummary, PlanningConstraintAssessment } from "../lib/mission-planning";
@@ -1168,6 +1169,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
           <em />
           <span className="priority-ring">◎</span><span>重点范围加权</span>
           {selected?.cycloneForecast || activeTask?.cycloneForecast ? <><em /><span><i className="forecast-track-key" />官方路径</span><span><i className="forecast-impact-key" />风圈范围</span><span><i className="forecast-uncertainty-key" />路径不确定区</span></> : null}
+          {filtered.some((event) => isRegionalLandslideScreeningSource(event.source)) ? <><em /><span><i className="regional-landslide-key" />区域滑坡试验风险面</span></> : null}
           {selected && landslideTerrain[selected.masterEventId] ? <><em /><span><i className="landslide-terrain-key" />DEM 地形筛查 AOI</span></> : null}
           {selected && exposureAssessments[selected.masterEventId] ? <><em /><span><i className="exposure-aoi-key" />暴露度筛查 AOI</span><span><i className="exposure-facility-key" />OSM 关键设施</span></> : null}
           {activeResponseScenario ? <><em /><span><i className="response-route-clear-key" />未检出相交</span><span><i className="response-route-limited-key" />影响区内撤离</span><span><i className="response-route-blocked-key" />禁用/未核验</span>{activeResponseScenario.infrastructureFeatures?.length ? <span><i className="infrastructure-exposure-key" />OSM 设施暴露</span> : null}</> : null}
@@ -1336,6 +1338,7 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
   const bbox = scopes[scope].bbox;
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<import("leaflet").Map | null>(null);
+  const regionalRiskLayerRef = useRef<import("leaflet").LayerGroup | null>(null);
   const markerLayerRef = useRef<import("leaflet").LayerGroup | null>(null);
   const selectedLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const taskForecastLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
@@ -1474,6 +1477,7 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
         if (tileFailures >= 3) setMapError("底图加载受限；灾害点和坐标数据仍可使用。");
       }).addTo(map);
       L.control.zoom({ position: "topright" }).addTo(map);
+      regionalRiskLayerRef.current = L.layerGroup().addTo(map);
       markerLayerRef.current = L.layerGroup().addTo(map);
       selectedLayerRef.current = L.featureGroup().addTo(map);
       taskForecastLayerRef.current = L.featureGroup().addTo(map);
@@ -1503,6 +1507,7 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
       disposed = true;
       if (map) map.remove();
       mapRef.current = null;
+      regionalRiskLayerRef.current = null;
       markerLayerRef.current = null;
       selectedLayerRef.current = null;
       taskForecastLayerRef.current = null;
@@ -1602,6 +1607,29 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
     });
     return () => { cancelled = true; };
   }, [activeDraftVertices, mapReady]);
+
+  useEffect(() => {
+    const layer = regionalRiskLayerRef.current;
+    if (!mapReady || !layer) return;
+    let cancelled = false;
+    void import("leaflet").then((L) => {
+      if (cancelled) return;
+      layer.clearLayers();
+      events.filter((event) => isRegionalLandslideScreeningSource(event.source) && ["Polygon", "MultiPolygon"].includes(event.geometry.type)).forEach((event) => {
+        const color = event.severity === "orange" || event.severity === "red" ? "#c55a2b" : "#d19a22";
+        const riskLayer = L.geoJSON(unwrapForecastGeometry(event.geometry, event.longitude) as GeoJSON.GeoJsonObject, {
+          style: { color, weight: 2, fillColor: color, fillOpacity: 0.12, dashArray: "6 4", className: "regional-landslide-risk" },
+          interactive: true,
+        });
+        const tooltip = document.createElement("span");
+        tooltip.textContent = `${event.title} · ${event.sourceSeverity} · 试验筛查，点击复核`;
+        riskLayer.bindTooltip(tooltip, { sticky: true, opacity: 0.96 });
+        riskLayer.on("click", () => onSelectRef.current(event));
+        riskLayer.addTo(layer);
+      });
+    });
+    return () => { cancelled = true; };
+  }, [events, mapReady]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -2264,10 +2292,11 @@ function DetailPanel({ event, exposureAssessment, onExposureChange, currentUser,
   }, [compact, event.id, onClose]);
   const taskWindowValid = Date.parse(event.observationExpiresAt) > nowMs + 3_600_000;
   const cycloneForecastUsable = !event.cycloneForecast || Date.parse(event.cycloneForecast.forecastValidUntil) > nowMs + 3_600_000;
+  const regionalScreening = isRegionalLandslideScreeningSource(event.source);
   const needsAoiReview = event.aoiApprovalRequired || !cycloneForecastUsable;
   const canSaveCandidate = !historicalReadOnly && !isDemo && taskWindowValid && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived";
-  const canEnterDispatchReview = !dispatchBlocked && canSaveCandidate && (!needsAoiReview || aoiConfirmed);
-  const canBuildTerrainTask = !historicalReadOnly && !isDemo && taskWindowValid && event.dispatchEligibility !== "blocked" && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived";
+  const canEnterDispatchReview = !regionalScreening && event.dispatchEligibility !== "blocked" && !dispatchBlocked && canSaveCandidate && (!needsAoiReview || aoiConfirmed);
+  const canBuildTerrainTask = !regionalScreening && !historicalReadOnly && !isDemo && taskWindowValid && event.dispatchEligibility !== "blocked" && event.lifecycleStatus !== "resolved" && event.lifecycleStatus !== "archived";
   const effectiveImpactRisk = assessImpactRisk({
     ...event,
     exposure: exposureAssessment?.riskInput ?? undefined,
@@ -2284,11 +2313,12 @@ function DetailPanel({ event, exposureAssessment, onExposureChange, currentUser,
       <small>来源原文：{event.country || event.title}</small>
     </div>
     <div className="classification-grid" aria-label="事件分级与任务排序">
-      <div className={`official-severity ${event.severity}`}><span>来源/官方告警等级</span><strong>{severityLabels[event.severity]}</strong><small>来源原始表述：{event.sourceSeverity}</small></div>
+      <div className={`official-severity ${event.severity}`}><span>{regionalScreening ? "试验筛查等级" : "来源/官方告警等级"}</span><strong>{severityLabels[event.severity]}</strong><small>{regionalScreening ? "模型原始表述" : "来源原始表述"}：{event.sourceSeverity}</small></div>
       <div className={`impact-risk ${effectiveImpactRisk?.level ?? "undetermined"}`}><span>影响风险</span><strong>{effectiveImpactRisk?.status === "assessed" ? `${impactRiskLabel(effectiveImpactRisk.level)} · ${effectiveImpactRisk.score}${effectiveImpactRisk.scoreRange ? `（${effectiveImpactRisk.scoreRange.min}–${effectiveImpactRisk.scoreRange.max}）` : ""}` : "待评估"}</strong><small>{effectiveImpactRisk?.status === "assessed" ? `${effectiveImpactRisk.hazardModel.quantitative ? "分灾种强度" : "官方等级代理"}、暴露度和脆弱性初筛` : `危险性 ${effectiveImpactRisk?.hazardIndex ?? "—"}/100；待补 ${effectiveImpactRisk?.missingInputs.join("、") || "必要输入"}`}</small></div>
       <div className="satellite-priority"><span>卫星观测优先级</span><strong>{event.priority}</strong><small>用于候选任务排序，不等于灾害影响风险</small></div>
     </div>
     <details className="priority-method"><summary>查看卫星优先级构成</summary><p>官方等级 {event.priorityBreakdown.severity} · 重点区域 {event.priorityBreakdown.scope} · 遥感可观测性 {event.priorityBreakdown.observability} · 时效 {event.priorityBreakdown.time} · 数据可信度 {event.priorityBreakdown.confidence ?? 0}</p></details>
+    {regionalScreening ? <section className="regional-landslide-notice"><div><span>REGIONAL PILOT</span><strong>区域固定格网 · 试验筛查</strong></div><p>该风险面来自降雨条件与 DEM 坡度的联合筛查，不是官方预警，也不代表已经发生滑坡。当前阶段只允许保存卫星候选草稿；任务机会计算、导出和下发保持锁定。</p><small>需补齐地方官方预警、在册隐患点或人工 AOI 复核后，由后续经验证版本重新生成可规划事件。</small></section> : null}
     {effectiveImpactRisk ? <section className="impact-risk-method"><h3>影响风险说明</h3><p>{effectiveImpactRisk.limitations}</p><small>模型：{effectiveImpactRisk.hazardModel.modelId} · 强度依据：{effectiveImpactRisk.hazardModel.intensityProxy} · 危险性区间 {effectiveImpactRisk.uncertainty.hazardIndexMin}–{effectiveImpactRisk.uncertainty.hazardIndexMax}</small>{effectiveImpactRisk.missingInputs.length ? <small>待补数据：{effectiveImpactRisk.missingInputs.join("、")}</small> : null}</section> : null}
     <ExposureAssessmentCard event={event} assessment={exposureAssessment} currentUser={currentUser} historicalReadOnly={historicalReadOnly} onChange={onExposureChange} />
     <div className={`event-integrity ${event.dispatchEligibility}`}>
@@ -2337,9 +2367,9 @@ function DetailPanel({ event, exposureAssessment, onExposureChange, currentUser,
     </dl>
     <a className="source-link" href={safeHttpUrl(event.sourceUrl)} target="_blank" rel="noreferrer">查看权威来源 ↗</a>
     <button className="response-plan-button" disabled={historicalReadOnly} onClick={() => onResponsePlan(event)}>{historicalReadOnly ? "历史重演不可建立推演" : "建立处置推演场景"}</button>
-    {needsAoiReview ? <div className="aoi-approval"><input id={`aoi-confirm-${event.id}`} type="checkbox" checked={aoiConfirmed} disabled={historicalReadOnly} onChange={(change) => onConfirmAoi(change.target.checked)} /><label htmlFor={`aoi-confirm-${event.id}`}><strong>人工核对 AOI</strong><small>{historicalReadOnly ? "历史重演为只读；返回实时后再确认任务 AOI。" : !cycloneForecastUsable ? "官方台风报次已不足一小时，不再作为预测 AOI；如需灾后复核，请在地图重新圈定实况 AOI。" : "地图已用绿色虚线显示完整来源几何；确认前请核对目标类型、范围和代表点误差。"}</small></label></div> : null}
-    <button className="task-button" onClick={() => onAddTask(event, aoiConfirmed)} disabled={taskAdded || !canSaveCandidate}>{historicalReadOnly ? "历史重演不可建立任务" : taskAdded ? "已加入卫星任务候选" : isDemo ? "演示事件不能建立任务" : !taskWindowValid ? "观测期不足一小时，不能建立任务" : canEnterDispatchReview ? "加入卫星任务候选" : "保存为候选草稿"}</button>
-    {!canEnterDispatchReview && canSaveCandidate ? <small className="task-candidate-note">当前可先保存候选草稿；完成 AOI 复核且数据恢复实时后，才能计算、导出或进入下发复核。</small> : null}
+    {needsAoiReview ? <div className="aoi-approval"><input id={`aoi-confirm-${event.id}`} type="checkbox" checked={regionalScreening ? false : aoiConfirmed} disabled={historicalReadOnly || regionalScreening} onChange={(change) => onConfirmAoi(change.target.checked)} /><label htmlFor={`aoi-confirm-${event.id}`}><strong>{regionalScreening ? "AOI 仍需外部证据复核" : "人工核对 AOI"}</strong><small>{historicalReadOnly ? "历史重演为只读；返回实时后再确认任务 AOI。" : regionalScreening ? "本阶段的固定试验格不能仅靠界面勾选升级为可规划 AOI；请先核对地方官方预警、隐患点或现场线索。" : !cycloneForecastUsable ? "官方台风报次已不足一小时，不再作为预测 AOI；如需灾后复核，请在地图重新圈定实况 AOI。" : "地图已用绿色虚线显示完整来源几何；确认前请核对目标类型、范围和代表点误差。"}</small></label></div> : null}
+    <button className="task-button" onClick={() => onAddTask(event, regionalScreening ? false : aoiConfirmed)} disabled={taskAdded || !canSaveCandidate}>{historicalReadOnly ? "历史重演不可建立任务" : taskAdded ? "已加入卫星任务候选" : isDemo ? "演示事件不能建立任务" : !taskWindowValid ? "观测期不足一小时，不能建立任务" : regionalScreening ? "保存试验候选草稿" : canEnterDispatchReview ? "加入卫星任务候选" : "保存为候选草稿"}</button>
+    {!canEnterDispatchReview && canSaveCandidate ? <small className="task-candidate-note">{regionalScreening ? "试验筛查草稿不会进入机会计算、导出或下发；后续必须由官方预警、隐患点或人工复核生成新的可规划事件。" : "当前可先保存候选草稿；完成 AOI 复核且数据恢复实时后，才能计算、导出或进入下发复核。"}</small> : null}
   </aside>;
 }
 
@@ -3334,11 +3364,12 @@ function TaskPanel({ open, compact, tasks, syncState, storageMode, fleet, active
       {tasks.map((task, index) => <article className={`task-item ${activeTaskId === task.taskId ? "active" : ""} ${expandedTaskIds.has(task.taskId) ? "expanded" : "collapsed"}`} key={task.taskId}>
         <div className="task-item-title">
           <i>{String(index + 1).padStart(2, "0")}</i>
-          <div><label className="task-export-select"><input type="checkbox" checked={selectedExportTaskIds.has(task.taskId)} onChange={(event) => setSelectedExportTaskIds((current) => { const next = new Set(current); if (event.target.checked) next.add(task.taskId); else next.delete(task.taskId); return next; })} />选入手动导出</label><h3>{task.title}</h3><p>{hazardMeta[task.hazard].label} · 优先级 {task.priority} · {observationPhaseLabels[task.observationPhase]}</p><time>事件参考时间 · {formatTimeWithYear(task.eventOccurredAt)}</time><div className="task-card-actions"><button onClick={() => setExpandedTaskIds((current) => { const next = new Set(current); if (next.has(task.taskId)) next.delete(task.taskId); else next.add(task.taskId); return next; })} aria-expanded={expandedTaskIds.has(task.taskId)}>{expandedTaskIds.has(task.taskId) ? "收起参数" : "展开规划"}</button><button className="show-aoi" onClick={() => onActivate(task.taskId)}>在地图显示 AOI</button></div></div>
+          <div><label className="task-export-select"><input type="checkbox" disabled={isRegionalLandslideScreeningSource(task.source)} checked={!isRegionalLandslideScreeningSource(task.source) && selectedExportTaskIds.has(task.taskId)} onChange={(event) => setSelectedExportTaskIds((current) => { const next = new Set(current); if (event.target.checked) next.add(task.taskId); else next.delete(task.taskId); return next; })} />{isRegionalLandslideScreeningSource(task.source) ? "试验草稿不可导出" : "选入手动导出"}</label><h3>{task.title}</h3><p>{hazardMeta[task.hazard].label} · 优先级 {task.priority} · {observationPhaseLabels[task.observationPhase]}</p><time>事件参考时间 · {formatTimeWithYear(task.eventOccurredAt)}</time><div className="task-card-actions"><button onClick={() => setExpandedTaskIds((current) => { const next = new Set(current); if (next.has(task.taskId)) next.delete(task.taskId); else next.add(task.taskId); return next; })} aria-expanded={expandedTaskIds.has(task.taskId)}>{expandedTaskIds.has(task.taskId) ? "收起参数" : "展开规划"}</button><button className="show-aoi" onClick={() => onActivate(task.taskId)}>在地图显示 AOI</button></div></div>
           {canTransitionTask(task.status, "cancelled") || ["submitted", "cancel_rejected"].includes(task.status) ? <button onClick={() => onRemove(task.taskId)} aria-label={`取消${task.title}`}>{task.status === "submitted" || task.status === "cancel_rejected" ? "申请取消" : task.revision > 0 ? "取消" : "删除草稿"}</button> : null}
         </div>
         <div className="task-coordinates"><span>中心坐标</span><code>{task.latitude.toFixed(6)}, {task.longitude.toFixed(6)}</code><button onClick={() => void copyCoordinates(task).then((copied) => { if (copied) { setCopiedTaskId(task.taskId); window.setTimeout(() => setCopiedTaskId((current) => current === task.taskId ? null : current), 1800); } })}>{copiedTaskId === task.taskId ? "已复制" : "复制"}</button></div>
-        <div className={`task-quality ${task.aoiApproval}`}><span>{locationQualityLabels[task.locationQuality]} · ±{task.locationAccuracyKm} km</span><b>{task.aoiApproval === "source_verified" ? "来源几何已核验" : task.aoiApproval === "operator_confirmed" ? "操作员已复核 AOI" : "AOI 待复核"}</b><small>{task.evidenceCount} 条证据 · {task.masterEventId}</small>{task.aoiApproval === "review_required" ? <button onClick={() => onUpdate(task.taskId, { aoiApproval: "operator_confirmed", approvedAt: new Date().toISOString(), approvedBy: "当前操作员", approvalReason: "操作员已在地图核对当前 AOI、位置误差和观测目标" })}>确认当前 AOI</button> : null}</div>
+        <div className={`task-quality ${task.aoiApproval}`}><span>{locationQualityLabels[task.locationQuality]} · ±{task.locationAccuracyKm} km</span><b>{task.aoiApproval === "source_verified" ? "来源几何已核验" : task.aoiApproval === "operator_confirmed" ? "操作员已复核 AOI" : "AOI 待复核"}</b><small>{task.evidenceCount} 条证据 · {task.masterEventId}</small>{task.aoiApproval === "review_required" && !isRegionalLandslideScreeningSource(task.source) ? <button onClick={() => onUpdate(task.taskId, { aoiApproval: "operator_confirmed", approvedAt: new Date().toISOString(), approvedBy: "当前操作员", approvalReason: "操作员已在地图核对当前 AOI、位置误差和观测目标" })}>确认当前 AOI</button> : null}</div>
+        {isRegionalLandslideScreeningSource(task.source) ? <div className="regional-task-lock" role="status"><strong>区域试验筛查草稿</strong><span>可以调整参数和查看 AOI，但不能确认、计算、导出或下发。需要官方预警、隐患点或人工研判形成新的可规划事件。</span></div> : null}
         <WeatherForecastCard latitude={task.latitude} longitude={task.longitude} maximumCloudPercent={task.maximumCloudPercent} compact enabled={weatherTaskId === task.taskId} onRequest={() => setWeatherTaskId(task.taskId)} />
         {task.cycloneForecast ? <div className="task-forecast-summary"><strong>官方预报已随任务保存 · 动态跟踪</strong><span>{task.cycloneForecast.track.length} 个官方中心节点{task.cycloneForecast.impactField ? ` · ${task.cycloneForecast.impactField.frames.length} 个逐时时间片` : ""} · 至 {formatTimeWithYear(task.cycloneForecast.forecastValidUntil)} UTC+08</span><small>计算时按每次卫星过境时刻匹配对应预测片；官方新报次到达后必须重新计算机会。</small></div> : null}
         {task.hazard === "landslide" && task.orbitDirectionPreference ? <div className="task-landslide-summary"><strong>{task.orbitDirectionPreference === "ascending" ? "升轨" : task.orbitDirectionPreference === "descending" ? "降轨" : "任一轨向"} SAR 滑坡模板</strong><span>{task.referenceAcquisitionRequired ? "要求灾前参考影像" : "未要求灾前参考影像"} · {task.revisitCount} 次重访</span><small>地形格网是操作员确认的筛查 AOI，不是滑坡实况边界；成像机会仍需验证轨向、入射角及地形阴影/叠掩。</small></div> : null}
@@ -3387,7 +3418,7 @@ function TaskPanel({ open, compact, tasks, syncState, storageMode, fleet, active
           {task.aoiType === "corridor" ? <><label>走廊长度（公里）<input type="number" min="1" max="3000" value={task.aoiLengthKm} onChange={(event) => onUpdate(task.taskId, { aoiLengthKm: clampNumber(event.target.value, 1, 3000) })} /></label><label>走廊宽度（公里）<input type="number" min="1" max="500" value={task.aoiWidthKm} onChange={(event) => onUpdate(task.taskId, { aoiWidthKm: clampNumber(event.target.value, 1, 500) })} /></label><label>方位角（度）<input type="number" min="0" max="359" value={task.aoiBearingDeg} onChange={(event) => onUpdate(task.taskId, { aoiBearingDeg: clampNumber(event.target.value, 0, 359) })} /></label></> : null}
           <label>最早成像（Asia/Shanghai UTC+08）<input type="datetime-local" value={toLocalInput(task.imagingStart)} onChange={(event) => onUpdate(task.taskId, { imagingStart: fromLocalInput(event.target.value) })} /></label>
           <label>最晚成像（Asia/Shanghai UTC+08）<input type="datetime-local" min={toLocalInput(task.imagingStart)} value={toLocalInput(task.imagingEnd)} onChange={(event) => onUpdate(task.taskId, { imagingEnd: fromLocalInput(event.target.value) })} /></label>
-          <label>规划状态<select value={task.status} disabled={!['candidate', 'reviewed'].includes(task.status)} onChange={(event) => onUpdate(task.taskId, { status: event.target.value as SatelliteTask["status"] })}>{allowedOperatorTaskStatuses(task.status).map((status) => <option key={status} value={status}>{taskStatusLabel(status)}</option>)}</select><small>排程、下发、成像和完成状态只能由仿真或执行回执产生</small></label>
+          <label>规划状态<select value={task.status} disabled={isRegionalLandslideScreeningSource(task.source) || !['candidate', 'reviewed'].includes(task.status)} onChange={(event) => onUpdate(task.taskId, { status: event.target.value as SatelliteTask["status"] })}>{allowedOperatorTaskStatuses(task.status).map((status) => <option key={status} value={status}>{taskStatusLabel(status)}</option>)}</select><small>{isRegionalLandslideScreeningSource(task.source) ? "阶段1固定为候选草稿" : "排程、下发、成像和完成状态只能由仿真或执行回执产生"}</small></label>
           <label>最低覆盖率（%）<input type="number" min="1" max="100" value={task.minimumCoveragePercent} onChange={(event) => onUpdate(task.taskId, { minimumCoveragePercent: clampNumber(event.target.value, 1, 100) })} /></label>
           {task.sensors.includes("光学") ? <label>最大云量（%）<input type="number" min="0" max="100" value={task.maximumCloudPercent} onChange={(event) => onUpdate(task.taskId, { maximumCloudPercent: clampNumber(event.target.value, 0, 100) })} /></label> : null}
           <label>目标分辨率（米）<input type="number" min="0.1" max="10000" step="0.1" value={task.spatialResolutionMeters} onChange={(event) => onUpdate(task.taskId, { spatialResolutionMeters: clampNumber(event.target.value, 0.1, 10000) })} /></label>
@@ -3399,7 +3430,7 @@ function TaskPanel({ open, compact, tasks, syncState, storageMode, fleet, active
         <div className="task-targets">观测目标：{task.observationTargets.join(" · ")}</div>
         {(() => { const validation = validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requirePayload: true, requireProvenance: true }); return validation.ok ? null : <div className="task-validation" role="alert"><strong>还不能计算卫星机会</strong><ul>{validation.errors.map((error) => <li key={error}>{humanizeTaskValidationError(error)}</li>)}</ul></div>; })()}
         <div className={`visibility-box ${visibility[task.taskId]?.state ?? "idle"}`}>
-          {(() => { const ready = validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requirePayload: true, requireProvenance: true }).ok; return <button onClick={() => void calculateVisibility(task)} disabled={visibility[task.taskId]?.state === "loading" || !ready || fleet.current === 0}>{visibility[task.taskId]?.state === "loading" ? "正在计算轨道机会…" : fleet.current === 0 ? "暂无可用轨道，暂不能计算" : !ready ? "请先完成上方必填项" : task.hazard === "cyclone" && task.timeIndexedAoi?.length ? "计算台风动态跟踪机会" : "计算卫星任务机会"}</button>; })()}
+          {(() => { const regionalLocked = isRegionalLandslideScreeningSource(task.source); const ready = !regionalLocked && validateSatelliteTask(task as unknown as Record<string, unknown>, { requireApproved: true, requirePayload: true, requireProvenance: true }).ok; return <button onClick={() => void calculateVisibility(task)} disabled={regionalLocked || visibility[task.taskId]?.state === "loading" || !ready || fleet.current === 0}>{regionalLocked ? "试验筛查仅保存草稿" : visibility[task.taskId]?.state === "loading" ? "正在计算轨道机会…" : fleet.current === 0 ? "暂无可用轨道，暂不能计算" : !ready ? "请先完成上方必填项" : task.hazard === "cyclone" && task.timeIndexedAoi?.length ? "计算台风动态跟踪机会" : "计算卫星任务机会"}</button>; })()}
           {visibility[task.taskId]?.message ? <p>{visibility[task.taskId].message}</p> : null}
           {visibility[task.taskId]?.planningSummary ? <p className="planning-summary">规划约束：{visibility[task.taskId].planningSummary!.eligible + visibility[task.taskId].planningSummary!.conditional} 个可进入试排 · {visibility[task.taskId].planningSummary!.conditional} 个待补工程约束 · {visibility[task.taskId].planningSummary!.dispatchable} 个可进入下发复核</p> : null}
           {task.opportunityId ? <p className="selected-opportunity">已选机会：{task.satelliteId} · {task.opportunityId} · {task.simulationLevel === "orbit_only" ? `轨道级粗筛${task.minimumGroundTrackDistanceKm == null ? "" : ` · 最近 ${task.minimumGroundTrackDistanceKm} km`}` : task.simulationLevel === "assumed_sensor" ? "假设传感器试算" : "传感器级仿真"}</p> : null}

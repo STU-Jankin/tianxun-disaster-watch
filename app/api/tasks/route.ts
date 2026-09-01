@@ -5,6 +5,7 @@ import { aoiFingerprint, eventRevisionFingerprint } from "../../../lib/event-int
 import { buildTaskAoi } from "../../../lib/task-aoi";
 import { cycloneTaskAoiSlices } from "../../../lib/cyclone-forecast";
 import { cycloneTrackingSliceAt, cycloneTrackingTargets, type CycloneTrackingTarget } from "../../../lib/cyclone-tracking-opportunities";
+import { isRegionalLandslideScreeningSource } from "../../../lib/landslide-regional-screening";
 
 export const dynamic = "force-dynamic";
 
@@ -54,6 +55,10 @@ export async function POST(request: Request) {
     }
     if (Date.parse(String(task.imagingEnd)) > Date.parse(canonical.observationExpiresAt)) {
       return Response.json({ error: "成像窗口超过该灾害的有效观测期" }, { status: 409 });
+    }
+    if (isRegionalLandslideScreeningSource(canonical.event.source)
+      && (String(task.status) !== "candidate" || String(task.aoiApproval) !== "review_required")) {
+      return Response.json({ error: "区域滑坡试验筛查当前只允许保存待复核候选草稿，不能确认、计算、导出或下发" }, { status: 409 });
     }
     const currentEventRevision = eventRevisionFingerprint(canonical.event);
     if (Number(task.revision ?? 0) > 0 && task.eventRevision !== currentEventRevision) {

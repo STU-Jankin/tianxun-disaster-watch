@@ -87,15 +87,22 @@ export function landslideForecastBaselinePeriod(now = new Date()) {
   return { start: `${startYear}-01-01`, end: `${endYear}-12-31` };
 }
 
-export function buildOpenMeteoLandslideForecastUrl(latitude: number, longitude: number, model: LandslideForecastModelId = "best_match") {
+export function buildOpenMeteoLandslideForecastUrl(
+  latitude: number,
+  longitude: number,
+  model: LandslideForecastModelId = "best_match",
+  window: { pastHours?: number; forecastHours?: number } = {},
+) {
   validateCoordinate(latitude, longitude);
+  const pastHours = boundedInteger(window.pastHours ?? 48, 48, 72, "前期逐小时窗口");
+  const forecastHours = boundedInteger(window.forecastHours ?? 72, 72, 96, "未来逐小时窗口");
   const url = new URL("https://api.open-meteo.com/v1/forecast");
   url.search = new URLSearchParams({
     latitude: latitude.toFixed(6),
     longitude: longitude.toFixed(6),
     hourly: "precipitation,soil_moisture_9_to_27cm,soil_moisture_27_to_81cm",
-    past_hours: "48",
-    forecast_hours: "72",
+    past_hours: String(pastHours),
+    forecast_hours: String(forecastHours),
     timezone: "UTC",
     timeformat: "iso8601",
   }).toString();
@@ -121,7 +128,7 @@ export function buildOpenMeteoLandslideClimatologyUrl(latitude: number, longitud
 export function parseOpenMeteoLandslideForecast(payload: unknown): OpenMeteoForecastSeries {
   const root = record(payload, "Open-Meteo预报响应不是JSON对象");
   const hourly = record(root.hourly, "Open-Meteo预报缺少hourly字段");
-  const times = stringArray(hourly.time, 130, "逐小时时间").map(utcIso);
+  const times = stringArray(hourly.time, 180, "逐小时时间").map(utcIso);
   const precipitationMm = numberArray(hourly.precipitation, times.length, 0, 2_000, "逐小时降雨");
   const shallow = nullableNumberArray(hourly.soil_moisture_9_to_27cm, times.length, 0, 1, "9–27厘米土壤含水量");
   const deep = nullableNumberArray(hourly.soil_moisture_27_to_81cm, times.length, 0, 1, "27–81厘米土壤含水量");
@@ -313,6 +320,12 @@ function nullableNumberArrayFlexible(value: unknown, minimum: number, maximum: n
 function boundedNumber(value: unknown, minimum: number, maximum: number, label: string) {
   const number = Number(value);
   if (!Number.isFinite(number) || number < minimum || number > maximum) throw new Error(`${label}包含越界值`);
+  return number;
+}
+
+function boundedInteger(value: unknown, minimum: number, maximum: number, label: string) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < minimum || number > maximum) throw new Error(`${label}无效`);
   return number;
 }
 

@@ -94,6 +94,17 @@ test("new yellow and blue events stay silent while red and orange are reported",
   assert.equal(changeNotifications(null, event({ severity: "red", priority: 30 }), config)[0].type, "new");
 });
 
+test("blocked experimental screening products never enter the notification stream", () => {
+  const experimental = event({
+    hazard: "landslide",
+    source: "天巡区域滑坡试验筛查",
+    severity: "orange",
+    dispatchEligibility: "blocked",
+  });
+  assert.deepEqual(changeNotifications(null, experimental, config), []);
+  assert.deepEqual(changeNotifications(event({ severity: "yellow" }), experimental, config), []);
+});
+
 test("yellow focus-area exceptions are explicit and configurable", () => {
   const focused = changeNotifications(null, event({ scope: "wuxi", priority: 82 }), config);
   assert.equal(focused[0].type, "new");

@@ -50,6 +50,25 @@ import { storeForecastRasterObject } from "../../../lib/forecast-raster-storage"
 import { amapConfiguration, buildAmapGeocodeUrl, parseAmapGeocodes, type RoutingCoordinate } from "../../../lib/amap-routing";
 import { assessImpactRisk } from "../../../lib/impact-risk";
 import { sanitizeSnapshotUrl, sourceGovernance, sourceIdForName, sourceNameForUrl, type SourceGovernance, type SourceRole, type SourceTier } from "../../../lib/source-governance";
+import {
+  buildLandslideForecast,
+  buildOpenMeteoLandslideClimatologyUrl,
+  buildOpenMeteoLandslideForecastUrl,
+  landslideForecastBaselinePeriod,
+  parseOpenMeteoLandslideClimatology,
+  parseOpenMeteoLandslideForecast,
+  type OpenMeteoClimatology,
+} from "../../../lib/landslide-forecast";
+import { analyzeTerrainElevations, prepareTerrainSamplingPlan, type LandslideTerrainResult } from "../../../lib/landslide-planning";
+import { matchLandslidePilotRegion } from "../../../lib/landslide-pilot-regions";
+import {
+  REGIONAL_LANDSLIDE_SCREENING_SOURCE,
+  attachRegionalTerrainGeometry,
+  buildRegionalLandslideScreeningProducts,
+  isRegionalLandslideScreeningSource,
+  regionalLandslidePilotCells,
+  type RegionalLandslideCellResult,
+} from "../../../lib/landslide-regional-screening";
 
 export const dynamic = "force-dynamic";
 
@@ -117,6 +136,9 @@ let eventsRefresh: Promise<EventsCacheEntry> | null = null;
 let lastSuccessfulFetchAt: string | null = null;
 let copernicusCache: { events: DisasterEvent[]; expiresAt: number } | null = null;
 let usgsGroundFailureCache: { events: DisasterEvent[]; expiresAt: number } | null = null;
+let regionalLandslideScreeningCache: { events: DisasterEvent[]; expiresAt: number } | null = null;
+const regionalLandslideClimatologyCache = new Map<string, { value: OpenMeteoClimatology; expiresAt: number }>();
+const regionalLandslideTerrainCache = new Map<string, { value: LandslideTerrainResult; expiresAt: number }>();
 const nveBoundaryCache = new Map<string, { geometry: { type: string; coordinates: unknown }; expiresAt: number }>();
 const memGeocodeCache = new Map<string, { coordinate: RoutingCoordinate; expiresAt: number }>();
 let activeRefreshId: string | null = null;
@@ -187,6 +209,14 @@ async function refreshEvents() {
       setupUrl: endpoints.memGeohazards,
       successMessage: "在线；仅把含明确发生时间和受影响地的官方灾情通报作为实况，地名编码点仍要求人工复核 AOI",
       fetcher: fetchMemGeohazards,
+    },
+    {
+      name: REGIONAL_LANDSLIDE_SCREENING_SOURCE,
+      tier: "中国第二批",
+      role: "预报",
+      setupUrl: "https://open-meteo.com/en/docs",
+      successMessage: `在线；${regionalLandslidePilotCells.length} 个固定试验格每6小时筛查一次，只在24/48小时达到加强关注时形成风险面，72小时仅作趋势；禁止自动告警、自动计算和自动下发`,
+      fetcher: fetchRegionalLandslideScreening,
     },
     {
       name: "中国气象数据网 CMA 预警",
@@ -1063,6 +1093,143 @@ async function fetchEmsc(): Promise<DisasterEvent[]> {
   const params = new URLSearchParams({ format: "json", starttime: start, minmag: "4.5", orderby: "time", limit: "100" });
   return parseEmscEvents(await fetchJson(`${endpoints.emsc}?${params}`, { maximumBytes: 4_000_000, timeoutMs: 10_000 }))
     .map((candidate) => publicCandidateEvent(candidate, "EMSC SeismicPortal", "emsc"));
+}
+
+async function fetchRegionalLandslideScreening(): Promise<DisasterEvent[]> {
+  const now = Date.now();
+  if (regionalLandslideScreeningCache && regionalLandslideScreeningCache.expiresAt > now) return regionalLandslideScreeningCache.events;
+  const cycleMs = Math.floor(now / (6 * 3_600_000)) * 6 * 3_600_000;
+  const issuedAt = new Date(cycleMs).toISOString();
+  const settled = await mapWithConcurrency(regionalLandslidePilotCells, 3, (cell) => fetchRegionalLandslideCell(cell, issuedAt));
+  const results = settled.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+  if (!results.length) throw new Error("重庆/江苏固定试验格输入均不可用");
+  const products = buildRegionalLandslideScreeningProducts(results, issuedAt);
+  const events = products.map((product) => {
+    const candidate: PublicEventCandidate = {
+      sourceEventId: product.sourceEventId,
+      title: product.title,
+      hazard: "landslide",
+      hazardSubtype: "landslide",
+      geometry: product.geometry,
+      occurredAt: product.validFrom,
+      updatedAt: product.issuedAt,
+      activityAt: product.issuedAt,
+      issuedAt: product.issuedAt,
+      validFrom: product.validFrom,
+      validTo: product.validTo,
+      phenomenonStage: "forecast",
+      sourceUrl: "https://open-meteo.com/en/docs",
+      sourceSeverity: product.sourceSeverity,
+      severity: product.severity,
+      country: `中国 · ${product.regionLabel}`,
+      description: product.description,
+      requiresReview: true,
+    };
+    const event = publicCandidateEvent(candidate, REGIONAL_LANDSLIDE_SCREENING_SOURCE, "regional-landslide");
+    return {
+      ...event,
+      confidenceScore: Math.min(64, event.confidenceScore),
+      confidenceLevel: "low" as const,
+      observable: "conditional" as const,
+      dispatchEligibility: "blocked" as const,
+      aoiApprovalRequired: true,
+      observationTargets: ["潜在滑坡源区", "道路切坡", "沟道堵塞", "灾前参考影像"],
+      recommendedSensors: ["高分光学", "SAR"],
+      description: `${event.description} 本轮覆盖 ${results.length}/${regionalLandslidePilotCells.length} 个固定格；未计算格网不作低风险解释。`,
+    };
+  });
+  regionalLandslideScreeningCache = { events, expiresAt: cycleMs + 6 * 3_600_000 };
+  return events;
+}
+
+async function fetchRegionalLandslideCell(
+  cell: (typeof regionalLandslidePilotCells)[number],
+  issuedAt: string,
+): Promise<RegionalLandslideCellResult> {
+  const model = "cma_grapes_global" as const;
+  const period = landslideForecastBaselinePeriod(new Date(issuedAt));
+  const plan = prepareTerrainSamplingPlan({ latitude: cell.latitude, longitude: cell.longitude, radiusKm: cell.terrainRadiusKm });
+  const [forecastResult, climatologyResult, terrainResult] = await Promise.allSettled([
+    fetchJson(buildOpenMeteoLandslideForecastUrl(cell.latitude, cell.longitude, model, { pastHours: 54, forecastHours: 78 }), {
+      maximumBytes: 1_500_000,
+      timeoutMs: 18_000,
+      sourceName: REGIONAL_LANDSLIDE_SCREENING_SOURCE,
+    }).then(parseOpenMeteoLandslideForecast),
+    regionalLandslideClimatology(cell.id, cell.latitude, cell.longitude, period),
+    regionalLandslideTerrain(cell.id, plan),
+  ]);
+  if (forecastResult.status === "rejected") throw forecastResult.reason;
+  const warnings: string[] = [];
+  const climatology = climatologyResult.status === "fulfilled" ? climatologyResult.value : null;
+  if (!climatology) warnings.push("本地10年日雨P95基准不可用，本格不形成触发等级");
+  const terrain: LandslideTerrainResult = terrainResult.status === "fulfilled" ? terrainResult.value : {
+    state: "unavailable",
+    provider: "Open-Meteo Elevation · Copernicus DEM",
+    message: "DEM坡度输入不可用",
+  };
+  if (terrainResult.status === "rejected") warnings.push("DEM坡度不可用，本格不形成风险面");
+  const forecast = buildLandslideForecast({
+    series: forecastResult.value,
+    climatology,
+    terrain,
+    radiusKm: cell.radiusKm,
+    fetchedAt: issuedAt,
+    baselinePeriod: period,
+    inputWarnings: warnings,
+    pilotRegion: matchLandslidePilotRegion(cell.regionLabel),
+    weatherModel: model,
+  });
+  if (terrain.state === "ready") attachRegionalTerrainGeometry(forecast, terrain.geometry as DisasterEvent["geometry"]);
+  return { cell, forecast };
+}
+
+async function regionalLandslideClimatology(
+  cellId: string,
+  latitude: number,
+  longitude: number,
+  period: { start: string; end: string },
+) {
+  const key = `${cellId}:${period.start}:${period.end}`;
+  const cached = regionalLandslideClimatologyCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  const payload = await fetchJson(buildOpenMeteoLandslideClimatologyUrl(latitude, longitude, period), {
+    maximumBytes: 1_500_000,
+    timeoutMs: 22_000,
+    sourceName: REGIONAL_LANDSLIDE_SCREENING_SOURCE,
+  });
+  const value = parseOpenMeteoLandslideClimatology(payload);
+  regionalLandslideClimatologyCache.set(key, { value, expiresAt: Date.now() + 30 * 86_400_000 });
+  return value;
+}
+
+async function regionalLandslideTerrain(cellId: string, plan: ReturnType<typeof prepareTerrainSamplingPlan>) {
+  const cached = regionalLandslideTerrainCache.get(cellId);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  const endpoint = new URL("https://api.open-meteo.com/v1/elevation");
+  endpoint.searchParams.set("latitude", plan.points.map((point) => point.latitude.toFixed(7)).join(","));
+  endpoint.searchParams.set("longitude", plan.points.map((point) => point.longitude.toFixed(7)).join(","));
+  const payload = await fetchJson(endpoint.toString(), {
+    maximumBytes: 128 * 1024,
+    timeoutMs: 15_000,
+    sourceName: REGIONAL_LANDSLIDE_SCREENING_SOURCE,
+  }) as { elevation?: unknown };
+  const value = analyzeTerrainElevations(plan, payload.elevation, new Date().toISOString());
+  regionalLandslideTerrainCache.set(cellId, { value, expiresAt: Date.now() + 30 * 86_400_000 });
+  return value;
+}
+
+async function mapWithConcurrency<T, R>(values: T[], limit: number, mapper: (value: T) => Promise<R>) {
+  const results = new Array<PromiseSettledResult<R>>(values.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < values.length) {
+      const index = cursor++;
+      try { results[index] = { status: "fulfilled", value: await mapper(values[index]) }; }
+      catch (reason) { results[index] = { status: "rejected", reason }; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, values.length) }, worker));
+  return results;
 }
 
 async function fetchNwsAlerts(): Promise<DisasterEvent[]> {
@@ -2008,6 +2175,10 @@ const mergePolicy: Record<HazardType, { hours: number; kilometers: number }> = {
 function isSamePhysicalEvent(a: DisasterEvent, b: DisasterEvent) {
   if (a.hazard !== b.hazard) return false;
   if (a.id === b.id && isValidSourceEventId(a.id)) return true;
+  // A model screening cell is a forecast hypothesis, not an occurrence
+  // identity. Never merge it into a nearby observed landslide solely because
+  // the generic spatial-temporal threshold happens to match.
+  if (isRegionalLandslideScreeningSource(a.source) || isRegionalLandslideScreeningSource(b.source)) return false;
   const surfaceObservation = isCmaSurfaceSource(a.source) ? a : isCmaSurfaceSource(b.source) ? b : null;
   const authoritativeEvent = surfaceObservation === a ? b : surfaceObservation === b ? a : null;
   if (surfaceObservation && authoritativeEvent && !isCmaSurfaceSource(authoritativeEvent.source)) {
@@ -2051,6 +2222,7 @@ function distanceKm(latA: number, lonA: number, latB: number, lonB: number) {
 
 function inferLocationProfile(source: string, hazard: HazardType, description?: string): { quality: DisasterEvent["locationQuality"]; accuracyKm: number } {
   if (isCmaSurfaceSource(source)) return { quality: "precise", accuracyKm: 2 };
+  if (/天巡区域滑坡试验筛查/.test(source)) return { quality: "estimated", accuracyKm: 15 };
   if (/太湖流域管理局|江苏省水利厅/.test(source) || /AOI锚点|代表点/.test(description ?? "")) return { quality: "representative", accuracyKm: 100 };
   if (/FIRMS/.test(source) && /0\.1°网格聚合/.test(description ?? "")) return { quality: "estimated", accuracyKm: 8 };
   if (/NWS Alerts|ECCC GeoMet|NVE Jordskredvarsling/.test(source)) return { quality: "precise", accuracyKm: 1 };
@@ -2062,6 +2234,7 @@ function inferLocationProfile(source: string, hazard: HazardType, description?: 
 
 function sourceTrust(source: string) {
   if (isCmaSurfaceSource(source)) return 88;
+  if (/天巡区域滑坡试验筛查/.test(source)) return 60;
   if (/中国气象数据网 CMA 预警/.test(source)) return 90;
   if (/中国地震台网/.test(source)) return 92;
   if (/应急管理部地质灾害快报/.test(source)) return 95;
@@ -2087,6 +2260,7 @@ function locationRank(quality: DisasterEvent["locationQuality"]) {
 
 function evidenceRole(source: string): "detection" | "warning" | "verification" | "driver" | "context" {
   if (isCmaSurfaceSource(source)) return "driver";
+  if (/天巡区域滑坡试验筛查/.test(source)) return "driver";
   if (/ReliefWeb|Smithsonian|Copernicus EMS|LHASA/.test(source)) return "context";
   if (/应急管理部地质灾害快报/.test(source)) return "detection";
   if (/EMSC|GeoNet/.test(source)) return "verification";

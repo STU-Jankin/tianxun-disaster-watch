@@ -16,6 +16,7 @@ import {
 } from "../../../lib/cyclone-tracking-opportunities";
 import { annotatePlanningWindows } from "../../../lib/mission-planning";
 import { loadVisibilityServiceCapabilities } from "../../../lib/visibility-service-capabilities";
+import { isRegionalLandslideScreeningSource } from "../../../lib/landslide-regional-screening";
 
 export const dynamic = "force-dynamic";
 
@@ -109,6 +110,9 @@ export async function POST(request: Request) {
   canonical ??= await getCanonicalEventForTask(String(task.masterEventId));
   if (!canonical || ["resolved", "archived"].includes(canonical.lifecycleStatus) || Date.parse(canonical.observationExpiresAt) <= Date.now()) {
     return Response.json({ state: "error", windows: [], message: "关联主事件不存在、已解除或已超过观测期" }, { status: 409 });
+  }
+  if (isRegionalLandslideScreeningSource(canonical.event.source)) {
+    return Response.json({ state: "error", windows: [], message: "区域滑坡试验筛查当前仅可保存候选草稿；补齐官方预警、隐患点或人工复核证据后才能计算卫星机会" }, { status: 409 });
   }
   if (Date.parse(String(task.imagingEnd)) > Date.parse(canonical.observationExpiresAt)) {
     return Response.json({ state: "error", windows: [], message: "任务成像窗口已超过该灾害的有效观测期" }, { status: 409 });

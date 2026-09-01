@@ -36,6 +36,14 @@ const governanceOverrides: Record<string, Partial<SourceGovernance>> = {
     updateSemantics: "按官方栅格批次更新，超过产品有效期自动失效。",
     geometrySemantics: "模型风险区，不是已发生滑坡或泥石流边界。",
   },
+  "天巡区域滑坡试验筛查": {
+    authorityClass: "scientific",
+    pollIntervalMinutes: 360,
+    latencySloMinutes: 420,
+    updateSemantics: "按UTC六小时时次更新重庆/江苏固定试验格；同一区域与预报时效使用稳定事件编号形成版本记录，未命中格网不解释为低风险。",
+    geometrySemantics: "CMA GRAPES Global降雨条件与Copernicus DEM坡度共同命中的试验筛查格，不是滑坡概率、滑坡体边界、官方预警或省域完整覆盖。",
+    licenseNote: "试验模型输出；保留Open-Meteo与Copernicus DEM归属，正式业务需替换为具服务保障的数据链路并完成地方样本校准。",
+  },
   "Copernicus EMS Rapid Mapping": {
     pollIntervalMinutes: 30,
     latencySloMinutes: 180,
