@@ -4,7 +4,7 @@ import { normalizeAntimeridianGeometry, validateGeoGeometry } from "./geo-geomet
 import { publicOverpassMaximumAreaKm2, type OverpassCacheStatus, type OverpassProfile } from "./overpass-runtime.ts";
 import polygonClipping, { type MultiPolygon as ClippingMultiPolygon, type Polygon as ClippingPolygon } from "polygon-clipping";
 
-export const exposureAssessmentModelVersion = "tianxun-exposure-screening-v5" as const;
+export const exposureAssessmentModelVersion = "tianxun-exposure-screening-v6" as const;
 export const maximumWorldPopAreaKm2 = 50_000;
 export const maximumOverpassAreaKm2 = publicOverpassMaximumAreaKm2;
 
@@ -77,12 +77,23 @@ export type OsmExposure = {
   cacheStatus?: OverpassCacheStatus;
   dataProfile?: OverpassProfile;
   updateCadence?: "upstream" | "daily";
+  coverage?: "full" | "focused";
+  scopeLabel?: string;
+  scopeAreaKm2?: number;
+  sourceAoiAreaKm2?: number;
   completedParts?: number;
   totalParts?: number;
   parts?: OsmExposurePart[];
   planHash?: string;
   refreshStartedAt?: string;
   message: string;
+};
+
+export type OsmExposureScope = {
+  aoi: ExposureAoi;
+  coverage: "full" | "focused";
+  label: string;
+  sourceAoiAreaKm2: number;
 };
 
 export type OsmExposurePart = {
@@ -177,6 +188,40 @@ export function buildExposureAoi(event: DisasterEvent): ExposureAoi {
 export function exposureAssessmentIdentity(event: DisasterEvent) {
   const aoi = buildExposureAoi(event);
   return { aoi, eventRevision: eventRevisionFingerprint(event), aoiHash: aoiFingerprint(aoi.geometry) };
+}
+
+export function buildOsmExposureScope(event: DisasterEvent, sourceAoi: ExposureAoi, maximumAreaKm2 = maximumOverpassAreaKm2): OsmExposureScope {
+  const safeMaximumAreaKm2 = Math.max(100, maximumAreaKm2);
+  if (sourceAoi.areaKm2 <= safeMaximumAreaKm2) {
+    return { aoi: sourceAoi, coverage: "full", label: sourceAoi.label, sourceAoiAreaKm2: sourceAoi.areaKm2 };
+  }
+
+  const currentCenter = event.cycloneForecast?.track.find((point) => point.leadHours === 0) ?? event.cycloneForecast?.track[0];
+  const longitude = currentCenter?.longitude ?? event.longitude;
+  const latitude = currentCenter?.latitude ?? event.latitude;
+  const radiusKm = Math.max(5, Math.min(50, Math.sqrt(safeMaximumAreaKm2 / Math.PI) * 0.9));
+  const focusCircle = circlePolygon(longitude, latitude, radiusKm, 48);
+  const intersected = intersectPolygonalGeometries(sourceAoi.geometry, focusCircle);
+  const geometry = intersected ?? focusCircle;
+  const validation = validateGeoGeometry(geometry, { maximumAreaKm2: safeMaximumAreaKm2, maximumVertices: 20_000, maximumRingVertices: 5_000, allowOverlappingMultiPolygon: true });
+  if (!validation.ok) throw new Error(validation.reason || "无法建立 OSM 重点筛查区");
+  const centerLabel = event.hazard === "cyclone" ? "当前台风中心" : "事件代表点";
+  const label = intersected
+    ? `${centerLabel} ${Math.round(radiusKm)} km OSM 重点筛查区（与来源影响面交集）`
+    : `${centerLabel} ${Math.round(radiusKm)} km OSM 重点筛查区（未与来源影响面重叠，需人工核对）`;
+  return {
+    aoi: {
+      geometry,
+      areaKm2: validation.areaKm2,
+      bbox: geometryBbox(geometry),
+      basis: sourceAoi.basis,
+      label,
+      crossesAntimeridian: validation.crossesAntimeridian,
+    },
+    coverage: "focused",
+    label,
+    sourceAoiAreaKm2: sourceAoi.areaKm2,
+  };
 }
 
 export function worldPopRequestPlan(aoi: ExposureAoi, requestedYear = new Date().getUTCFullYear(), maximumAreaKm2 = maximumWorldPopAreaKm2) {
@@ -422,14 +467,17 @@ export function exposureRiskInput(population: PopulationExposure, osm: OsmExposu
   const totalScore = clamp(((Math.log10(total + 1) - 1) / 5) * 100, 0, 100);
   const densityScore = clamp((Math.log10(density + 1) / 4) * 100, 0, 100);
   const populationBaseline = Math.min(85, Math.round(totalScore * 0.72 + densityScore * 0.28));
-  const osmContext = osm.state === "ready" ? Math.min(15,
+  const fullCoverageOsm = osm.state === "ready" && osm.coverage !== "focused";
+  const osmContext = fullCoverageOsm ? Math.min(15,
     Math.min(5, Math.log10((osm.mappedBuildingCount ?? 0) + 1) * 1.5)
     + Math.min(3, Math.log10((osm.mappedRoadWayCount ?? 0) + 1))
     + Math.min(7, Math.log10((osm.mappedKeyFacilityCount ?? 0) + 1) * 2.2)) : 0;
   const index = Math.min(100, Math.round(populationBaseline + osmContext));
-  const osmBasis = osm.state === "ready"
+  const osmBasis = fullCoverageOsm
     ? `；OSM 已映射建筑 ${osm.mappedBuildingCount?.toLocaleString()}、道路 way ${osm.mappedRoadWayCount?.toLocaleString()}、关键设施 ${osm.mappedKeyFacilityCount?.toLocaleString()} 仅作上调背景，不以缺失记录降低指数`
-    : "；本指数仅含人口暴露，未计入建筑、道路和关键设施存量";
+    : osm.state === "ready" && osm.coverage === "focused"
+      ? "；OSM 仅完成重点区筛查，结果不外推且不参与完整影响范围指数"
+      : "；本指数仅含人口暴露，未计入建筑、道路和关键设施存量";
   return {
     index,
     basis: `WorldPop ${population.year} 年模型估计人口 ${Math.round(total).toLocaleString()}，密度 ${Math.round(density).toLocaleString()} 人/km²${osmBasis}`,
@@ -534,6 +582,25 @@ function intersectGeometryWithBbox(geometry: EventGeometry, bbox: [number, numbe
   const normalized = normalizeAntimeridianGeometry(candidate) ?? candidate;
   const validation = validateGeoGeometry(normalized, { maximumAreaKm2: 25_000_000, maximumVertices: 20_000, maximumRingVertices: 5_000, allowOverlappingMultiPolygon: true });
   return validation.ok && validation.areaKm2 > 0.01 ? [normalized] : [];
+}
+
+function intersectPolygonalGeometries(subjectGeometry: EventGeometry, clipGeometry: EventGeometry): EventGeometry | null {
+  if (!(subjectGeometry.type === "Polygon" || subjectGeometry.type === "MultiPolygon")) return null;
+  if (!(clipGeometry.type === "Polygon" || clipGeometry.type === "MultiPolygon")) return null;
+  const subject = subjectGeometry.type === "Polygon"
+    ? subjectGeometry.coordinates as ClippingPolygon
+    : subjectGeometry.coordinates as ClippingMultiPolygon;
+  const clip = clipGeometry.type === "Polygon"
+    ? clipGeometry.coordinates as ClippingPolygon
+    : clipGeometry.coordinates as ClippingMultiPolygon;
+  const clipped = polygonClipping.intersection(subject, clip);
+  if (!clipped.length) return null;
+  const candidate: EventGeometry = clipped.length === 1
+    ? { type: "Polygon", coordinates: clipped[0] }
+    : { type: "MultiPolygon", coordinates: clipped };
+  const normalized = normalizeAntimeridianGeometry(candidate) ?? candidate;
+  const validation = validateGeoGeometry(normalized, { maximumAreaKm2: 25_000_000, maximumVertices: 20_000, maximumRingVertices: 5_000, allowOverlappingMultiPolygon: true });
+  return validation.ok && validation.areaKm2 > 0.01 ? normalized : null;
 }
 
 function overpassFacility(element: Record<string, unknown>): ExposureFacility[] {

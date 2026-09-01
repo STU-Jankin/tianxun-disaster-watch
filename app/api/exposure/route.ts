@@ -2,6 +2,7 @@ import { getCanonicalEventForTask, getEventExposureAssessment, getOsmQueryCache,
 import { ApiInputError, apiActor, authorizeApiRequest, enforceRateLimit, readJsonObject, rejectCrossOriginBrowserWrite } from "../../../lib/api-security.ts";
 import {
   aggregateOverpassExposureChunks,
+  buildOsmExposureScope,
   decodeOsmIdDeltas,
   encodeOsmIdDeltas,
   exposureAssessmentIdentity,
@@ -16,6 +17,7 @@ import {
   type ExposureFacility,
   type OsmExposure,
   type OsmExposurePart,
+  type OsmExposureScope,
   type OverpassExposureChunkResult,
   type PopulationExposure,
   type PopulationExposurePart,
@@ -81,12 +83,13 @@ export async function POST(request: Request) {
 
     const actor = await apiActor(request);
     const year = configuredWorldPopYear();
+    const osmScope = buildOsmExposureScope(canonical.event, identity.aoi, overpassConfig.maximumAreaKm2);
     const reusablePending = !force && sameInput && cached?.population.state === "pending" ? cached.population : undefined;
     const reusablePopulation = !force && sameInput && cached?.population.state === "ready" ? cached.population : undefined;
     const reusableOsm = !force && sameInput && sameOsmProfile && cached?.osm.state === "pending" ? cached.osm : undefined;
     const [population, osm] = await Promise.all([
       reusablePopulation ? Promise.resolve(reusablePopulation) : fetchPopulation(identity.aoi, year, reusablePending),
-      fetchOsmExposure(identity.aoi, overpassConfig, force, reusableOsm),
+      fetchOsmExposure(osmScope, overpassConfig, force, reusableOsm),
     ]);
     const computedAt = new Date().toISOString();
     const osmFetchedAt = osm.state === "ready" && osm.fetchedAt ? Date.parse(osm.fetchedAt) : Number.NaN;
@@ -110,6 +113,7 @@ export async function POST(request: Request) {
         "该结果是暴露度筛查，不是受灾、受损、伤亡或经济损失评估。",
         "WorldPop 是指定年份人口模型估计，不代表灾害发生时刻的人口分布。",
         "OSM 为志愿者维护的已映射要素；零记录或缺失记录不能证明现实中不存在。",
+        ...(osm.coverage === "focused" ? ["OSM 建筑、道路和关键设施仅统计明确标注的重点筛查区，不代表完整灾害影响范围，也不得按面积比例外推。"] : []),
         identity.aoi.basis === "derived_screening_buffer" ? "当前没有可直接采用的官方影响面，AOI 为事件代表点缓冲区，需要在地图中核对。" : "AOI 采用来源几何，但来源范围不等于实际受灾边界。",
       ],
       modelVersion: exposureAssessmentModelVersion,
@@ -238,20 +242,26 @@ async function requestWorldPopTask(endpoint: URL, taskId: string, year: number, 
   return parseWorldPopTask(JSON.parse(response), year, resolution, taskId);
 }
 
-async function fetchOsmExposure(aoi: ReturnType<typeof exposureAssessmentIdentity>["aoi"], config: OverpassRuntimeConfig, force: boolean, pending?: OsmExposure): Promise<OsmExposure> {
-  const plan = prepareOverpassExposurePlan(aoi, {
+async function fetchOsmExposure(scope: OsmExposureScope, config: OverpassRuntimeConfig, force: boolean, pending?: OsmExposure): Promise<OsmExposure> {
+  const plan = prepareOverpassExposurePlan(scope.aoi, {
     maximumAreaKm2: config.maximumAreaKm2,
     chunkAreaKm2: config.chunkAreaKm2,
     serviceLabel: config.profileLabel,
     queryTimeoutSeconds: config.queryTimeoutSeconds,
   });
-  if (plan.state === "skipped") return emptyOsmExposure("skipped", config, plan.message);
+  if (plan.state === "skipped") return emptyOsmExposure("skipped", config, plan.message, scope);
+  const scopeMetadata = {
+    coverage: scope.coverage,
+    scopeLabel: scope.label,
+    scopeAreaKm2: scope.aoi.areaKm2,
+    sourceAoiAreaKm2: scope.sourceAoiAreaKm2,
+  } as const;
 
   const aggregateCacheKey = overpassCacheKey(config, "exposure", `aggregate-v1:${plan.cacheIdentity}`);
   const cachedAggregate = await readExposureCache(aggregateCacheKey);
   const continuing = pending?.state === "pending" && pending.planHash === plan.planHash;
   if (!force && !continuing && cachedAggregate && Date.parse(cachedAggregate.expiresAt) > Date.now()) {
-    return { ...cachedAggregate.payload, cacheStatus: "fresh", dataProfile: config.profile, updateCadence: config.updateCadence };
+    return { ...cachedAggregate.payload, ...scopeMetadata, cacheStatus: "fresh", dataProfile: config.profile, updateCadence: config.updateCadence };
   }
 
   const priorRefreshStartedAt = continuing && pending.refreshStartedAt && Number.isFinite(Date.parse(pending.refreshStartedAt)) ? pending.refreshStartedAt : undefined;
@@ -327,11 +337,12 @@ async function fetchOsmExposure(aoi: ReturnType<typeof exposureAssessmentIdentit
       cacheStatus: "refreshed",
       dataProfile: config.profile,
       updateCadence: config.updateCadence,
+      ...scopeMetadata,
       completedParts: plan.chunks.length,
       totalParts: plan.chunks.length,
       parts,
       planHash: plan.planHash,
-      message: `${config.profileLabel} · 已完成 ${plan.chunks.length}/${plan.chunks.length} 个非重叠分块，并按 OSM 类型与 ID 跨块去重；关键设施地图最多显示 300 个点位`,
+      message: `${config.profileLabel} · 已完成 ${plan.chunks.length}/${plan.chunks.length} 个非重叠分块，并按 OSM 类型与 ID 跨块去重；${scope.coverage === "focused" ? "统计口径仅限重点筛查区，不代表完整影响范围；" : ""}关键设施地图最多显示 300 个点位`,
     };
     await writeExposureCache(aggregateCacheKey, ready, config);
     return ready;
@@ -343,6 +354,7 @@ async function fetchOsmExposure(aoi: ReturnType<typeof exposureAssessmentIdentit
     provider: "OpenStreetMap · Overpass",
     dataProfile: config.profile,
     updateCadence: config.updateCadence,
+    ...scopeMetadata,
     facilityCounts: {},
     facilities: [],
     facilitiesTruncated: false,
@@ -444,12 +456,16 @@ function delay(milliseconds: number) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function emptyOsmExposure(state: "skipped" | "unavailable", config: OverpassRuntimeConfig, message: string): OsmExposure {
+function emptyOsmExposure(state: "skipped" | "unavailable", config: OverpassRuntimeConfig, message: string, scope?: OsmExposureScope): OsmExposure {
   return {
     state,
     provider: "OpenStreetMap · Overpass",
     dataProfile: config.profile,
     updateCadence: config.updateCadence,
+    coverage: scope?.coverage,
+    scopeLabel: scope?.label,
+    scopeAreaKm2: scope?.aoi.areaKm2,
+    sourceAoiAreaKm2: scope?.sourceAoiAreaKm2,
     facilityCounts: {},
     facilities: [],
     facilitiesTruncated: false,

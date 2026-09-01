@@ -2217,25 +2217,27 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
   const osm = assessment?.osm;
   const populationReady = population?.state === "ready" && population.totalPopulation !== undefined;
   const osmReady = osm?.state === "ready";
+  const osmFocused = osm?.coverage === "focused";
   const populationOnly = Boolean(assessment?.riskInput && populationReady && (osm?.state === "skipped" || osm?.state === "unavailable"));
   const missingOsmLabel = osm?.state === "pending" ? `分块统计中 ${osm.completedParts ?? 0}/${osm.totalParts ?? "—"}` : osm?.state === "skipped" ? "范围较大，未运行 OSM 统计" : "OSM 数据暂未取得";
   return <section className="exposure-card" aria-labelledby={`exposure-title-${event.id}`}>
     <div className="exposure-heading">
       <div><h3 id={`exposure-title-${event.id}`}>人口与承灾体暴露</h3><small>WorldPop 人口模型 · OpenStreetMap 已映射要素（非实时设施状态）</small></div>
-      <span className={`exposure-status ${populationOnly ? "population-ready" : assessment?.status ?? "unavailable"}`}>{loading ? "读取中" : exposureStatusLabel(assessment?.status, populationOnly)}</span>
+      <span className={`exposure-status ${populationOnly ? "population-ready" : assessment?.status ?? "unavailable"}`}>{loading ? "读取中" : exposureStatusLabel(assessment?.status, populationOnly, osmFocused)}</span>
     </div>
     {historicalReadOnly ? <p className="exposure-notice">历史重演不读取当前暴露度数据；只有随快照保存的结果才能用于历史复盘。</p> : null}
     {stale ? <p className="exposure-warning">事件范围或版本已更新，旧暴露度结果已隐藏，请重新计算。</p> : null}
       {assessment ? <>
         <div className="exposure-metrics">
           <div><span>范围内模型人口</span><strong>{populationReady ? Math.round(population.totalPopulation!).toLocaleString() : "—"}</strong><small>{populationReady ? `${population.year} 年 · ${population.resolution} · ${Math.round(population.populationDensityPerKm2 ?? 0).toLocaleString()} 人/km²` : population?.message}</small></div>
-          <div><span>已映射建筑</span><strong>{osmReady ? osm.mappedBuildingCount?.toLocaleString() : "未统计"}</strong><small>{osmReady ? "OSM building 轮廓数，不是受损建筑数" : missingOsmLabel}</small></div>
-          <div><span>已映射道路</span><strong>{osmReady ? osm.mappedRoadWayCount?.toLocaleString() : "未统计"}</strong><small>{osmReady ? "OSM highway way 数，不代表里程或通行状态" : missingOsmLabel}</small></div>
-          <div><span>关键设施</span><strong>{osmReady ? osm.mappedKeyFacilityCount?.toLocaleString() : "未统计"}</strong><small>{osmReady ? (osm.facilitiesTruncated ? `地图仅显示前 ${osm.facilities.length} 个` : "地图显示可定位设施") : missingOsmLabel}</small></div>
+          <div><span>{osmFocused ? "重点区已映射建筑" : "已映射建筑"}</span><strong>{osmReady ? osm.mappedBuildingCount?.toLocaleString() : "未统计"}</strong><small>{osmReady ? "OSM building 轮廓数，不是受损建筑数" : missingOsmLabel}</small></div>
+          <div><span>{osmFocused ? "重点区已映射道路" : "已映射道路"}</span><strong>{osmReady ? osm.mappedRoadWayCount?.toLocaleString() : "未统计"}</strong><small>{osmReady ? "OSM highway way 数，不代表里程或通行状态" : missingOsmLabel}</small></div>
+          <div><span>{osmFocused ? "重点区关键设施" : "关键设施"}</span><strong>{osmReady ? osm.mappedKeyFacilityCount?.toLocaleString() : "未统计"}</strong><small>{osmReady ? (osm.facilitiesTruncated ? `地图仅显示前 ${osm.facilities.length} 个` : "地图显示可定位设施") : missingOsmLabel}</small></div>
       </div>
       {osm?.state === "ready" && Object.keys(osm.facilityCounts).length ? <div className="exposure-facility-summary">{(Object.entries(osm.facilityCounts) as Array<[ExposureFacilityKind, number]>).map(([kind, count]) => <span key={kind}><i style={{ background: exposureFacilityColor(kind) }} />{exposureFacilityKindLabel(kind)} {count}</span>)}</div> : null}
       <dl className="exposure-provenance">
         <div><dt>筛查范围</dt><dd>{assessment.aoi.label} · {Math.round(assessment.aoi.areaKm2).toLocaleString()} km²</dd></div>
+        {osm?.scopeLabel && osm.scopeAreaKm2 ? <div><dt>OSM 筛查范围</dt><dd>{osm.scopeLabel} · {Math.round(osm.scopeAreaKm2).toLocaleString()} km²</dd></div> : null}
         <div><dt>人口暴露指数</dt><dd>{assessment.riskInput ? `${assessment.riskInput.index}/100（仅用于初筛）` : "未生成"}</dd></div>
         <div><dt>计算时间</dt><dd>{formatTimeWithYear(assessment.computedAt)} UTC+08</dd></div>
         {osm?.osmBaseTimestamp ? <div><dt>OSM 数据时点</dt><dd>{formatTimeWithYear(osm.osmBaseTimestamp)} UTC+08</dd></div> : null}
@@ -2243,6 +2245,7 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
         {osm?.state === "ready" && osm.fetchedAt ? <div><dt>OSM 查询缓存</dt><dd>{overpassCacheStatusLabel(osm.cacheStatus)} · 查询于 {formatTimeWithYear(osm.fetchedAt)} UTC+08</dd></div> : null}
       </dl>
       {assessment.riskInput ? <p className="exposure-risk-basis"><strong>指数依据：</strong>{exposureRiskBasisForDisplay(assessment)}</p> : null}
+      {osmFocused ? <p className="exposure-data-note"><strong>已切换为双尺度筛查。</strong>人口仍覆盖完整灾害影响范围；OSM 只统计上方明确标注的重点区，不代表全影响区总数，也不参与完整范围的人口暴露指数。</p> : null}
       {populationOnly ? <p className="exposure-data-note"><strong>人口筛查已完成。</strong>建筑、道路和关键设施属于补充项，本次未统计；上方人口是筛查范围内模型人口，不是实际受灾人口。</p> : null}
       {population && population.state !== "ready" ? <p className={`exposure-source-state ${population.state}`}>WorldPop：{population.message}</p> : null}
       {osm?.state === "pending" ? <p className="exposure-source-state pending"><strong>OSM 分块统计中。</strong>{osm.message} 页面保持打开时会约每 20 秒自动续算；可以离开详情，已完成分块不会丢失。</p> : null}
@@ -2254,9 +2257,9 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
   </section>;
 }
 
-function exposureStatusLabel(status: ExposureAssessment["status"] | undefined, populationOnly = false) {
+function exposureStatusLabel(status: ExposureAssessment["status"] | undefined, populationOnly = false, osmFocused = false) {
   if (populationOnly) return "人口指数已生成";
-  return status === "complete" ? "人口与 OSM 已完成" : status === "partial" ? "已有可用结果" : status === "pending" ? "计算中" : status === "unavailable" ? "不可用" : "未计算";
+  return status === "complete" ? osmFocused ? "人口与 OSM 重点区已完成" : "人口与 OSM 已完成" : status === "partial" ? "已有可用结果" : status === "pending" ? "计算中" : status === "unavailable" ? "不可用" : "未计算";
 }
 
 function exposureRiskBasisForDisplay(assessment: ExposureAssessment) {

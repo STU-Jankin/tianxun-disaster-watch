@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   aggregateOverpassExposureChunks,
   buildExposureAoi,
+  buildOsmExposureScope,
   decodeOsmIdDeltas,
   encodeOsmIdDeltas,
   exposureAssessmentStatus,
@@ -70,6 +71,26 @@ test("accepts and partitions a routine 50 km flood screening buffer", () => {
   assert.ok(aoi.areaKm2 > 7_800 && aoi.areaKm2 < 7_900);
   assert.ok(plan.chunks.length > 12 && plan.chunks.length <= 20);
   assert.ok(plan.chunks.every((chunk) => chunk.areaKm2 <= 750));
+});
+
+test("uses a clearly labelled bounded OSM focus for a very large official cyclone impact area", () => {
+  const event = pointEvent({
+    hazard: "cyclone",
+    title: "测试台风",
+    latitude: 30,
+    longitude: 102,
+    geometryType: "Polygon",
+    geometry: { type: "Polygon", coordinates: [[[99, 27], [105, 27], [105, 33], [99, 33], [99, 27]]] },
+  });
+  const sourceAoi = buildExposureAoi(event);
+  assert.ok(sourceAoi.areaKm2 > 100_000);
+  const scope = buildOsmExposureScope(event, sourceAoi, 10_000);
+  assert.equal(scope.coverage, "focused");
+  assert.ok(scope.aoi.areaKm2 > 7_000 && scope.aoi.areaKm2 <= 10_000);
+  assert.equal(scope.sourceAoiAreaKm2, sourceAoi.areaKm2);
+  assert.match(scope.label, /当前台风中心 50 km OSM 重点筛查区/);
+  const plan = prepareOverpassExposurePlan(scope.aoi, { maximumAreaKm2: 10_000, chunkAreaKm2: 750 });
+  assert.equal(plan.state, "ready");
 });
 
 test("uses official polygon geometry when available and enforces provider area limits", () => {
@@ -167,10 +188,14 @@ test("population parser preserves year and automatic exposure never treats missi
   assert.equal(population.year, 2025);
   const unavailableOsm = { state: "unavailable", provider: "OpenStreetMap · Overpass", facilityCounts: {}, facilities: [], facilitiesTruncated: false, message: "offline" };
   const mappedOsm = { ...unavailableOsm, state: "ready", mappedBuildingCount: 3000, mappedRoadWayCount: 600, mappedKeyFacilityCount: 40 };
+  const focusedOsm = { ...mappedOsm, coverage: "focused", scopeLabel: "重点筛查区", scopeAreaKm2: 7800 };
   const baseline = exposureRiskInput(population, unavailableOsm);
   const enriched = exposureRiskInput(population, mappedOsm);
+  const focused = exposureRiskInput(population, focusedOsm);
   assert.ok(baseline.index > 0);
   assert.ok(enriched.index >= baseline.index);
+  assert.equal(focused.index, baseline.index);
+  assert.match(focused.basis, /不外推且不参与完整影响范围指数/);
   assert.match(baseline.basis, /本指数仅含人口暴露/);
   assert.equal(exposureAssessmentStatus(population, unavailableOsm), "partial");
   assert.equal(exposureAssessmentStatus(population, { ...unavailableOsm, state: "pending", completedParts: 1, totalParts: 4 }), "pending");
