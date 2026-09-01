@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Jiangsu OSM screening index refresh
+
+[Timer]
+OnCalendar=*-*-* 05:20:00 Asia/Shanghai
+RandomizedDelaySec=20m
+Persistent=true
+Unit=tianxun-osm-jiangsu-refresh.service
+
+[Install]
+WantedBy=timers.target

@@ -41,6 +41,8 @@ server {
     add_header Referrer-Policy "no-referrer" always;
     add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
 
+    include /etc/nginx/snippets/tianxun-osm-jiangsu*.conf;
+
     location = /api/health/live {
         limit_req zone=tianxun_api burst=3 nodelay;
         include /etc/nginx/snippets/tianxun-proxy-common.conf;

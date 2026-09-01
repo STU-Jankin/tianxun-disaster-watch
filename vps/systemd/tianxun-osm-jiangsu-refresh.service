@@ -1,0 +1,16 @@
+[Unit]
+Description=Refresh Tianxun Jiangsu OSM screening index
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/tianxun/current
+ExecStart=/bin/bash /opt/tianxun/current/vps/osm-jiangsu/refresh.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=45min
+MemoryHigh=600M
+MemoryMax=850M

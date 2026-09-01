@@ -65,7 +65,7 @@ export type WorldPopRequestChunk = {
 
 export type OsmExposure = {
   state: "ready" | "pending" | "skipped" | "unavailable";
-  provider: "OpenStreetMap · Overpass";
+  provider: "OpenStreetMap · Overpass" | "OpenStreetMap · 江苏本地日更索引";
   mappedBuildingCount?: number;
   mappedRoadWayCount?: number;
   mappedKeyFacilityCount?: number;
@@ -75,8 +75,10 @@ export type OsmExposure = {
   osmBaseTimestamp?: string;
   fetchedAt?: string;
   cacheStatus?: OverpassCacheStatus;
-  dataProfile?: OverpassProfile;
+  dataProfile?: OverpassProfile | "jiangsu_daily";
   updateCadence?: "upstream" | "daily";
+  aggregationMethod?: "exact_feature_ids" | "feature_bbox_centroid_grid";
+  aggregationResolutionKm?: number;
   coverage?: "full" | "focused";
   scopeLabel?: string;
   scopeAreaKm2?: number;

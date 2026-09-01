@@ -1,0 +1,37 @@
+[Unit]
+Description=Tianxun Jiangsu OSM local exposure index
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tianxun-osm
+Group=tianxun-osm
+WorkingDirectory=/opt/tianxun/current
+EnvironmentFile=/etc/tianxun/osm-jiangsu.env
+Environment="NODE_OPTIONS=--disable-warning=ExperimentalWarning"
+ExecStart=/usr/bin/node /opt/tianxun/current/vps/osm-jiangsu/server.mjs
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+UMask=0077
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+ReadOnlyPaths=/var/lib/tianxun/osm-jiangsu
+MemoryHigh=180M
+MemoryMax=280M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

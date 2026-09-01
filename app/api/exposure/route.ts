@@ -24,6 +24,7 @@ import {
   type WorldPopRequestChunk,
 } from "../../../lib/exposure-assessment.ts";
 import { overpassCacheKey, overpassFreshUntil, resolveOverpassRuntimeConfig, type OverpassRuntimeConfig } from "../../../lib/overpass-runtime.ts";
+import { isJiangsuOsmCandidate, jiangsuOsmDataProfile, localOsmScopeMetadata, parseJiangsuOsmExposure, resolveJiangsuOsmRuntimeConfig, type JiangsuOsmRuntimeConfig } from "../../../lib/jiangsu-osm.ts";
 
 export const dynamic = "force-dynamic";
 
@@ -76,20 +77,24 @@ export async function POST(request: Request) {
     const identity = exposureAssessmentIdentity(canonical.event);
     const cached = await getEventExposureAssessment(masterEventId);
     const overpassConfig = resolveOverpassRuntimeConfig();
+    const jiangsuConfig = resolveJiangsuOsmRuntimeConfig();
+    const useJiangsuIndex = Boolean(jiangsuConfig && isJiangsuOsmCandidate(identity.aoi.geometry));
+    const expectedOsmProfile = useJiangsuIndex ? jiangsuOsmDataProfile : overpassConfig.profile;
     const sameInput = cached?.eventRevision === identity.eventRevision && cached.aoiHash === identity.aoiHash && cached.modelVersion === exposureAssessmentModelVersion;
-    const sameOsmProfile = cached?.osm.dataProfile === overpassConfig.profile;
+    const sameOsmProfile = cached?.osm.dataProfile === expectedOsmProfile;
     const fresh = sameInput && sameOsmProfile && Date.parse(cached!.expiresAt) > Date.now();
     if (!force && fresh && cached!.status !== "pending") return Response.json({ assessment: cached }, { headers: privateHeaders("hit") });
 
     const actor = await apiActor(request);
     const year = configuredWorldPopYear();
-    const osmScope = buildOsmExposureScope(canonical.event, identity.aoi, overpassConfig.maximumAreaKm2);
+    const publicOsmScope = buildOsmExposureScope(canonical.event, identity.aoi, overpassConfig.maximumAreaKm2);
+    const osmScope = useJiangsuIndex ? buildOsmExposureScope(canonical.event, identity.aoi, jiangsuConfig!.maximumAreaKm2) : publicOsmScope;
     const reusablePending = !force && sameInput && cached?.population.state === "pending" ? cached.population : undefined;
     const reusablePopulation = !force && sameInput && cached?.population.state === "ready" ? cached.population : undefined;
     const reusableOsm = !force && sameInput && sameOsmProfile && cached?.osm.state === "pending" ? cached.osm : undefined;
     const [population, osm] = await Promise.all([
       reusablePopulation ? Promise.resolve(reusablePopulation) : fetchPopulation(identity.aoi, year, reusablePending),
-      fetchOsmExposure(osmScope, overpassConfig, force, reusableOsm),
+      fetchOsmExposure(osmScope, overpassConfig, force, reusableOsm, jiangsuConfig, publicOsmScope),
     ]);
     const computedAt = new Date().toISOString();
     const osmFetchedAt = osm.state === "ready" && osm.fetchedAt ? Date.parse(osm.fetchedAt) : Number.NaN;
@@ -113,6 +118,7 @@ export async function POST(request: Request) {
         "该结果是暴露度筛查，不是受灾、受损、伤亡或经济损失评估。",
         "WorldPop 是指定年份人口模型估计，不代表灾害发生时刻的人口分布。",
         "OSM 为志愿者维护的已映射要素；零记录或缺失记录不能证明现实中不存在。",
+        ...(osm.aggregationMethod === "feature_bbox_centroid_grid" ? ["江苏本地索引的建筑和道路数量按约 1 km 网格中的要素包围盒代表点汇总，用于快速筛查，不等同于 AOI 边界逐要素精确求交。"] : []),
         ...(osm.coverage === "focused" ? ["OSM 建筑、道路和关键设施仅统计明确标注的重点筛查区，不代表完整灾害影响范围，也不得按面积比例外推。"] : []),
         identity.aoi.basis === "derived_screening_buffer" ? "当前没有可直接采用的官方影响面，AOI 为事件代表点缓冲区，需要在地图中核对。" : "AOI 采用来源几何，但来源范围不等于实际受灾边界。",
       ],
@@ -242,14 +248,25 @@ async function requestWorldPopTask(endpoint: URL, taskId: string, year: number, 
   return parseWorldPopTask(JSON.parse(response), year, resolution, taskId);
 }
 
-async function fetchOsmExposure(scope: OsmExposureScope, config: OverpassRuntimeConfig, force: boolean, pending?: OsmExposure): Promise<OsmExposure> {
+async function fetchOsmExposure(scope: OsmExposureScope, config: OverpassRuntimeConfig, force: boolean, pending?: OsmExposure, jiangsuConfig?: JiangsuOsmRuntimeConfig | null, publicFallbackScope?: OsmExposureScope): Promise<OsmExposure> {
+  let localFallbackNote = "";
+  if (jiangsuConfig && isJiangsuOsmCandidate(scope.aoi.geometry)) {
+    try {
+      const local = await fetchJiangsuOsmExposure(scope, jiangsuConfig);
+      if (local.supported) return local.exposure;
+      localFallbackNote = local.reason;
+    } catch (error) {
+      localFallbackNote = safeUpstreamMessage(error, "江苏 OSM 本地索引暂时不可用");
+    }
+    scope = publicFallbackScope ?? scope;
+  }
   const plan = prepareOverpassExposurePlan(scope.aoi, {
     maximumAreaKm2: config.maximumAreaKm2,
     chunkAreaKm2: config.chunkAreaKm2,
     serviceLabel: config.profileLabel,
     queryTimeoutSeconds: config.queryTimeoutSeconds,
   });
-  if (plan.state === "skipped") return emptyOsmExposure("skipped", config, plan.message, scope);
+  if (plan.state === "skipped") return emptyOsmExposure("skipped", config, [localFallbackNote, plan.message].filter(Boolean).join("；"), scope);
   const scopeMetadata = {
     coverage: scope.coverage,
     scopeLabel: scope.label,
@@ -342,7 +359,7 @@ async function fetchOsmExposure(scope: OsmExposureScope, config: OverpassRuntime
       totalParts: plan.chunks.length,
       parts,
       planHash: plan.planHash,
-      message: `${config.profileLabel} · 已完成 ${plan.chunks.length}/${plan.chunks.length} 个非重叠分块，并按 OSM 类型与 ID 跨块去重；${scope.coverage === "focused" ? "统计口径仅限重点筛查区，不代表完整影响范围；" : ""}关键设施地图最多显示 300 个点位`,
+      message: `${localFallbackNote ? `${localFallbackNote}；已回退` : ""}${config.profileLabel} · 已完成 ${plan.chunks.length}/${plan.chunks.length} 个非重叠分块，并按 OSM 类型与 ID 跨块去重；${scope.coverage === "focused" ? "统计口径仅限重点筛查区，不代表完整影响范围；" : ""}关键设施地图最多显示 300 个点位`,
     };
     await writeExposureCache(aggregateCacheKey, ready, config);
     return ready;
@@ -363,7 +380,47 @@ async function fetchOsmExposure(scope: OsmExposureScope, config: OverpassRuntime
     parts,
     planHash: plan.planHash,
     refreshStartedAt,
-    message: `${plan.message}；已完成 ${readyChunks.size}/${plan.chunks.length}${failedParts ? `，${failedParts} 块本轮失败，将优先续算未尝试分块后再重试` : ""}。未完成全部分块前不生成建筑、道路或设施总数`,
+    message: `${localFallbackNote ? `${localFallbackNote}；已回退公共查询。` : ""}${plan.message}；已完成 ${readyChunks.size}/${plan.chunks.length}${failedParts ? `，${failedParts} 块本轮失败，将优先续算未尝试分块后再重试` : ""}。未完成全部分块前不生成建筑、道路或设施总数`,
+  };
+}
+
+async function fetchJiangsuOsmExposure(scope: OsmExposureScope, config: JiangsuOsmRuntimeConfig): Promise<{ supported: true; exposure: OsmExposure } | { supported: false; reason: string }> {
+  const response = await boundedFetch(config.endpoint.toString(), {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${config.token}`,
+    },
+    body: JSON.stringify({ geometry: scope.aoi.geometry, facilityLimit: 300 }),
+  }, config.timeoutMs, 2 * 1024 * 1024);
+  const result = parseJiangsuOsmExposure(JSON.parse(response));
+  if (!result.supported) return result;
+  const fetchedAt = new Date().toISOString();
+  const approximateResolutionKm = Math.round(result.gridSizeDegrees * 111 * 10) / 10;
+  return {
+    supported: true,
+    exposure: {
+      state: "ready",
+      provider: result.provider,
+      mappedBuildingCount: result.mappedBuildingCount,
+      mappedRoadWayCount: result.mappedRoadWayCount,
+      mappedKeyFacilityCount: result.mappedKeyFacilityCount,
+      facilityCounts: result.facilityCounts,
+      facilities: result.facilities,
+      facilitiesTruncated: result.facilitiesTruncated,
+      osmBaseTimestamp: result.sourceTimestamp,
+      fetchedAt,
+      cacheStatus: "refreshed",
+      dataProfile: jiangsuOsmDataProfile,
+      updateCadence: "daily",
+      aggregationMethod: result.aggregationMethod,
+      aggregationResolutionKm: approximateResolutionKm,
+      ...localOsmScopeMetadata(scope),
+      completedParts: 1,
+      totalParts: 1,
+      message: `江苏 OSM 本地日更索引 · 建筑和道路按约 ${approximateResolutionKm} km 网格中的要素包围盒代表点汇总，关键设施按代表点落入 AOI 筛选；无需公共 Overpass 分块。数据时点 ${result.sourceTimestamp}`,
+    },
   };
 }
 

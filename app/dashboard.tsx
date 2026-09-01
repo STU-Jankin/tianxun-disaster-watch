@@ -2218,6 +2218,7 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
   const populationReady = population?.state === "ready" && population.totalPopulation !== undefined;
   const osmReady = osm?.state === "ready";
   const osmFocused = osm?.coverage === "focused";
+  const osmLocalGrid = osm?.dataProfile === "jiangsu_daily";
   const populationOnly = Boolean(assessment?.riskInput && populationReady && (osm?.state === "skipped" || osm?.state === "unavailable"));
   const missingOsmLabel = osm?.state === "pending" ? `分块统计中 ${osm.completedParts ?? 0}/${osm.totalParts ?? "—"}` : osm?.state === "skipped" ? "范围较大，未运行 OSM 统计" : "OSM 数据暂未取得";
   return <section className="exposure-card" aria-labelledby={`exposure-title-${event.id}`}>
@@ -2230,8 +2231,8 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
       {assessment ? <>
         <div className="exposure-metrics">
           <div><span>范围内模型人口</span><strong>{populationReady ? Math.round(population.totalPopulation!).toLocaleString() : "—"}</strong><small>{populationReady ? `${population.year} 年 · ${population.resolution} · ${Math.round(population.populationDensityPerKm2 ?? 0).toLocaleString()} 人/km²` : population?.message}</small></div>
-          <div><span>{osmFocused ? "重点区已映射建筑" : "已映射建筑"}</span><strong>{osmReady ? osm.mappedBuildingCount?.toLocaleString() : "未统计"}</strong><small>{osmReady ? "OSM building 轮廓数，不是受损建筑数" : missingOsmLabel}</small></div>
-          <div><span>{osmFocused ? "重点区已映射道路" : "已映射道路"}</span><strong>{osmReady ? osm.mappedRoadWayCount?.toLocaleString() : "未统计"}</strong><small>{osmReady ? "OSM highway way 数，不代表里程或通行状态" : missingOsmLabel}</small></div>
+          <div><span>{osmFocused ? "重点区已映射建筑" : "已映射建筑"}</span><strong>{osmReady ? osm.mappedBuildingCount?.toLocaleString() : "未统计"}</strong><small>{osmReady ? osmLocalGrid ? `约 ${osm.aggregationResolutionKm ?? 1} km 网格代表点汇总，不是受损建筑数` : "OSM building 轮廓数，不是受损建筑数" : missingOsmLabel}</small></div>
+          <div><span>{osmFocused ? "重点区已映射道路" : "已映射道路"}</span><strong>{osmReady ? osm.mappedRoadWayCount?.toLocaleString() : "未统计"}</strong><small>{osmReady ? osmLocalGrid ? `约 ${osm.aggregationResolutionKm ?? 1} km 网格代表点汇总，不代表道路里程` : "OSM highway way 数，不代表里程或通行状态" : missingOsmLabel}</small></div>
           <div><span>{osmFocused ? "重点区关键设施" : "关键设施"}</span><strong>{osmReady ? osm.mappedKeyFacilityCount?.toLocaleString() : "未统计"}</strong><small>{osmReady ? (osm.facilitiesTruncated ? `地图仅显示前 ${osm.facilities.length} 个` : "地图显示可定位设施") : missingOsmLabel}</small></div>
       </div>
       {osm?.state === "ready" && Object.keys(osm.facilityCounts).length ? <div className="exposure-facility-summary">{(Object.entries(osm.facilityCounts) as Array<[ExposureFacilityKind, number]>).map(([kind, count]) => <span key={kind}><i style={{ background: exposureFacilityColor(kind) }} />{exposureFacilityKindLabel(kind)} {count}</span>)}</div> : null}
@@ -2241,11 +2242,12 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
         <div><dt>人口暴露指数</dt><dd>{assessment.riskInput ? `${assessment.riskInput.index}/100（仅用于初筛）` : "未生成"}</dd></div>
         <div><dt>计算时间</dt><dd>{formatTimeWithYear(assessment.computedAt)} UTC+08</dd></div>
         {osm?.osmBaseTimestamp ? <div><dt>OSM 数据时点</dt><dd>{formatTimeWithYear(osm.osmBaseTimestamp)} UTC+08</dd></div> : null}
-        {osm?.dataProfile ? <div><dt>OSM 更新方式</dt><dd>{osm.dataProfile === "china_daily" ? "中国日更镜像（非实时）" : "公共 Overpass 上游"}</dd></div> : null}
-        {osm?.state === "ready" && osm.fetchedAt ? <div><dt>OSM 查询缓存</dt><dd>{overpassCacheStatusLabel(osm.cacheStatus)} · 查询于 {formatTimeWithYear(osm.fetchedAt)} UTC+08</dd></div> : null}
+        {osm?.dataProfile ? <div><dt>OSM 更新方式</dt><dd>{osm.dataProfile === "jiangsu_daily" ? "江苏本地日更索引（非实时）" : osm.dataProfile === "china_daily" ? "中国日更镜像（非实时）" : "公共 Overpass 上游"}</dd></div> : null}
+        {osm?.state === "ready" && osm.fetchedAt ? <div><dt>OSM 查询状态</dt><dd>{overpassCacheStatusLabel(osm.cacheStatus, osmLocalGrid)} · 查询于 {formatTimeWithYear(osm.fetchedAt)} UTC+08</dd></div> : null}
       </dl>
       {assessment.riskInput ? <p className="exposure-risk-basis"><strong>指数依据：</strong>{exposureRiskBasisForDisplay(assessment)}</p> : null}
       {osmFocused ? <p className="exposure-data-note"><strong>已切换为双尺度筛查。</strong>人口仍覆盖完整灾害影响范围；OSM 只统计上方明确标注的重点区，不代表全影响区总数，也不参与完整范围的人口暴露指数。</p> : null}
+      {osmLocalGrid ? <p className="exposure-data-note"><strong>已使用江苏本地索引。</strong>无需等待公共 Overpass 分块；建筑和道路为快速网格筛查结果，关键设施仍按可定位代表点筛选。</p> : null}
       {populationOnly ? <p className="exposure-data-note"><strong>人口筛查已完成。</strong>建筑、道路和关键设施属于补充项，本次未统计；上方人口是筛查范围内模型人口，不是实际受灾人口。</p> : null}
       {population && population.state !== "ready" ? <p className={`exposure-source-state ${population.state}`}>WorldPop：{population.message}</p> : null}
       {osm?.state === "pending" ? <p className="exposure-source-state pending"><strong>OSM 分块统计中。</strong>{osm.message} 页面保持打开时会约每 20 秒自动续算；可以离开详情，已完成分块不会丢失。</p> : null}
@@ -2268,8 +2270,8 @@ function exposureRiskBasisForDisplay(assessment: ExposureAssessment) {
   return `WorldPop ${population.year} 年模型估计人口 ${Math.round(population.totalPopulation).toLocaleString()}，密度 ${Math.round(population.populationDensityPerKm2 ?? 0).toLocaleString()} 人/km²；本指数仅含人口暴露，未计入建筑、道路和关键设施存量`;
 }
 
-function overpassCacheStatusLabel(status: "refreshed" | "fresh" | "stale" | undefined) {
-  return status === "fresh" ? "本地缓存命中" : status === "stale" ? "过期缓存降级" : "已向数据服务刷新";
+function overpassCacheStatusLabel(status: "refreshed" | "fresh" | "stale" | undefined, localIndex = false) {
+  return status === "fresh" ? "本地缓存命中" : status === "stale" ? "过期缓存降级" : localIndex ? "已查询江苏本地索引" : "已向数据服务刷新";
 }
 
 function exposureFacilityColor(kind: ExposureFacilityKind) {
