@@ -99,6 +99,10 @@ test("creates mode-level assumed sensor opportunities from a current TLE and CSA
     assert.deepEqual(window.polarizations, ["VV"]);
     assert.deepEqual(window.productLevels.map(({ level, code }) => ({ level, code })), [{ level: "L1", code: "SLC" }, { level: "L2", code: "ORG" }]);
     assert.equal(window.footprintGeometry.type, "Polygon");
+    assert.ok(window.reachableNearKm > 0);
+    assert.ok(window.reachableFarKm > window.reachableNearKm);
+    assert.deepEqual(window.reachableLookSides, ["left", "right"]);
+    assert.equal(window.reachableBasis, "tle_sgp4_incidence_envelope");
     assert.match(window.constraintNotes.join(" "), /不得自动下发/);
   }
 });

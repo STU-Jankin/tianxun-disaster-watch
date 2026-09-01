@@ -204,6 +204,11 @@ type SatelliteTask = {
   opportunitySpatialResolutionM?: number;
   opportunitySceneCrossTrackKm?: number;
   opportunitySceneAlongTrackKm?: number;
+  opportunityStart?: string;
+  opportunityEnd?: string;
+  opportunityReachableNearKm?: number;
+  opportunityReachableFarKm?: number;
+  opportunityReachableLookSides?: Array<"left" | "right">;
   sensorParameterStatus?: "user_provided" | "provisional_assumption";
   opportunityFootprint?: GeoGeometry;
   simulationLevel?: "orbit_only" | "assumed_sensor" | "sensor_model";
@@ -243,6 +248,10 @@ type VisibilityWindow = {
   nominalSceneAlongTrackKm?: number;
   parameterStatus?: "user_provided" | "provisional_assumption";
   footprintGeometry?: GeoGeometry;
+  reachableNearKm?: number;
+  reachableFarKm?: number;
+  reachableLookSides?: Array<"left" | "right">;
+  reachableBasis?: "tle_sgp4_incidence_envelope";
   orbitDirection?: "ascending" | "descending";
   simulationLevel?: "orbit_only" | "assumed_sensor" | "sensor_model";
   satelliteLabel?: string;
@@ -266,6 +275,8 @@ type VisibilityWindow = {
   trackingThresholdKnots?: number;
   forecastAdvisoryId?: string;
 };
+
+type OpportunityPreview = { taskId: string; window: VisibilityWindow };
 
 type VisibilityState = {
   state: "idle" | "loading" | "ready" | "needs_config" | "error";
@@ -421,6 +432,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
   const [taskSync, setTaskSync] = useState<Record<string, TaskSyncState>>({});
   const [taskStorageMode, setTaskStorageMode] = useState<TaskStorageMode>("loading");
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+  const [opportunityPreview, setOpportunityPreview] = useState<OpportunityPreview | null>(null);
   const [clock, setClock] = useState(() => Date.now());
   const [compactViewport, setCompactViewport] = useState(false);
   const [fleet, setFleet] = useState<SatelliteFleetState>({ state: "loading", satellites: [], current: 0 });
@@ -794,6 +806,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     const touchesAoi = Object.keys(patch).some((key) => aoiKeys.includes(key));
     const opportunityInputKeys = [...aoiKeys, "imagingStart", "imagingEnd", "sensors", "sarImagingModes", "minimumCoveragePercent", "maximumCloudPercent", "spatialResolutionMeters", "incidenceAngleMinDeg", "incidenceAngleMaxDeg", "orbitDirectionPreference", "cycloneTrackingTarget", "priority", "revisitCount", "deliveryDeadline"];
     const invalidatesOpportunity = Object.keys(patch).some((key) => opportunityInputKeys.includes(key));
+    if (invalidatesOpportunity) setOpportunityPreview((current) => current?.taskId === taskId ? null : current);
     const taskBeforeUpdate = tasksRef.current.find((task) => task.taskId === taskId);
     if (invalidatesOpportunity && taskBeforeUpdate?.opportunityId) {
       opportunityResetNotices.current.set(taskId, "规划条件已修改，原成像机会已清除；请重新计算并选择卫星机会");
@@ -802,7 +815,9 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
       satelliteId: undefined, instrumentId: undefined, imagingMode: undefined, opportunityId: undefined,
       orbitVersion: undefined, visibilityComputedAt: undefined, incidenceAngleDeg: undefined, offNadirAngleDeg: undefined,
       opportunityLookSide: undefined, opportunityCoveragePercent: undefined, opportunitySpatialResolutionM: undefined,
-      opportunitySceneCrossTrackKm: undefined, opportunitySceneAlongTrackKm: undefined, sensorParameterStatus: undefined, opportunityFootprint: undefined,
+      opportunitySceneCrossTrackKm: undefined, opportunitySceneAlongTrackKm: undefined, opportunityStart: undefined, opportunityEnd: undefined,
+      opportunityReachableNearKm: undefined, opportunityReachableFarKm: undefined, opportunityReachableLookSides: undefined,
+      sensorParameterStatus: undefined, opportunityFootprint: undefined,
       simulationLevel: undefined, satelliteNoradId: undefined, closestApproachAt: undefined,
       closestSubpointLatitude: undefined, closestSubpointLongitude: undefined, minimumGroundTrackDistanceKm: undefined,
       orbitSearchRadiusKm: undefined, opportunityOrbitDirection: undefined,
@@ -829,6 +844,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
   const removeTask = useCallback(async (taskId: string) => {
     const task = tasksRef.current.find((item) => item.taskId === taskId);
     if (!task) return;
+    setOpportunityPreview((current) => current?.taskId === taskId ? null : current);
     const priorTimer = taskSaveTimers.current.get(taskId);
     if (priorTimer) window.clearTimeout(priorTimer);
     taskSaveTimers.current.delete(taskId);
@@ -1037,6 +1053,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
       setListOpen(false);
     }
   }, []);
+  const previewOpportunityOnMap = useCallback((preview: OpportunityPreview | null) => setOpportunityPreview(preview), []);
   const updateCustomAoi = useCallback((taskId: string, geometry?: CustomAoiGeometry) => {
     const requestedType = tasksRef.current.find((task) => task.taskId === taskId)?.aoiType;
     const normalized = geometry && requestedType === "multi" ? asMultiPolygon(geometry) : geometry;
@@ -1046,7 +1063,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
     });
   }, [updateTask]);
   const modalPanelOpen = taskPanelOpen || responsePanelOpen;
-  const mapObscured = modalPanelOpen || (compactViewport && (listOpen || Boolean(selected)));
+  const mapObscured = responsePanelOpen || (compactViewport && (taskPanelOpen || listOpen || Boolean(selected)));
 
   return (
     <main className="app-shell">
@@ -1125,7 +1142,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
 
         {!listOpen && <button className="reopen-panel" onClick={() => setListOpen(true)} inert={modalPanelOpen ? true : undefined} aria-hidden={modalPanelOpen || undefined}>事件列表 <b>{filtered.length}</b> ›</button>}
 
-          <MapView scope={scope} events={filtered} selected={selected} exposureAssessment={selected ? exposureAssessments[selected.masterEventId] : undefined} terrainScreening={selected ? landslideTerrain[selected.masterEventId] : undefined} activeTask={activeTask} activeResponseScenario={activeResponseScenario} fleet={fleet} detailOpen={Boolean(selected) && !modalPanelOpen && !activeResponseScenario} layoutKey={`${modalPanelOpen}-${listOpen}-${activeResponseScenario?.scenarioId ?? "none"}`} obscured={mapObscured} responsePointPickTarget={responsePointPickTarget} onResponsePointPick={acceptResponsePointPick} onCancelResponsePointPick={() => { setResponsePointPickTarget(null); setResponsePanelOpen(true); }} onSelect={selectEvent} onCustomAoiChange={updateCustomAoi} onReturnToTask={() => setTaskPanelOpen(true)} onReturnToResponse={() => setResponsePanelOpen(true)} />
+          <MapView scope={scope} events={filtered} selected={selected} exposureAssessment={selected ? exposureAssessments[selected.masterEventId] : undefined} terrainScreening={selected ? landslideTerrain[selected.masterEventId] : undefined} activeTask={activeTask} opportunityPreview={opportunityPreview?.taskId === activeTask?.taskId ? opportunityPreview : null} activeResponseScenario={activeResponseScenario} fleet={fleet} detailOpen={Boolean(selected) && !modalPanelOpen && !activeResponseScenario} layoutKey={`${modalPanelOpen}-${listOpen}-${activeResponseScenario?.scenarioId ?? "none"}`} obscured={mapObscured} responsePointPickTarget={responsePointPickTarget} onResponsePointPick={acceptResponsePointPick} onCancelResponsePointPick={() => { setResponsePointPickTarget(null); setResponsePanelOpen(true); }} onSelect={selectEvent} onCustomAoiChange={updateCustomAoi} onReturnToTask={() => setTaskPanelOpen(true)} onReturnToResponse={() => setResponsePanelOpen(true)} />
 
         <div className="map-legend" inert={modalPanelOpen ? true : undefined} aria-hidden={modalPanelOpen || undefined}>
           <span><i className="red" />红色</span><span><i className="orange" />橙色</span><span><i className="yellow" />黄色</span><span><i className="blue" />蓝色</span>
@@ -1138,7 +1155,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
         </div>
 
         {selected && !activeResponseScenario && <DetailPanel key={`${selected.masterEventId}:${data?.replay?.snapshotId ?? "live"}`} event={selected} exposureAssessment={exposureAssessments[selected.masterEventId]} onExposureChange={(assessment) => setExposureAssessments((current) => { const next = { ...current }; if (assessment) next[selected.masterEventId] = assessment; else delete next[selected.masterEventId]; return next; })} currentUser={currentUser} nowMs={clock} compact={compactViewport} obscured={modalPanelOpen} dispatchBlocked={modeStale} historicalReadOnly={Boolean(data?.replay)} locationZh={locationZh[selected.id]} locationLoading={locationLoading === selected.id} locationState={locationState[selected.id]?.state} onRetryLocation={() => { setLocationState((current) => { const next = { ...current }; delete next[selected.id]; return next; }); setLocationRetry((value) => value + 1); }} taskAdded={tasks.some((task) => taskMatchesEvent(task, selected))} landslideTemplateCount={new Set(tasks.filter((task) => task.masterEventId === selected.masterEventId && ["ascending", "descending"].includes(String(task.orbitDirectionPreference))).map((task) => task.orbitDirectionPreference)).size} terrainScreening={landslideTerrain[selected.masterEventId]} onTerrainChange={(terrain) => setLandslideTerrain((current) => { const next = { ...current }; if (terrain) next[selected.masterEventId] = terrain; else delete next[selected.masterEventId]; return next; })} aoiConfirmed={confirmedAois.has(selected.masterEventId)} onConfirmAoi={(confirmed) => setConfirmedAois((current) => { const next = new Set(current); if (confirmed) next.add(selected.masterEventId); else next.delete(selected.masterEventId); return next; })} onAddTask={addTask} onAddLandslideTasks={addLandslideSarTasks} onResponsePlan={openResponsePlanner} onClose={closeSelected} />}
-        <TaskPanel open={taskPanelOpen} tasks={tasks} syncState={taskSync} storageMode={taskStorageMode} fleet={fleet} activeTaskId={activeTaskId} onActivate={reviewTaskAoi} onUpdate={updateTask} onRemove={(taskId) => void removeTask(taskId)} onClose={closeTaskPanel} onRetry={saveTask} />
+        <TaskPanel open={taskPanelOpen} compact={compactViewport} tasks={tasks} syncState={taskSync} storageMode={taskStorageMode} fleet={fleet} activeTaskId={activeTaskId} onActivate={reviewTaskAoi} onPreviewOpportunity={previewOpportunityOnMap} onUpdate={updateTask} onRemove={(taskId) => void removeTask(taskId)} onClose={closeTaskPanel} onRetry={saveTask} />
         <ResponsePlanPanel open={responsePanelOpen} event={responsePlanningEvent} events={deduplicatedEvents} scenarios={responseScenarios} activeScenarioId={activeResponseScenarioId} currentUserRole={currentUser?.role ?? "admin"} pickedPoint={responsePickedPoint} onRequestPointPick={requestResponsePointPick} onSave={saveResponseScenario} onActivate={reviewResponseScenario} onSelectRoute={selectResponseRoute} onRemove={removeResponseScenario} onChooseEvent={(event) => setResponseEventId(event.masterEventId)} onClose={closeResponsePanel} />
         {undoDraft ? <div className="task-undo-toast" role="status"><span>已删除本机草稿：{undoDraft.task.title}</span><button onClick={restoreDraft}>撤销</button></div> : null}
       </section>
@@ -1295,7 +1312,7 @@ function EventCard({ event, active, onClick }: { event: DisasterEvent; active: b
   </button>;
 }
 
-function MapView({ scope, events, selected, exposureAssessment, terrainScreening, activeTask, activeResponseScenario, fleet, detailOpen, layoutKey, obscured, responsePointPickTarget, onResponsePointPick, onCancelResponsePointPick, onSelect, onCustomAoiChange, onReturnToTask, onReturnToResponse }: { scope: ScopeId; events: DisasterEvent[]; selected: DisasterEvent | null; exposureAssessment?: ExposureAssessment; terrainScreening?: LandslideTerrainScreening; activeTask: SatelliteTask | null; activeResponseScenario: ResponseScenario | null; fleet: SatelliteFleetState; detailOpen: boolean; layoutKey: string; obscured: boolean; responsePointPickTarget: ResponsePointPickTarget | null; onResponsePointPick: (target: ResponsePointPickTarget, longitude: number, latitude: number) => void; onCancelResponsePointPick: () => void; onSelect: (event: DisasterEvent) => void; onCustomAoiChange: (taskId: string, geometry?: CustomAoiGeometry) => void; onReturnToTask: () => void; onReturnToResponse: () => void }) {
+function MapView({ scope, events, selected, exposureAssessment, terrainScreening, activeTask, opportunityPreview, activeResponseScenario, fleet, detailOpen, layoutKey, obscured, responsePointPickTarget, onResponsePointPick, onCancelResponsePointPick, onSelect, onCustomAoiChange, onReturnToTask, onReturnToResponse }: { scope: ScopeId; events: DisasterEvent[]; selected: DisasterEvent | null; exposureAssessment?: ExposureAssessment; terrainScreening?: LandslideTerrainScreening; activeTask: SatelliteTask | null; opportunityPreview: OpportunityPreview | null; activeResponseScenario: ResponseScenario | null; fleet: SatelliteFleetState; detailOpen: boolean; layoutKey: string; obscured: boolean; responsePointPickTarget: ResponsePointPickTarget | null; onResponsePointPick: (target: ResponsePointPickTarget, longitude: number, latitude: number) => void; onCancelResponsePointPick: () => void; onSelect: (event: DisasterEvent) => void; onCustomAoiChange: (taskId: string, geometry?: CustomAoiGeometry) => void; onReturnToTask: () => void; onReturnToResponse: () => void }) {
   const bbox = scopes[scope].bbox;
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<import("leaflet").Map | null>(null);
@@ -1304,6 +1321,7 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
   const taskForecastLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const aoiLayerRef = useRef<import("leaflet").GeoJSON | null>(null);
   const opportunityLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
+  const productFootprintLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const responseLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const exposureLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const drawPreviewLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
@@ -1323,11 +1341,31 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
   const [vertexLongitude, setVertexLongitude] = useState("");
   const [vertexLatitude, setVertexLatitude] = useState("");
   const [orbitsVisible, setOrbitsVisible] = useState(false);
+  const [imagingTimeSelection, setImagingTimeSelection] = useState<{ opportunityId: string; percent: number }>({ opportunityId: "", percent: 50 });
+  const [productFootprints, setProductFootprints] = useState<ObservationProduct[]>([]);
   const [clusterSelection, setClusterSelection] = useState<DisasterEvent[]>([]);
+  const previewWindow = opportunityPreview?.window;
+  const imagingRangeOpportunityId = previewWindow?.opportunityId ?? activeTask?.opportunityId ?? "";
+  const imagingTimePercent = imagingTimeSelection.opportunityId === imagingRangeOpportunityId ? imagingTimeSelection.percent : 50;
+  const opportunityClosestAt = previewWindow?.closestApproachAt ?? activeTask?.closestApproachAt;
+  const opportunityInterval = useMemo(() => {
+    if (!activeTask || !opportunityClosestAt) return null;
+    const center = Date.parse(opportunityClosestAt);
+    if (!Number.isFinite(center)) return null;
+    const estimatedDurationMs = Math.max(1_000, Math.min(180_000, Number(previewWindow?.nominalSceneAlongTrackKm ?? activeTask.opportunitySceneAlongTrackKm ?? 25) / 7.5 * 1_000));
+    const start = Date.parse(previewWindow?.start ?? activeTask.opportunityStart ?? "");
+    const end = Date.parse(previewWindow?.end ?? activeTask.opportunityEnd ?? "");
+    return Number.isFinite(start) && Number.isFinite(end) && end > start
+      ? { start, end }
+      : { start: center - estimatedDurationMs / 2, end: center + estimatedDurationMs / 2 };
+  }, [activeTask, opportunityClosestAt, previewWindow]);
+  const imagingPreviewAt = opportunityInterval
+    ? new Date(opportunityInterval.start + (opportunityInterval.end - opportunityInterval.start) * imagingTimePercent / 100).toISOString()
+    : opportunityClosestAt;
   const activeTrackingSlice = useMemo(() => {
-    if (activeTask?.hazard !== "cyclone" || !activeTask.closestApproachAt || !activeTask.timeIndexedAoi?.length) return undefined;
-    return cycloneTrackingSliceAt(activeTask.timeIndexedAoi, activeTask.closestApproachAt);
-  }, [activeTask]);
+    if (activeTask?.hazard !== "cyclone" || !opportunityClosestAt || !activeTask.timeIndexedAoi?.length) return undefined;
+    return cycloneTrackingSliceAt(activeTask.timeIndexedAoi, opportunityClosestAt);
+  }, [activeTask, opportunityClosestAt]);
   const activeTrackingTarget = activeTask?.cycloneTrackingTarget ?? "center";
   const activeTrackingGeometry = useMemo(() => activeTrackingSlice
     ? cycloneTrackingGeometry(activeTrackingSlice, activeTrackingTarget)
@@ -1335,7 +1373,7 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
   const displayedCycloneForecast = activeTask?.hazard === "cyclone" ? activeTask.cycloneForecast : selected?.cycloneForecast;
   const forecastOwnerId = activeTask?.hazard === "cyclone" ? activeTask.taskId : selected?.id ?? "";
   const forecastFrames = displayedCycloneForecast?.impactField?.frames ?? [];
-  const acquisitionForecastFrameIndex = nearestCycloneFrameIndex(forecastFrames, activeTask?.closestApproachAt);
+  const acquisitionForecastFrameIndex = nearestCycloneFrameIndex(forecastFrames, opportunityClosestAt);
   const forecastFrameIndex = forecastSelection.eventId === forecastOwnerId
     ? Math.min(forecastSelection.index, Math.max(0, forecastFrames.length - 1))
     : acquisitionForecastFrameIndex;
@@ -1384,6 +1422,7 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
       selectedLayerRef.current = L.featureGroup().addTo(map);
       taskForecastLayerRef.current = L.featureGroup().addTo(map);
       opportunityLayerRef.current = L.featureGroup().addTo(map);
+      productFootprintLayerRef.current = L.featureGroup().addTo(map);
       responseLayerRef.current = L.featureGroup().addTo(map);
       exposureLayerRef.current = L.featureGroup().addTo(map);
       drawPreviewLayerRef.current = L.featureGroup().addTo(map);
@@ -1411,6 +1450,7 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
       selectedLayerRef.current = null;
       taskForecastLayerRef.current = null;
       opportunityLayerRef.current = null;
+      productFootprintLayerRef.current = null;
       responseLayerRef.current = null;
       exposureLayerRef.current = null;
       drawPreviewLayerRef.current = null;
@@ -1825,27 +1865,28 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
       }).addTo(map);
       if (activeTrackingSlice) {
         const targetLabel = activeTrackingTarget === "center" ? "预测中心" : activeTrackingTarget === "wind_field" ? `${activeTrackingSlice.thresholdKnots ?? "最低阈值"} kt 风圈` : "路径不确定区";
-        layer.bindTooltip(`拍摄时刻台风${targetLabel} · +${activeTrackingSlice.leadHours}小时 · ${formatTimeWithYear(activeTask.closestApproachAt!)} UTC+08 · 中心 ${activeTrackingSlice.center[1].toFixed(3)}°, ${activeTrackingSlice.center[0].toFixed(3)}°`, { sticky: true });
+        layer.bindTooltip(`拍摄时刻台风${targetLabel} · +${activeTrackingSlice.leadHours}小时 · ${formatTimeWithYear(opportunityClosestAt!)} UTC+08 · 中心 ${activeTrackingSlice.center[1].toFixed(3)}°, ${activeTrackingSlice.center[0].toFixed(3)}°`, { sticky: true });
       }
       aoiLayerRef.current = layer;
       const bounds = layer.getBounds();
       if (bounds.isValid() && (activeTrackingSlice || activeTask.simulationLevel !== "orbit_only")) fitWithOverlay(map, bounds, activeTrackingTarget === "center" ? 10 : 9);
     });
     return () => { cancelled = true; };
-  }, [activeTask, activeTrackingGeometry, activeTrackingSlice, activeTrackingTarget, fitWithOverlay, mapReady]);
+  }, [activeTask, activeTrackingGeometry, activeTrackingSlice, activeTrackingTarget, fitWithOverlay, mapReady, opportunityClosestAt]);
 
   useEffect(() => {
     const map = mapRef.current;
     const layer = opportunityLayerRef.current;
     if (!mapReady || !map || !layer) return;
     layer.clearLayers();
-    if (!activeTask || !["orbit_only", "assumed_sensor"].includes(String(activeTask.simulationLevel)) || !activeTask.closestApproachAt || !activeTask.satelliteNoradId) return;
-    const satellite = fleet.satellites.find((candidate) => candidate.noradId === activeTask.satelliteNoradId && candidate.orbitStatus === "current" && candidate.tleLine1 && candidate.tleLine2);
+    if (!activeTask || !["orbit_only", "assumed_sensor", "sensor_model"].includes(String(previewWindow?.simulationLevel ?? activeTask.simulationLevel)) || !opportunityClosestAt) return;
+    const satelliteNoradId = previewWindow?.satelliteNoradId ?? activeTask.satelliteNoradId;
+    const satellite = fleet.satellites.find((candidate) => candidate.noradId === satelliteNoradId && candidate.orbitStatus === "current" && candidate.tleLine1 && candidate.tleLine2);
     if (!satellite) return;
     let cancelled = false;
-    void Promise.all([import("leaflet"), import("../lib/orbit-simulation")]).then(([L, orbit]) => {
+    void Promise.all([import("leaflet"), import("../lib/orbit-simulation"), import("../lib/satellite-imaging-geometry")]).then(([L, orbit, imaging]) => {
       if (cancelled) return;
-      const at = new Date(activeTask.closestApproachAt!);
+      const at = new Date(imagingPreviewAt ?? opportunityClosestAt);
       const position = orbit.propagateTle(satellite.tleLine1!, satellite.tleLine2!, at);
       if (!position) return;
       const targetLatitude = activeTrackingSlice?.center[1] ?? activeTask.latitude;
@@ -1853,27 +1894,47 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
       const displaySubpointLongitude = unwrapLongitudeNear(position.longitude, targetLongitude);
       // Keep the review overlay close to the actual coarse-screening interval;
       // a full orbital arc would dwarf the AOI and falsely resemble a swath.
-      const assumedSensor = activeTask.simulationLevel === "assumed_sensor";
-      const track = orbit.buildGroundTrack(satellite.tleLine1!, satellite.tleLine2!, at, assumedSensor ? 0.25 : 2, assumedSensor ? 0.25 : 2, assumedSensor ? 5 : 15);
+      const simulationLevel = previewWindow?.simulationLevel ?? activeTask.simulationLevel;
+      const assumedSensor = simulationLevel === "assumed_sensor";
+      const intervalMinutes = opportunityInterval ? Math.max(0.1, (opportunityInterval.end - opportunityInterval.start) / 120_000) : 0.25;
+      const track = orbit.buildGroundTrack(satellite.tleLine1!, satellite.tleLine2!, at, assumedSensor ? intervalMinutes : 2, assumedSensor ? intervalMinutes : 2, assumedSensor ? 5 : 15);
       [...track.past, ...track.future].forEach((segment) => L.polyline(segment.map(([latitude, longitude]) => [latitude, unwrapLongitudeNear(longitude, targetLongitude)]), { color: "#6546b3", weight: 3, opacity: 0.92, dashArray: "8 4", interactive: false, className: "selected-opportunity-track" }).addTo(layer));
-      const radiusKm = activeTask.orbitSearchRadiusKm ?? 350;
+      const radiusKm = previewWindow?.searchRadiusKm ?? activeTask.orbitSearchRadiusKm ?? 350;
       let searchCircle: import("leaflet").Circle | null = null;
-      if (activeTask.simulationLevel === "orbit_only") {
+      if (simulationLevel === "orbit_only") {
         searchCircle = L.circle([position.latitude, displaySubpointLongitude], { radius: radiusKm * 1_000, color: "#6546b3", weight: 2, fillColor: "#8d78cf", fillOpacity: 0.08, dashArray: "6 5", className: "selected-opportunity-search-circle" });
         searchCircle.bindTooltip(`TLE 轨道粗筛搜索圈 · 半径 ${radiusKm} km（不是 SAR 幅宽）`, { sticky: true });
         searchCircle.addTo(layer);
       } else {
         const lookLine = L.polyline([[position.latitude, displaySubpointLongitude], [targetLatitude, targetLongitude]], { color: "#6546b3", weight: 2, opacity: 0.8, dashArray: "5 4", interactive: true });
-        lookLine.bindTooltip(`假设传感器侧视关系 · 地面轨迹距拍摄时刻 AOI 中心约 ${activeTask.minimumGroundTrackDistanceKm ?? "--"} km`, { sticky: true });
+        lookLine.bindTooltip(`${assumedSensor ? "假设传感器" : "传感器模型"}侧视关系 · 地面轨迹距 AOI 中心约 ${previewWindow?.minimumGroundTrackDistanceKm ?? activeTask.minimumGroundTrackDistanceKm ?? "--"} km`, { sticky: true });
         lookLine.addTo(layer);
       }
+      if (assumedSensor && opportunityInterval) {
+        const profileMinimum = satellite.payloadProfile?.incidenceAngleDeg.min ?? activeTask.incidenceAngleMinDeg;
+        const profileMaximum = satellite.payloadProfile?.incidenceAngleDeg.max ?? activeTask.incidenceAngleMaxDeg;
+        const corridor = imaging.buildReachableImagingCorridor({
+          tleLine1: satellite.tleLine1!,
+          tleLine2: satellite.tleLine2!,
+          start: new Date(opportunityInterval.start),
+          end: new Date(opportunityInterval.end),
+          incidenceAngleMinDeg: Math.max(profileMinimum, activeTask.incidenceAngleMinDeg),
+          incidenceAngleMaxDeg: Math.min(profileMaximum, activeTask.incidenceAngleMaxDeg),
+          lookSides: previewWindow?.reachableLookSides ?? activeTask.opportunityReachableLookSides ?? satellite.payloadProfile?.lookSides ?? ["left", "right"],
+        });
+        if (corridor) {
+          const corridorLayer = L.geoJSON(unwrapForecastGeometry(corridor.geometry as DisasterEvent["geometry"], targetLongitude) as GeoJSON.GeoJsonObject, { style: { color: "#008eaa", weight: 2, fillColor: "#20bed1", fillOpacity: 0.1, dashArray: "4 4", className: "reachable-imaging-corridor" } }).addTo(layer);
+          corridorLayer.bindTooltip(`可达拍摄走廊 · 入射角 ${Math.max(profileMinimum, activeTask.incidenceAngleMinDeg)}–${Math.min(profileMaximum, activeTask.incidenceAngleMaxDeg)}° · 横轨地距约 ${corridor.nearGroundRangeKm}–${corridor.farGroundRangeKm} km · ${corridor.lookSides.map((side) => side === "left" ? "左视" : "右视").join("/")} · TLE/SGP4 试算`, { sticky: true });
+        }
+      }
       const closestMarker = L.circleMarker([position.latitude, displaySubpointLongitude], { radius: 7, color: "#6546b3", weight: 3, fillColor: "#fff", fillOpacity: 1, className: "selected-opportunity-subpoint" });
-      closestMarker.bindTooltip(`${satellite.interfaceName || satellite.commonName} · 最近子星点 · ${formatTimeWithYear(position.at)} UTC+08 · ${position.direction === "ascending" ? "升轨" : "降轨"} · 距拍摄时刻 AOI 中心约 ${activeTask.minimumGroundTrackDistanceKm ?? "--"} km`, { direction: "top" });
+      closestMarker.bindTooltip(`${satellite.interfaceName || satellite.commonName} · 时间轴子星点 · ${formatTimeWithYear(position.at)} UTC+08 · ${position.direction === "ascending" ? "升轨" : "降轨"} · TLE/SGP4 外推`, { direction: "top" });
       closestMarker.addTo(layer);
       const aoiBounds = aoiLayerRef.current?.getBounds();
-      if (assumedSensor && activeTask.opportunityFootprint) {
-        const footprintLayer = L.geoJSON(unwrapForecastGeometry(activeTask.opportunityFootprint as DisasterEvent["geometry"], targetLongitude) as GeoJSON.GeoJsonObject, { style: { color: "#006dc7", weight: 3, fillColor: "#2c8ee0", fillOpacity: 0.18, dashArray: "7 4", className: "selected-opportunity-footprint" } }).addTo(layer);
-        footprintLayer.bindTooltip(`${activeTask.imagingMode ?? "成像模式"} · 标称场景 ${activeTask.opportunitySceneCrossTrackKm ?? "--"}×${activeTask.opportunitySceneAlongTrackKm ?? "--"} km · 预计覆盖 ${activeTask.opportunityCoveragePercent ?? "--"}%`, { sticky: true });
+      const plannedFootprint = previewWindow?.footprintGeometry ?? activeTask.opportunityFootprint;
+      if (simulationLevel !== "orbit_only" && plannedFootprint) {
+        const footprintLayer = L.geoJSON(unwrapForecastGeometry(plannedFootprint as DisasterEvent["geometry"], targetLongitude) as GeoJSON.GeoJsonObject, { style: { color: "#006dc7", weight: 3, fillColor: "#2c8ee0", fillOpacity: 0.2, dashArray: "7 4", className: "selected-opportunity-footprint" } }).addTo(layer);
+        footprintLayer.bindTooltip(`${previewWindow?.imagingMode ?? activeTask.imagingMode ?? "成像模式"} · 计划/标称成像足迹 ${previewWindow?.nominalSceneCrossTrackKm ?? activeTask.opportunitySceneCrossTrackKm ?? "--"}×${previewWindow?.nominalSceneAlongTrackKm ?? activeTask.opportunitySceneAlongTrackKm ?? "--"} km · 预计覆盖 ${previewWindow?.coveragePercent ?? activeTask.opportunityCoveragePercent ?? "--"}%（不是实拍回执）`, { sticky: true });
         const focusBounds = footprintLayer.getBounds();
         if (aoiBounds?.isValid()) focusBounds.extend(aoiBounds);
         if (focusBounds.isValid()) fitWithOverlay(map, focusBounds, 12);
@@ -1885,7 +1946,32 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
       }
     }).catch(() => setMapError("已选 TLE 轨道机会无法绘制；AOI 和任务字段仍可使用。"));
     return () => { cancelled = true; layer.clearLayers(); };
-  }, [activeTask, activeTrackingSlice, fitWithOverlay, fleet.satellites, mapReady]);
+  }, [activeTask, activeTrackingSlice, fitWithOverlay, fleet.satellites, imagingPreviewAt, mapReady, opportunityClosestAt, opportunityInterval, previewWindow]);
+
+  useEffect(() => {
+    const layer = productFootprintLayerRef.current;
+    if (!mapReady || !layer) return;
+    layer.clearLayers();
+    setProductFootprints([]);
+    if (!activeTask) return;
+    const controller = new AbortController();
+    void fetch(`/api/products?taskId=${encodeURIComponent(activeTask.taskId)}`, { cache: "no-store", signal: controller.signal })
+      .then(async (response) => response.ok ? response.json() as Promise<{ products?: ObservationProduct[] }> : { products: [] })
+      .then(async (result) => {
+        if (controller.signal.aborted) return;
+        const products = result.products ?? [];
+        setProductFootprints(products);
+        if (!products.length) return;
+        const L = await import("leaflet");
+        if (controller.signal.aborted) return;
+        products.forEach((product) => {
+          const productLayer = L.geoJSON(unwrapForecastGeometry(product.geometry as DisasterEvent["geometry"], activeTask.longitude) as GeoJSON.GeoJsonObject, { style: { color: "#15835f", weight: 3, fillColor: "#35b788", fillOpacity: 0.22, className: "actual-product-footprint" } }).addTo(layer);
+          productLayer.bindTooltip(`实拍产品范围 · ${product.productLevel} · ${formatTimeWithYear(product.acquiredAt)} UTC+08 · ${productQualityLabel(product.qualityStatus)} · ${product.itemId}`, { sticky: true });
+        });
+      })
+      .catch(() => undefined);
+    return () => { controller.abort(); layer.clearLayers(); };
+  }, [activeTask, mapReady]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -2000,6 +2086,10 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
   };
 
   const activeResponseRoute = activeResponseScenario?.routes.find((route) => route.routeId === activeResponseScenario.selectedRouteId) ?? activeResponseScenario?.routes[0];
+  const displayedOpportunityLevel = previewWindow?.simulationLevel ?? activeTask?.simulationLevel;
+  const displayedReachableNearKm = previewWindow?.reachableNearKm ?? activeTask?.opportunityReachableNearKm;
+  const displayedReachableFarKm = previewWindow?.reachableFarKm ?? activeTask?.opportunityReachableFarKm;
+  const displayedPlannedFootprint = previewWindow?.footprintGeometry ?? activeTask?.opportunityFootprint;
 
   return <div className="map-stage" role="region" aria-label="灾害与任务地图" inert={obscured ? true : undefined} aria-hidden={obscured || undefined}>
     <div ref={containerRef} className="leaflet-map" aria-label={`${scopes[scope].label}灾害事件地图`} />
@@ -2013,12 +2103,19 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
     </aside> : null}
     {forecastFrames.length > 0 && activeForecastFrame ? <div className="cyclone-timeline" role="group" aria-label="台风四维影响场时间轴">
       <div><strong>{activeTask?.hazard === "cyclone" ? "任务 4D 预测路径" : "4D 影响场"}</strong><span>{browsingTaskForecast ? "浏览模式" : activeTask?.hazard === "cyclone" ? "拍摄时刻" : activeForecastFrame.centerBasis === "official_node" ? "官方节点" : "逐时插值"} · +{activeForecastFrame.leadHours}h</span></div>
-      <div className="cyclone-timeline-meta"><time>{formatTimeWithYear(activeForecastFrame.forecastAt)} UTC+08</time>{activeTask?.hazard === "cyclone" && activeTask.closestApproachAt ? <button disabled={!browsingTaskForecast} onClick={() => setForecastSelection({ eventId: forecastOwnerId, index: acquisitionForecastFrameIndex })}>回到拍摄时刻</button> : null}</div>
+      <div className="cyclone-timeline-meta"><time>{formatTimeWithYear(activeForecastFrame.forecastAt)} UTC+08</time>{activeTask?.hazard === "cyclone" && opportunityClosestAt ? <button disabled={!browsingTaskForecast} onClick={() => setForecastSelection({ eventId: forecastOwnerId, index: acquisitionForecastFrameIndex })}>回到拍摄时刻</button> : null}</div>
       <input type="range" min="0" max={forecastFrames.length - 1} value={Math.min(forecastFrameIndex, forecastFrames.length - 1)} onChange={(event) => setForecastSelection({ eventId: forecastOwnerId, index: Number(event.target.value) })} aria-label="选择台风预报小时" />
       <small>{activeForecastFrame.windFields.length ? activeForecastFrame.windFields.map((field) => `≥${field.thresholdKnots} kt 象限风圈`).join(" · ") : "本时次无可用官方风圈"} · {activeForecastFrame.uncertaintyRadiusKm || activeForecastFrame.uncertaintyGeometry ? "含分时不确定区" : displayedCycloneForecast?.uncertaintyGeometry ? "显示本报次总体不确定区" : "无不确定区数据"}{activeTask?.hazard === "cyclone" ? " · 拖动仅浏览预测，不改变已选卫星机会" : ""}</small>
     </div> : null}
+    {activeTask && opportunityInterval && opportunityClosestAt && displayedOpportunityLevel !== "orbit_only" ? <div className="imaging-range-control" role="group" aria-label="卫星拍摄范围时间轴">
+      <div><strong>卫星拍摄范围</strong><span>{previewWindow ? "候选机会预览" : "已选机会"} · {previewWindow?.satelliteLabel ?? previewWindow?.satelliteId ?? activeTask.satelliteId ?? "卫星待定"}</span></div>
+      <time>{formatTimeWithYear(imagingPreviewAt ?? opportunityClosestAt)} UTC+08</time>
+      <input type="range" min="0" max="100" step="1" value={imagingTimePercent} onChange={(event) => setImagingTimeSelection({ opportunityId: imagingRangeOpportunityId, percent: Number(event.target.value) })} aria-label="选择成像时窗内的卫星位置" />
+      <div className="imaging-range-legend"><span><i className="reachable" />可达拍摄走廊{displayedReachableNearKm != null && displayedReachableFarKm != null ? ` ${displayedReachableNearKm}–${displayedReachableFarKm} km` : ""}</span><span><i className="planned" />{displayedPlannedFootprint ? "计划成像足迹" : "计划足迹待返回"}</span><span><i className="actual" />实拍产品 {productFootprints.length}</span></div>
+      <small>青色是 TLE/SGP4、入射角与左右视形成的时窗可达包络；蓝色是计划/标称场景；绿色只在收到 STAC 产品几何后出现。拖动仅改变卫星时刻显示。</small>
+    </div> : null}
     {activeTask ? <div className="map-review-toolbar" role="group" aria-label="任务AOI地图复核">
-      <div><strong>{activeTask.title}</strong><span>{activeTrackingSlice ? `拍摄时刻台风${activeTrackingTarget === "center" ? "预测中心" : activeTrackingTarget === "wind_field" ? "风圈" : "路径不确定区"} · +${activeTrackingSlice.leadHours}h · ${formatTimeWithYear(activeTask.closestApproachAt!)} UTC+08 · ${activeTrackingSlice.center[1].toFixed(3)}°, ${activeTrackingSlice.center[0].toFixed(3)}°` : ["polygon", "multi"].includes(activeTask.aoiType) ? `${customAoiPartCount(activeTask.customGeometry)} 块自定义 AOI` : "正在显示任务 AOI"}{activeTask.simulationLevel === "orbit_only" ? ` · TLE 轨道粗筛 · 最近约 ${activeTask.minimumGroundTrackDistanceKm ?? "--"} km` : activeTask.simulationLevel === "assumed_sensor" ? ` · 假设传感器试算 · ${activeTask.imagingMode ?? "模式待选"}` : ""}</span></div>
+      <div><strong>{activeTask.title}</strong><span>{activeTrackingSlice ? `拍摄时刻台风${activeTrackingTarget === "center" ? "预测中心" : activeTrackingTarget === "wind_field" ? "风圈" : "路径不确定区"} · +${activeTrackingSlice.leadHours}h · ${formatTimeWithYear(opportunityClosestAt!)} UTC+08 · ${activeTrackingSlice.center[1].toFixed(3)}°, ${activeTrackingSlice.center[0].toFixed(3)}°` : ["polygon", "multi"].includes(activeTask.aoiType) ? `${customAoiPartCount(activeTask.customGeometry)} 块自定义 AOI` : "正在显示任务 AOI"}{displayedOpportunityLevel === "orbit_only" ? ` · TLE 轨道粗筛 · 最近约 ${previewWindow?.minimumGroundTrackDistanceKm ?? activeTask.minimumGroundTrackDistanceKm ?? "--"} km` : displayedOpportunityLevel === "assumed_sensor" ? ` · 假设传感器试算 · ${previewWindow?.imagingMode ?? activeTask.imagingMode ?? "模式待选"}` : ""}</span></div>
       {["polygon", "multi"].includes(activeTask.aoiType) ? <>
         <button onClick={() => { setDrawingTaskId(activeTask.taskId); setDrawing(true); setDraftVertices([]); setDrawingError(""); }}>{activeTask.aoiType === "multi" && activeTask.customGeometry ? "添加子区" : "开始绘制"}</button>
         <button onClick={() => setDraftVertices((current) => current.slice(0, -1))} disabled={!activeDrawing || !activeDraftVertices.length}>撤销顶点</button>
@@ -2732,7 +2829,7 @@ function ResponsePlanPanel({ open, event, events, scenarios, activeScenarioId, c
   </aside>;
 }
 
-function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, onActivate, onUpdate, onRemove, onClose, onRetry }: { open: boolean; tasks: SatelliteTask[]; syncState: Record<string, TaskSyncState>; storageMode: TaskStorageMode; fleet: SatelliteFleetState; activeTaskId: string | null; onActivate: (taskId: string) => void; onUpdate: (taskId: string, patch: Partial<SatelliteTask>) => void; onRemove: (taskId: string) => void; onClose: () => void; onRetry: (task: SatelliteTask) => Promise<SatelliteTask | null> }) {
+function TaskPanel({ open, compact, tasks, syncState, storageMode, fleet, activeTaskId, onActivate, onPreviewOpportunity, onUpdate, onRemove, onClose, onRetry }: { open: boolean; compact: boolean; tasks: SatelliteTask[]; syncState: Record<string, TaskSyncState>; storageMode: TaskStorageMode; fleet: SatelliteFleetState; activeTaskId: string | null; onActivate: (taskId: string) => void; onPreviewOpportunity: (preview: OpportunityPreview | null) => void; onUpdate: (taskId: string, patch: Partial<SatelliteTask>) => void; onRemove: (taskId: string) => void; onClose: () => void; onRetry: (task: SatelliteTask) => Promise<SatelliteTask | null> }) {
   const [visibility, setVisibility] = useState<Record<string, VisibilityState>>({});
   const [scheduling, setScheduling] = useState<JointSchedulingState>({ state: "idle" });
   const [manualRules, setManualRules] = useState<SchedulingManualRules>(() => emptySchedulingManualRules());
@@ -2779,6 +2876,7 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
     const changed = new Set(Object.keys(visibilityInputKeys).filter((taskId) => previous[taskId] && previous[taskId] !== visibilityInputKeys[taskId]));
     const removed = new Set(Object.keys(previous).filter((taskId) => !(taskId in visibilityInputKeys)));
     if (changed.size || removed.size) {
+      if (activeTaskId && (changed.has(activeTaskId) || removed.has(activeTaskId))) onPreviewOpportunity(null);
       changed.forEach((taskId) => visibilityRequestGeneration.current.set(taskId, (visibilityRequestGeneration.current.get(taskId) ?? 0) + 1));
       setVisibility((current) => Object.fromEntries(Object.entries(current).filter(([taskId]) => taskId in visibilityInputKeys && !changed.has(taskId))));
       const invalidTaskIds = new Set([...changed, ...removed]);
@@ -2791,7 +2889,7 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
       }
     }
     previousVisibilityInputKeys.current = visibilityInputKeys;
-  }, [visibilityInputKeys]);
+  }, [activeTaskId, onPreviewOpportunity, visibilityInputKeys]);
   useEffect(() => {
     let stopped = false;
     void fetch("/api/planning/scenarios", { cache: "no-store" }).then(async (response) => {
@@ -2808,7 +2906,7 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
     closeRef.current?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
-      if (event.key !== "Tab" || !panelRef.current) return;
+      if (!compact || event.key !== "Tab" || !panelRef.current) return;
       const focusable = [...panelRef.current.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), [href]')];
       if (!focusable.length) return;
       const first = focusable[0];
@@ -2818,7 +2916,7 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [onClose, open]);
+  }, [compact, onClose, open]);
   const planningProblems = useMemo(() => tasks
     .map((task) => visibility[task.taskId]?.planningProblem)
     .filter((problem): problem is MissionPlanningProblem => Boolean(problem)), [tasks, visibility]);
@@ -2998,7 +3096,7 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
       comparison: scheduling.comparison,
     }, `tianxun-planning-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
   };
-  return <aside ref={panelRef} className="task-panel" role="dialog" aria-modal={open ? "true" : undefined} aria-labelledby="task-panel-title" hidden={!open} inert={!open ? true : undefined}>
+  return <aside ref={panelRef} className="task-panel" role={compact ? "dialog" : "region"} aria-modal={compact && open ? "true" : undefined} aria-labelledby="task-panel-title" hidden={!open} inert={!open ? true : undefined}>
     <div className="task-panel-heading">
       <div><span>卫星任务工作台</span><h2 id="task-panel-title">卫星任务候选单 <b>{tasks.length}</b></h2><p>候选 → AOI 复核 → 机会 → 排程 → 执行回执 → 成像产品</p></div>
       <button ref={closeRef} onClick={onClose} aria-label="关闭卫星任务候选单">×</button>
@@ -3154,6 +3252,7 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
             {window.closestApproachAt ? <small>最近近接 {formatTimeWithYear(window.closestApproachAt)} UTC+08 · 地面轨迹距 AOI 中心 {window.minimumGroundTrackDistanceKm ?? "--"} km · 高度 {window.altitudeKm ?? "--"} km</small> : null}
             <small>{window.coveragePercent == null ? (window.simulationLevel === "orbit_only" ? "真实覆盖率未计算" : "覆盖率待仿真服务返回") : `覆盖 ${window.coveragePercent}%`}{window.incidenceAngleDeg == null ? (window.simulationLevel === "orbit_only" ? " · 地面入射角未计算" : " · 入射角待验证") : ` · 地面入射角 ${window.incidenceAngleDeg}°`}{window.offNadirAngleDeg == null ? "" : ` · 离轴 ${window.offNadirAngleDeg}°`}{window.lookSide ? ` · ${window.lookSide === "left" ? "左视" : "右视"}` : ""}{window.orbitDirection ? ` · ${window.orbitDirection === "ascending" ? "升轨" : "降轨"}` : ""}</small>
             {window.spatialResolutionM != null ? <small>标称分辨率 {window.spatialResolutionLabel ?? `${window.spatialResolutionM} m`} · 标称场景 {window.nominalSceneCrossTrackKm}×{window.nominalSceneAlongTrackKm} km · 极化 {window.polarizations?.join("/") || "待提供"} · {window.parameterStatus === "provisional_assumption" ? "临时假设参数" : "用户提供参数"}</small> : null}
+            {window.reachableNearKm != null && window.reachableFarKm != null ? <small className="opportunity-range-summary">可达拍摄走廊：横轨地距约 {window.reachableNearKm}–{window.reachableFarKm} km · {window.reachableLookSides?.map((side) => side === "left" ? "左视" : "右视").join("/") || "侧视待定"} · TLE/SGP4 + 入射角包络</small> : null}
             {window.productLevels?.length ? <small>可选产品：{window.productLevels.map((product) => `${product.level} ${product.code}`).join(" / ")}</small> : null}
             {window.constraintAssessment ? <small className={`planning-decision ${window.constraintAssessment.decision}`}><b>{window.constraintAssessment.decision === "eligible" ? "约束已满足" : window.constraintAssessment.decision === "conditional" ? "可试排 · 待补工程约束" : "不满足规划约束"}</b>{window.constraintAssessment.findings.length ? ` · ${window.constraintAssessment.findings.slice(0, 2).map((finding) => finding.message).join("；")}${window.constraintAssessment.findings.length > 2 ? `；另 ${window.constraintAssessment.findings.length - 2} 项` : ""}` : " · 当前已登记约束均通过"}</small> : null}
             {window.constraintNotes?.map((note) => <small className="constraint-note" key={note}>{note}</small>)}
@@ -3163,6 +3262,7 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
               const excluded = manualRules.excludedOpportunityRefs.includes(reference);
               return <div className="opportunity-manual-actions"><button className={locked ? "active lock" : ""} aria-pressed={locked} onClick={() => setOpportunityRule(reference, "lock")}>{locked ? "已锁定" : "锁定机会"}</button><button className={excluded ? "active exclude" : ""} aria-pressed={excluded} onClick={() => setOpportunityRule(reference, "exclude")}>{excluded ? "已排除" : "排除机会"}</button></div>;
             })() : null}
+            {window.simulationLevel !== "orbit_only" && window.footprintGeometry ? <button className="preview-opportunity" onClick={() => { onPreviewOpportunity({ taskId: task.taskId, window }); onActivate(task.taskId); }}>预览可达范围与计划足迹</button> : null}
             <button className="choose-opportunity" onClick={() => {
               onUpdate(task.taskId, {
               satelliteId: window.satelliteId, instrumentId: window.instrumentId, imagingMode: window.imagingMode,
@@ -3170,7 +3270,9 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
               incidenceAngleDeg: window.incidenceAngleDeg, offNadirAngleDeg: window.offNadirAngleDeg,
               opportunityLookSide: window.lookSide, opportunityCoveragePercent: window.coveragePercent,
               opportunitySpatialResolutionM: window.spatialResolutionM, opportunitySceneCrossTrackKm: window.nominalSceneCrossTrackKm,
-              opportunitySceneAlongTrackKm: window.nominalSceneAlongTrackKm, sensorParameterStatus: window.parameterStatus,
+              opportunitySceneAlongTrackKm: window.nominalSceneAlongTrackKm, opportunityStart: window.start, opportunityEnd: window.end,
+              opportunityReachableNearKm: window.reachableNearKm, opportunityReachableFarKm: window.reachableFarKm,
+              opportunityReachableLookSides: window.reachableLookSides, sensorParameterStatus: window.parameterStatus,
               opportunityFootprint: window.footprintGeometry, simulationLevel: window.simulationLevel ?? "sensor_model",
               satelliteNoradId: window.satelliteNoradId, closestApproachAt: window.closestApproachAt,
               closestSubpointLatitude: window.closestSubpoint?.latitude, closestSubpointLongitude: window.closestSubpoint?.longitude,
@@ -3180,6 +3282,7 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
               trackingCenterLatitude: window.trackingCenter?.latitude, trackingCenterLongitude: window.trackingCenter?.longitude,
               trackingCenterBasis: window.trackingCenterBasis, trackingThresholdKnots: window.trackingThresholdKnots,
               });
+              onPreviewOpportunity({ taskId: task.taskId, window });
               onActivate(task.taskId);
             }}>{task.opportunityId === window.opportunityId ? "已选择 · 查看拍摄位置" : window.simulationLevel === "orbit_only" ? "选择并查看轨道粗筛位置" : window.simulationLevel === "assumed_sensor" ? "选择并查看试算位置" : "选择并在地图查看"}</button>
           </div>)}
@@ -3642,6 +3745,11 @@ function migrateSatelliteTask(task: Partial<SatelliteTask>): SatelliteTask {
     opportunitySpatialResolutionM: task.opportunitySpatialResolutionM,
     opportunitySceneCrossTrackKm: task.opportunitySceneCrossTrackKm,
     opportunitySceneAlongTrackKm: task.opportunitySceneAlongTrackKm,
+    opportunityStart: task.opportunityStart,
+    opportunityEnd: task.opportunityEnd,
+    opportunityReachableNearKm: task.opportunityReachableNearKm,
+    opportunityReachableFarKm: task.opportunityReachableFarKm,
+    opportunityReachableLookSides: task.opportunityReachableLookSides,
     sensorParameterStatus: task.sensorParameterStatus,
     opportunityFootprint: task.opportunityFootprint,
     simulationLevel: task.simulationLevel,

@@ -1,5 +1,6 @@
 import { propagateTle } from "./orbit-simulation.ts";
 import { normalizeAntimeridianGeometry } from "./geo-geometry.ts";
+import { groundReachForIncidence } from "./satellite-imaging-geometry.ts";
 import type { SarImagingMode, SarPayloadProfile } from "./satellite-payloads.ts";
 import type { SatelliteOrbitSnapshot } from "./satellite-orbits.ts";
 import { representativeAoi, screenTleOpportunities } from "./tle-opportunities.ts";
@@ -38,6 +39,10 @@ export type AssumedSarOpportunity = {
   nominalSceneCrossTrackKm: number;
   nominalSceneAlongTrackKm: number;
   footprintGeometry: GeoGeometry;
+  reachableNearKm: number;
+  reachableFarKm: number;
+  reachableLookSides: Array<"left" | "right">;
+  reachableBasis: "tle_sgp4_incidence_envelope";
   searchRadiusKm: number;
   aoiRadiusKm: number;
   candidateThresholdKm: number;
@@ -148,6 +153,10 @@ export function screenConfiguredSarOpportunities(input: {
         nominalSceneCrossTrackKm: mode.nominalSceneCrossTrackKm,
         nominalSceneAlongTrackKm: mode.nominalSceneAlongTrackKm,
         footprintGeometry,
+        reachableNearKm: round(groundReachForIncidence(candidate.altitudeKm, minimumIncidence), 1),
+        reachableFarKm: round(groundReachForIncidence(candidate.altitudeKm, maximumIncidence), 1),
+        reachableLookSides: [...profile.lookSides],
+        reachableBasis: "tle_sgp4_incidence_envelope",
         searchRadiusKm: round(maximumReachKm, 1),
         aoiRadiusKm: candidate.aoiRadiusKm,
         candidateThresholdKm: round(maximumReachKm + candidate.aoiRadiusKm, 1),
@@ -182,13 +191,7 @@ export function sarLookGeometry(altitudeKm: number, groundDistanceKm: number) {
   return { incidenceAngleDeg, offNadirAngleDeg };
 }
 
-export function groundReachForIncidence(altitudeKm: number, incidenceAngleDeg: number) {
-  const orbitalRadius = EARTH_RADIUS_KM + altitudeKm;
-  const incidence = incidenceAngleDeg * Math.PI / 180;
-  const slantRange = -EARTH_RADIUS_KM * Math.cos(incidence) + Math.sqrt(Math.max(0, orbitalRadius ** 2 - EARTH_RADIUS_KM ** 2 * Math.sin(incidence) ** 2));
-  const centralAngle = Math.atan2(slantRange * Math.sin(incidence), EARTH_RADIUS_KM + slantRange * Math.cos(incidence));
-  return EARTH_RADIUS_KM * centralAngle;
-}
+export { groundReachForIncidence } from "./satellite-imaging-geometry.ts";
 
 function trackGeometry(tleLine1: string, tleLine2: string, at: string, subpoint: { latitude: number; longitude: number }, target: { latitude: number; longitude: number }) {
   const centerMs = Date.parse(at);

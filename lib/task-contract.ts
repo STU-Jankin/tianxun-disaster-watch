@@ -38,7 +38,8 @@ const allowedTaskFields = new Set([
   "timeIndexedAoi", "forecastAdvisoryId", "forecastIssuedAt", "forecastValidUntil",
   "cycloneTrackingTarget", "trackingValidFrom", "trackingValidTo", "trackingLeadHours", "trackingCenterLatitude", "trackingCenterLongitude", "trackingCenterBasis", "trackingThresholdKnots",
   "satelliteId", "instrumentId", "imagingMode", "opportunityId", "orbitVersion", "visibilityComputedAt", "incidenceAngleDeg", "offNadirAngleDeg",
-  "opportunityLookSide", "opportunityCoveragePercent", "opportunitySpatialResolutionM", "opportunitySceneCrossTrackKm", "opportunitySceneAlongTrackKm", "sensorParameterStatus", "opportunityFootprint",
+  "opportunityLookSide", "opportunityCoveragePercent", "opportunitySpatialResolutionM", "opportunitySceneCrossTrackKm", "opportunitySceneAlongTrackKm", "opportunityStart", "opportunityEnd",
+  "opportunityReachableNearKm", "opportunityReachableFarKm", "opportunityReachableLookSides", "sensorParameterStatus", "opportunityFootprint",
   "simulationLevel", "satelliteNoradId", "closestApproachAt", "closestSubpointLatitude", "closestSubpointLongitude",
   "minimumGroundTrackDistanceKm", "orbitSearchRadiusKm", "opportunityOrbitDirection",
   "orbitDirectionPreference", "referenceAcquisitionRequired", "sarAnalysisMode",
@@ -113,6 +114,18 @@ export function validateSatelliteTask(task: Record<string, unknown>, options: { 
   if (task.opportunitySpatialResolutionM !== undefined) boundedNumber(task.opportunitySpatialResolutionM, 0.1, 10_000, "候选机会分辨率", errors);
   if (task.opportunitySceneCrossTrackKm !== undefined) boundedNumber(task.opportunitySceneCrossTrackKm, 0.1, 1_000, "候选场景横轨宽度", errors);
   if (task.opportunitySceneAlongTrackKm !== undefined) boundedNumber(task.opportunitySceneAlongTrackKm, 0.1, 3_000, "候选场景沿轨长度", errors);
+  const opportunityStart = task.opportunityStart === undefined ? null : Date.parse(String(task.opportunityStart));
+  const opportunityEnd = task.opportunityEnd === undefined ? null : Date.parse(String(task.opportunityEnd));
+  if (opportunityStart !== null && !Number.isFinite(opportunityStart)) errors.push("候选机会开始时间无效");
+  if (opportunityEnd !== null && !Number.isFinite(opportunityEnd)) errors.push("候选机会结束时间无效");
+  if (opportunityStart !== null && opportunityEnd !== null && Number.isFinite(opportunityStart) && Number.isFinite(opportunityEnd) && opportunityEnd <= opportunityStart) errors.push("候选机会结束时间必须晚于开始时间");
+  if (opportunityStart !== null && opportunityEnd !== null && Number.isFinite(opportunityStart) && Number.isFinite(opportunityEnd) && Number.isFinite(start) && Number.isFinite(end) && (opportunityStart < start || opportunityEnd > end)) errors.push("候选机会时段必须位于任务成像窗口内");
+  const closestApproach = Date.parse(String(task.closestApproachAt ?? ""));
+  if (opportunityStart !== null && opportunityEnd !== null && Number.isFinite(closestApproach) && Number.isFinite(opportunityStart) && Number.isFinite(opportunityEnd) && (closestApproach < opportunityStart || closestApproach > opportunityEnd)) errors.push("最近轨道近接时间必须位于候选机会时段内");
+  const reachableNear = task.opportunityReachableNearKm === undefined ? null : boundedNumber(task.opportunityReachableNearKm, 0, 2_000, "可达走廊近端地距", errors);
+  const reachableFar = task.opportunityReachableFarKm === undefined ? null : boundedNumber(task.opportunityReachableFarKm, 0, 2_000, "可达走廊远端地距", errors);
+  if (reachableNear !== null && reachableFar !== null && reachableFar < reachableNear) errors.push("可达走廊远端地距不能小于近端地距");
+  if (task.opportunityReachableLookSides !== undefined && (!Array.isArray(task.opportunityReachableLookSides) || task.opportunityReachableLookSides.length < 1 || task.opportunityReachableLookSides.length > 2 || task.opportunityReachableLookSides.some((side) => !["left", "right"].includes(String(side))) || new Set(task.opportunityReachableLookSides).size !== task.opportunityReachableLookSides.length)) errors.push("可达走廊侧视方向无效");
   if (task.sensorParameterStatus !== undefined && !["user_provided", "provisional_assumption"].includes(String(task.sensorParameterStatus))) errors.push("传感器参数状态无效");
   if (task.opportunityFootprint !== undefined) {
     const footprint = validateGeoGeometry(task.opportunityFootprint, { maximumVertices: 20, maximumRingVertices: 20, maximumAreaKm2: 500_000, rejectUnsplitAntimeridian: true });

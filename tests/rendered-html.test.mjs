@@ -265,7 +265,7 @@ test("computes cyclone visibility against the forecast slice valid at each satel
   assert.match(dashboard, /计算台风动态跟踪机会/);
   assert.match(dashboard, /拍摄时刻台风/);
   assert.match(dashboard, /选择并在地图查看/);
-  assert.match(dashboard, /cycloneTrackingSliceAt\(activeTask\.timeIndexedAoi, activeTask\.closestApproachAt\)/);
+  assert.match(dashboard, /cycloneTrackingSliceAt\(activeTask\.timeIndexedAoi, opportunityClosestAt\)/);
   assert.match(dashboard, /onActivate\(task\.taskId\)/);
   assert.match(dashboard, /任务 4D 预测路径/);
   assert.match(dashboard, /回到拍摄时刻/);
@@ -275,6 +275,21 @@ test("computes cyclone visibility against the forecast slice valid at each satel
   assert.match(visibilityRoute, /screenCycloneTleOpportunities/);
   assert.match(tracking, /按卫星过境时刻匹配台风/);
   assert.match(tracking, /cycloneTrackingSliceAt/);
+});
+
+test("shows STK-like reachable, planned and actual imaging footprints without conflating them", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  const geometry = await readFile(new URL("../lib/satellite-imaging-geometry.ts", import.meta.url), "utf8");
+  assert.match(dashboard, /预览可达范围与计划足迹/);
+  assert.match(dashboard, /可达拍摄走廊/);
+  assert.match(dashboard, /计划\/标称成像足迹/);
+  assert.match(dashboard, /实拍产品范围/);
+  assert.match(dashboard, /\/api\/products\?taskId=/);
+  assert.match(styles, /\.imaging-range-control/);
+  assert.match(dashboard, /reachable-imaging-corridor/);
+  assert.match(geometry, /tle_sgp4_incidence_envelope/);
 });
 
 test("keeps satellite simulation results mounted while previewing opportunities", async () => {
