@@ -12,6 +12,13 @@ import { taskPatchFromExecutionReceipt, type MissionExecutionReceipt, type Norma
 import { buildStacItem, geometryBbox, type ObservationProduct, type ObservationProductInput } from "../lib/stac-products.ts";
 import { partitionAoiGeometry, transitionAoiWorkPackage, type AoiWorkPackage, type AoiWorkPackageAction } from "../lib/aoi-work-packages.ts";
 import { buildTaskAoi, type GeoGeometry } from "../lib/task-aoi.ts";
+import {
+  evaluationWindow,
+  type DetectionEvaluationReport,
+  type EvaluationBenchmarkCase,
+  type EvaluationCandidate,
+  type EvaluationSourceReliability,
+} from "../lib/evaluation-center.ts";
 
 type TaskRecord = Record<string, unknown> & {
   taskId: string;
@@ -336,6 +343,11 @@ export function ensureOperationalSchema() {
     `CREATE TABLE IF NOT EXISTS aoi_work_package_history (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, package_id TEXT NOT NULL, revision INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, from_status TEXT, to_status TEXT NOT NULL, payload_json TEXT NOT NULL, changed_at TEXT NOT NULL)`,
     `CREATE UNIQUE INDEX IF NOT EXISTS aoi_work_package_history_revision_uidx ON aoi_work_package_history (package_id, revision)`,
     `CREATE INDEX IF NOT EXISTS aoi_work_package_history_time_idx ON aoi_work_package_history (package_id, changed_at)`,
+    `CREATE TABLE IF NOT EXISTS evaluation_benchmark_cases (case_id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, hazard TEXT NOT NULL, occurred_at TEXT NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL, location_tolerance_km REAL NOT NULL, event_time_tolerance_hours REAL NOT NULL, accepted_lead_minutes INTEGER NOT NULL DEFAULT 0, detection_deadline_minutes INTEGER NOT NULL, expected_severity TEXT, required_source TEXT, provenance_url TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '', verification_status TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS evaluation_cases_hazard_time_idx ON evaluation_benchmark_cases (hazard, occurred_at)`,
+    `CREATE INDEX IF NOT EXISTS evaluation_cases_verification_time_idx ON evaluation_benchmark_cases (verification_status, occurred_at)`,
+    `CREATE TABLE IF NOT EXISTS evaluation_runs (run_id TEXT PRIMARY KEY NOT NULL, model_version TEXT NOT NULL, case_count INTEGER NOT NULL, eligible_count INTEGER NOT NULL, detected_count INTEGER NOT NULL, report_json TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS evaluation_runs_created_idx ON evaluation_runs (created_at)`,
   ];
   schemaReady = database().then(async (db) => {
     await db.batch(statements.map((statement) => db.prepare(statement)));
@@ -533,6 +545,120 @@ export async function listIngestionSnapshots(limit = 24) {
   const db = await database();
   const rows = await db.prepare(`SELECT snapshot_id AS snapshotId, captured_at AS capturedAt, event_count AS eventCount, source_count AS sourceCount FROM ingestion_snapshots ORDER BY captured_at DESC LIMIT ?`).bind(Math.max(1, Math.min(100, limit))).all<Record<string, unknown>>();
   return rows.results;
+}
+
+export async function listEvaluationCases(limit = 100): Promise<EvaluationBenchmarkCase[]> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const rows = await db.prepare(`SELECT case_id AS caseId, title, hazard, occurred_at AS occurredAt, latitude, longitude, location_tolerance_km AS locationToleranceKm, event_time_tolerance_hours AS eventTimeToleranceHours, accepted_lead_minutes AS acceptedLeadMinutes, detection_deadline_minutes AS detectionDeadlineMinutes, expected_severity AS expectedSeverity, required_source AS requiredSource, provenance_url AS provenanceUrl, notes, verification_status AS verificationStatus, created_by AS createdBy, created_at AS createdAt, updated_at AS updatedAt FROM evaluation_benchmark_cases ORDER BY occurred_at DESC, case_id LIMIT ?`)
+    .bind(Math.max(1, Math.min(100, limit))).all<Record<string, unknown>>();
+  return rows.results.map(evaluationCaseFromRow).filter((item): item is EvaluationBenchmarkCase => Boolean(item));
+}
+
+export async function upsertEvaluationCase(benchmark: EvaluationBenchmarkCase) {
+  await ensureOperationalSchema();
+  const db = await database();
+  await db.prepare(`INSERT INTO evaluation_benchmark_cases (case_id, title, hazard, occurred_at, latitude, longitude, location_tolerance_km, event_time_tolerance_hours, accepted_lead_minutes, detection_deadline_minutes, expected_severity, required_source, provenance_url, notes, verification_status, created_by, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(case_id) DO UPDATE SET title=excluded.title, hazard=excluded.hazard, occurred_at=excluded.occurred_at, latitude=excluded.latitude, longitude=excluded.longitude, location_tolerance_km=excluded.location_tolerance_km, event_time_tolerance_hours=excluded.event_time_tolerance_hours, accepted_lead_minutes=excluded.accepted_lead_minutes, detection_deadline_minutes=excluded.detection_deadline_minutes, expected_severity=excluded.expected_severity, required_source=excluded.required_source, provenance_url=excluded.provenance_url, notes=excluded.notes, verification_status=excluded.verification_status, updated_at=excluded.updated_at`)
+    .bind(benchmark.caseId, benchmark.title, benchmark.hazard, benchmark.occurredAt, benchmark.latitude, benchmark.longitude, benchmark.locationToleranceKm, benchmark.eventTimeToleranceHours, benchmark.acceptedLeadMinutes, benchmark.detectionDeadlineMinutes, benchmark.expectedSeverity ?? null, benchmark.requiredSource ?? null, benchmark.provenanceUrl, benchmark.notes, benchmark.verificationStatus, benchmark.createdBy, benchmark.createdAt, benchmark.updatedAt).run();
+  return benchmark;
+}
+
+export async function deleteEvaluationCase(caseId: string) {
+  await ensureOperationalSchema();
+  const db = await database();
+  const existing = await db.prepare(`SELECT case_id FROM evaluation_benchmark_cases WHERE case_id=?`).bind(caseId).first<{ case_id: string }>();
+  if (!existing) return false;
+  await db.prepare(`DELETE FROM evaluation_benchmark_cases WHERE case_id=?`).bind(caseId).run();
+  return true;
+}
+
+export async function listEvaluationRuns(limit = 10): Promise<DetectionEvaluationReport[]> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const rows = await db.prepare(`SELECT report_json AS reportJson FROM evaluation_runs ORDER BY created_at DESC LIMIT ?`)
+    .bind(Math.max(1, Math.min(20, limit))).all<{ reportJson: string }>();
+  return rows.results.flatMap((row) => {
+    try { return [JSON.parse(row.reportJson) as DetectionEvaluationReport]; } catch { return []; }
+  });
+}
+
+export async function persistEvaluationRun(report: DetectionEvaluationReport, actor: string) {
+  await ensureOperationalSchema();
+  const db = await database();
+  await db.prepare(`INSERT INTO evaluation_runs (run_id, model_version, case_count, eligible_count, detected_count, report_json, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(report.runId, report.modelVersion, report.metrics.verifiedCases, report.metrics.eligibleCases, report.metrics.detectedCases, JSON.stringify(report), actor, report.computedAt).run();
+  await db.prepare(`DELETE FROM evaluation_runs WHERE run_id IN (SELECT run_id FROM evaluation_runs ORDER BY created_at DESC LIMIT -1 OFFSET 30)`).run();
+  return report;
+}
+
+export async function listEvaluationCandidates(benchmark: EvaluationBenchmarkCase): Promise<EvaluationCandidate[]> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const window = evaluationWindow(benchmark);
+  const latitudeDelta = Math.min(90, benchmark.locationToleranceKm / 110.574);
+  const longitudeScale = Math.max(0.05, Math.abs(Math.cos(benchmark.latitude * Math.PI / 180)));
+  const longitudeDelta = Math.min(180, benchmark.locationToleranceKm / (111.32 * longitudeScale));
+  const rows = await db.prepare(`SELECT s.snapshot_id AS snapshotId, s.captured_at AS capturedAt, event.value AS eventJson
+    FROM ingestion_snapshots s, json_each(s.payload_json, '$.events') AS event
+    WHERE s.captured_at BETWEEN ? AND ?
+      AND json_extract(event.value, '$.hazard') = ?
+      AND json_extract(event.value, '$.occurredAt') BETWEEN ? AND ?
+      AND CAST(json_extract(event.value, '$.latitude') AS REAL) BETWEEN ? AND ?
+      AND (ABS(CAST(json_extract(event.value, '$.longitude') AS REAL) - ?) <= ? OR ABS(CAST(json_extract(event.value, '$.longitude') AS REAL) - ?) >= ?)
+    ORDER BY s.captured_at, s.snapshot_id
+    LIMIT 1000`)
+    .bind(window.startAt, window.expectedBy, benchmark.hazard, window.eventStartAt, window.eventEndAt, benchmark.latitude - latitudeDelta, benchmark.latitude + latitudeDelta, benchmark.longitude, longitudeDelta, benchmark.longitude, 360 - longitudeDelta)
+    .all<{ snapshotId: string; capturedAt: string; eventJson: string }>();
+  return rows.results.flatMap((row) => {
+    try {
+      const event = JSON.parse(row.eventJson) as DisasterEvent;
+      if (!event?.masterEventId || !event?.hazard || !Number.isFinite(event.latitude) || !Number.isFinite(event.longitude)) return [];
+      return [{ snapshotId: row.snapshotId, capturedAt: row.capturedAt, event }];
+    } catch { return []; }
+  });
+}
+
+export async function evaluationSnapshotTimes(from: string, to: string) {
+  await ensureOperationalSchema();
+  const db = await database();
+  const rows = await db.prepare(`SELECT captured_at AS capturedAt FROM ingestion_snapshots WHERE captured_at BETWEEN ? AND ? ORDER BY captured_at LIMIT 5000`)
+    .bind(from, to).all<{ capturedAt: string }>();
+  return rows.results.map((row) => row.capturedAt);
+}
+
+export async function evaluationSourceReliability(from: string, to: string): Promise<EvaluationSourceReliability[]> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const rows = await db.prepare(`SELECT r.source_id AS sourceId, COALESCE(s.name, r.source_id) AS name, COUNT(*) AS attempts, SUM(CASE WHEN r.ok=1 THEN 1 ELSE 0 END) AS successfulAttempts, AVG(r.duration_ms) AS averageDurationMs
+    FROM source_fetch_runs r LEFT JOIN source_registry s ON s.source_id=r.source_id
+    WHERE r.fetched_at BETWEEN ? AND ? GROUP BY r.source_id, s.name ORDER BY r.source_id LIMIT 100`)
+    .bind(from, to).all<Record<string, unknown>>();
+  return rows.results.map((row) => {
+    const attempts = Number(row.attempts);
+    const successfulAttempts = Number(row.successfulAttempts);
+    return {
+      sourceId: String(row.sourceId),
+      name: String(row.name),
+      attempts,
+      successfulAttempts,
+      successRatePercent: attempts ? Math.round(successfulAttempts / attempts * 1_000) / 10 : 0,
+      averageDurationMs: Math.round(Number(row.averageDurationMs ?? 0)),
+    };
+  });
+}
+
+function evaluationCaseFromRow(row: Record<string, unknown>): EvaluationBenchmarkCase | null {
+  if (!row.caseId || !row.title || !row.hazard || !row.occurredAt) return null;
+  return {
+    caseId: String(row.caseId), title: String(row.title), hazard: String(row.hazard) as EvaluationBenchmarkCase["hazard"], occurredAt: String(row.occurredAt),
+    latitude: Number(row.latitude), longitude: Number(row.longitude), locationToleranceKm: Number(row.locationToleranceKm), eventTimeToleranceHours: Number(row.eventTimeToleranceHours),
+    acceptedLeadMinutes: Number(row.acceptedLeadMinutes), detectionDeadlineMinutes: Number(row.detectionDeadlineMinutes),
+    expectedSeverity: row.expectedSeverity ? String(row.expectedSeverity) as EvaluationBenchmarkCase["expectedSeverity"] : undefined,
+    requiredSource: row.requiredSource ? String(row.requiredSource) : undefined, provenanceUrl: String(row.provenanceUrl), notes: String(row.notes ?? ""),
+    verificationStatus: String(row.verificationStatus) as EvaluationBenchmarkCase["verificationStatus"], createdBy: String(row.createdBy), createdAt: String(row.createdAt), updatedAt: String(row.updatedAt),
+  };
 }
 
 export async function getEventExposureAssessment(masterEventId: string): Promise<ExposureAssessment | null> {

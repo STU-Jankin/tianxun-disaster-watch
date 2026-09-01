@@ -379,3 +379,38 @@ export const aoiWorkPackageHistory = sqliteTable("aoi_work_package_history", {
   uniqueIndex("aoi_work_package_history_revision_uidx").on(table.packageId, table.revision),
   index("aoi_work_package_history_time_idx").on(table.packageId, table.changedAt),
 ]);
+
+export const evaluationBenchmarkCases = sqliteTable("evaluation_benchmark_cases", {
+  caseId: text("case_id").primaryKey(),
+  title: text("title").notNull(),
+  hazard: text("hazard").notNull(),
+  occurredAt: text("occurred_at").notNull(),
+  latitude: real("latitude").notNull(),
+  longitude: real("longitude").notNull(),
+  locationToleranceKm: real("location_tolerance_km").notNull(),
+  eventTimeToleranceHours: real("event_time_tolerance_hours").notNull(),
+  acceptedLeadMinutes: integer("accepted_lead_minutes").notNull().default(0),
+  detectionDeadlineMinutes: integer("detection_deadline_minutes").notNull(),
+  expectedSeverity: text("expected_severity"),
+  requiredSource: text("required_source"),
+  provenanceUrl: text("provenance_url").notNull(),
+  notes: text("notes").notNull().default(""),
+  verificationStatus: text("verification_status").notNull(),
+  createdBy: text("created_by").notNull(),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  index("evaluation_cases_hazard_time_idx").on(table.hazard, table.occurredAt),
+  index("evaluation_cases_verification_time_idx").on(table.verificationStatus, table.occurredAt),
+]);
+
+export const evaluationRuns = sqliteTable("evaluation_runs", {
+  runId: text("run_id").primaryKey(),
+  modelVersion: text("model_version").notNull(),
+  caseCount: integer("case_count").notNull(),
+  eligibleCount: integer("eligible_count").notNull(),
+  detectedCount: integer("detected_count").notNull(),
+  reportJson: text("report_json").notNull(),
+  createdBy: text("created_by").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [index("evaluation_runs_created_idx").on(table.createdAt)]);

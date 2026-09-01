@@ -42,6 +42,7 @@ import { assessImpactRisk } from "../lib/impact-risk";
 import type { MissionExecutionReceipt } from "../lib/mission-execution";
 import type { ObservationProduct } from "../lib/stac-products";
 import type { AoiWorkPackage, AoiWorkPackageAction } from "../lib/aoi-work-packages";
+import { EvaluationCenter } from "./evaluation-center";
 
 type ApiResponse = {
   events: DisasterEvent[];
@@ -429,6 +430,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
   const [tasksHydrated, setTasksHydrated] = useState(false);
   const [taskPanelOpen, setTaskPanelOpen] = useState(false);
   const [responsePanelOpen, setResponsePanelOpen] = useState(false);
+  const [evaluationPanelOpen, setEvaluationPanelOpen] = useState(false);
   const [responsePointPickTarget, setResponsePointPickTarget] = useState<ResponsePointPickTarget | null>(null);
   const [responsePickedPoint, setResponsePickedPoint] = useState<ResponsePickedPoint | null>(null);
   const [responseEventId, setResponseEventId] = useState<string | null>(null);
@@ -463,6 +465,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
   const tasksRef = useRef<SatelliteTask[]>([]);
   const closeTaskPanel = useCallback(() => { setTaskPanelOpen(false); }, []);
   const closeResponsePanel = useCallback(() => { setResponsePanelOpen(false); }, []);
+  const closeEvaluationPanel = useCallback(() => { setEvaluationPanelOpen(false); }, []);
   const selectEvent = useCallback((event: DisasterEvent) => {
     setActiveResponseScenarioId(null);
     setSelected(event);
@@ -1014,6 +1017,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
   const openResponsePlanner = useCallback((event?: DisasterEvent) => {
     document.querySelectorAll<HTMLDetailsElement>("details[open]").forEach((details) => { details.open = false; });
     setTaskPanelOpen(false);
+    setEvaluationPanelOpen(false);
     setActiveTaskId(null);
     setResponseEventId(event?.masterEventId ?? null);
     setResponsePanelOpen(true);
@@ -1073,8 +1077,8 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
       ...(normalized && requestedType !== "multi" ? { aoiType: normalized.type === "Polygon" ? "polygon" as const : "multi" as const } : {}),
     });
   }, [updateTask]);
-  const modalPanelOpen = taskPanelOpen || responsePanelOpen;
-  const mapObscured = responsePanelOpen || (compactViewport && (taskPanelOpen || listOpen || Boolean(selected)));
+  const modalPanelOpen = taskPanelOpen || responsePanelOpen || evaluationPanelOpen;
+  const mapObscured = responsePanelOpen || evaluationPanelOpen || (compactViewport && (taskPanelOpen || listOpen || Boolean(selected)));
 
   return (
     <main className="app-shell">
@@ -1098,6 +1102,9 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
           </button>
           <button ref={taskTriggerRef} className="task-queue-button" disabled={Boolean(data?.replay)} title={data?.replay ? "历史重演为只读模式" : undefined} onClick={() => { document.querySelectorAll<HTMLDetailsElement>("details[open]").forEach((details) => { details.open = false; }); setResponsePanelOpen(false); setActiveResponseScenarioId(null); setListOpen(false); setTaskPanelOpen(true); }} aria-label={`打开卫星任务候选单，共${tasks.length}项`}>
             任务候选 <b>{tasks.length}</b>
+          </button>
+          <button className="evaluation-open-button" onClick={() => { document.querySelectorAll<HTMLDetailsElement>("details[open]").forEach((details) => { details.open = false; }); setTaskPanelOpen(false); setResponsePanelOpen(false); setActiveResponseScenarioId(null); setListOpen(false); setEvaluationPanelOpen(true); }} aria-label="打开系统评测中心">
+            系统评测
           </button>
           <div className="time-box"><strong>{chinaTime(clock)}</strong><small>UTC+08:00</small></div>
           {currentUser && onLogout ? <div className="session-control"><span><strong>{currentUser.username}</strong><small>{roleLabel(currentUser.role)}</small></span><button onClick={onLogout} disabled={logoutBusy}>{logoutBusy ? "退出中…" : "安全退出"}</button></div> : null}
@@ -1168,6 +1175,7 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
         {selected && !activeResponseScenario && <DetailPanel key={`${selected.masterEventId}:${data?.replay?.snapshotId ?? "live"}`} event={selected} exposureAssessment={exposureAssessments[selected.masterEventId]} onExposureChange={(assessment) => setExposureAssessments((current) => { const next = { ...current }; if (assessment) next[selected.masterEventId] = assessment; else delete next[selected.masterEventId]; return next; })} currentUser={currentUser} nowMs={clock} compact={compactViewport} obscured={modalPanelOpen} dispatchBlocked={modeStale} historicalReadOnly={Boolean(data?.replay)} locationZh={locationZh[selected.id]} locationLoading={locationLoading === selected.id} locationState={locationState[selected.id]?.state} onRetryLocation={() => { setLocationState((current) => { const next = { ...current }; delete next[selected.id]; return next; }); setLocationRetry((value) => value + 1); }} taskAdded={tasks.some((task) => taskMatchesEvent(task, selected))} landslideTemplateCount={new Set(tasks.filter((task) => task.masterEventId === selected.masterEventId && ["ascending", "descending"].includes(String(task.orbitDirectionPreference))).map((task) => task.orbitDirectionPreference)).size} terrainScreening={landslideTerrain[selected.masterEventId]} onTerrainChange={(terrain) => setLandslideTerrain((current) => { const next = { ...current }; if (terrain) next[selected.masterEventId] = terrain; else delete next[selected.masterEventId]; return next; })} aoiConfirmed={confirmedAois.has(selected.masterEventId)} onConfirmAoi={(confirmed) => setConfirmedAois((current) => { const next = new Set(current); if (confirmed) next.add(selected.masterEventId); else next.delete(selected.masterEventId); return next; })} onAddTask={addTask} onAddLandslideTasks={addLandslideSarTasks} onResponsePlan={openResponsePlanner} onClose={closeSelected} />}
         <TaskPanel open={taskPanelOpen} compact={compactViewport} tasks={tasks} syncState={taskSync} storageMode={taskStorageMode} fleet={fleet} activeTaskId={activeTaskId} onActivate={reviewTaskAoi} onPreviewOpportunity={previewOpportunityOnMap} onUpdate={updateTask} onRemove={(taskId) => void removeTask(taskId)} onClose={closeTaskPanel} onRetry={saveTask} />
         <ResponsePlanPanel open={responsePanelOpen} event={responsePlanningEvent} events={deduplicatedEvents} scenarios={responseScenarios} activeScenarioId={activeResponseScenarioId} currentUserRole={currentUser?.role ?? "admin"} pickedPoint={responsePickedPoint} onRequestPointPick={requestResponsePointPick} onSave={saveResponseScenario} onActivate={reviewResponseScenario} onSelectRoute={selectResponseRoute} onRemove={removeResponseScenario} onChooseEvent={(event) => setResponseEventId(event.masterEventId)} onClose={closeResponsePanel} />
+        <EvaluationCenter open={evaluationPanelOpen} role={currentUser?.role ?? "admin"} onClose={closeEvaluationPanel} />
         {undoDraft ? <div className="task-undo-toast" role="status"><span>已删除本机草稿：{undoDraft.task.title}</span><button onClick={restoreDraft}>撤销</button></div> : null}
       </section>
     </main>
