@@ -420,6 +420,23 @@ export const evaluationRuns = sqliteTable("evaluation_runs", {
   createdAt: text("created_at").notNull(),
 }, (table) => [index("evaluation_runs_created_idx").on(table.createdAt)]);
 
+export const lhasaV1GranuleProbes = sqliteTable("lhasa_v1_granule_probes", {
+  caseId: text("case_id").primaryKey(),
+  productDate: text("product_date").notNull(),
+  status: text("status").notNull(),
+  collectionConceptId: text("collection_concept_id").notNull(),
+  granuleConceptId: text("granule_concept_id"),
+  producerGranuleId: text("producer_granule_id"),
+  downloadUrl: text("download_url"),
+  granuleSizeMb: real("granule_size_mb"),
+  timeStart: text("time_start"),
+  timeEnd: text("time_end"),
+  message: text("message").notNull(),
+  checkedAt: text("checked_at").notNull(),
+}, (table) => [
+  index("lhasa_v1_granule_probes_status_date_idx").on(table.status, table.productDate),
+]);
+
 export const forecastRasterProducts = sqliteTable("forecast_raster_products", {
   productId: text("product_id").primaryKey(),
   sourceId: text("source_id").notNull(),

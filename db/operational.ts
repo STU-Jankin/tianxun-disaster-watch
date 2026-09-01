@@ -21,6 +21,7 @@ import {
 } from "../lib/evaluation-center.ts";
 import type { ForecastRasterStorageBackend } from "../lib/forecast-raster-storage.ts";
 import type { LhasaRiskRasterSummary } from "../lib/lhasa-nowcast.ts";
+import type { LhasaV1GranuleProbeRecord, LhasaV1GranuleStatus } from "../lib/lhasa-v1-history.ts";
 
 type TaskRecord = Record<string, unknown> & {
   taskId: string;
@@ -371,6 +372,8 @@ export function ensureOperationalSchema() {
     `CREATE INDEX IF NOT EXISTS evaluation_cases_verification_time_idx ON evaluation_benchmark_cases (verification_status, occurred_at)`,
     `CREATE TABLE IF NOT EXISTS evaluation_runs (run_id TEXT PRIMARY KEY NOT NULL, model_version TEXT NOT NULL, case_count INTEGER NOT NULL, eligible_count INTEGER NOT NULL, detected_count INTEGER NOT NULL, report_json TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS evaluation_runs_created_idx ON evaluation_runs (created_at)`,
+    `CREATE TABLE IF NOT EXISTS lhasa_v1_granule_probes (case_id TEXT PRIMARY KEY NOT NULL, product_date TEXT NOT NULL, status TEXT NOT NULL, collection_concept_id TEXT NOT NULL, granule_concept_id TEXT, producer_granule_id TEXT, download_url TEXT, granule_size_mb REAL, time_start TEXT, time_end TEXT, message TEXT NOT NULL, checked_at TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS lhasa_v1_granule_probes_status_date_idx ON lhasa_v1_granule_probes (status, product_date)`,
     `CREATE TABLE IF NOT EXISTS forecast_raster_products (product_id TEXT PRIMARY KEY NOT NULL, source_id TEXT NOT NULL, product_time TEXT NOT NULL, valid_from TEXT NOT NULL, valid_to TEXT NOT NULL, source_url TEXT NOT NULL, payload_sha256 TEXT NOT NULL, storage_key TEXT NOT NULL, storage_backend TEXT NOT NULL, content_type TEXT NOT NULL, byte_length INTEGER NOT NULL, source_width INTEGER NOT NULL, source_height INTEGER NOT NULL, group_pixels INTEGER NOT NULL, grid_width INTEGER NOT NULL, grid_height INTEGER NOT NULL, summary_json TEXT NOT NULL, archived_at TEXT NOT NULL)`,
     `CREATE UNIQUE INDEX IF NOT EXISTS forecast_raster_products_source_time_uidx ON forecast_raster_products (source_id, product_time)`,
     `CREATE INDEX IF NOT EXISTS forecast_raster_products_time_idx ON forecast_raster_products (product_time, source_id)`,
@@ -662,8 +665,39 @@ export async function deleteEvaluationCase(caseId: string) {
   const db = await database();
   const existing = await db.prepare(`SELECT case_id FROM evaluation_benchmark_cases WHERE case_id=?`).bind(caseId).first<{ case_id: string }>();
   if (!existing) return false;
+  await db.prepare(`DELETE FROM lhasa_v1_granule_probes WHERE case_id=?`).bind(caseId).run();
   await db.prepare(`DELETE FROM evaluation_benchmark_cases WHERE case_id=?`).bind(caseId).run();
   return true;
+}
+
+export async function listLhasaV1GranuleProbes(limit = 100): Promise<LhasaV1GranuleProbeRecord[]> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const rows = await db.prepare(`SELECT case_id AS caseId, product_date AS productDate, status, collection_concept_id AS collectionConceptId, granule_concept_id AS granuleConceptId, producer_granule_id AS producerGranuleId, download_url AS downloadUrl, granule_size_mb AS granuleSizeMb, time_start AS timeStart, time_end AS timeEnd, message, checked_at AS checkedAt FROM lhasa_v1_granule_probes ORDER BY product_date, case_id LIMIT ?`)
+    .bind(Math.max(1, Math.min(100, limit))).all<Record<string, unknown>>();
+  return rows.results.flatMap((row) => {
+    const status = String(row.status) as LhasaV1GranuleStatus;
+    if (!row.caseId || !row.productDate || !["available", "not_found", "metadata_error"].includes(status)) return [];
+    return [{
+      caseId: String(row.caseId), productDate: String(row.productDate), status, collectionConceptId: String(row.collectionConceptId),
+      granuleConceptId: row.granuleConceptId ? String(row.granuleConceptId) : undefined,
+      producerGranuleId: row.producerGranuleId ? String(row.producerGranuleId) : undefined,
+      downloadUrl: row.downloadUrl ? String(row.downloadUrl) : undefined,
+      granuleSizeMb: row.granuleSizeMb === null || row.granuleSizeMb === undefined ? undefined : Number(row.granuleSizeMb),
+      timeStart: row.timeStart ? String(row.timeStart) : undefined, timeEnd: row.timeEnd ? String(row.timeEnd) : undefined,
+      message: String(row.message ?? ""), checkedAt: String(row.checkedAt),
+    }];
+  });
+}
+
+export async function upsertLhasaV1GranuleProbe(probe: LhasaV1GranuleProbeRecord) {
+  await ensureOperationalSchema();
+  const db = await database();
+  await db.prepare(`INSERT INTO lhasa_v1_granule_probes (case_id, product_date, status, collection_concept_id, granule_concept_id, producer_granule_id, download_url, granule_size_mb, time_start, time_end, message, checked_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(case_id) DO UPDATE SET product_date=excluded.product_date, status=excluded.status, collection_concept_id=excluded.collection_concept_id, granule_concept_id=excluded.granule_concept_id, producer_granule_id=excluded.producer_granule_id, download_url=excluded.download_url, granule_size_mb=excluded.granule_size_mb, time_start=excluded.time_start, time_end=excluded.time_end, message=excluded.message, checked_at=excluded.checked_at`)
+    .bind(probe.caseId, probe.productDate, probe.status, probe.collectionConceptId, probe.granuleConceptId ?? null, probe.producerGranuleId ?? null, probe.downloadUrl ?? null, probe.granuleSizeMb ?? null, probe.timeStart ?? null, probe.timeEnd ?? null, probe.message, probe.checkedAt).run();
+  return probe;
 }
 
 export async function listEvaluationRuns(limit = 10): Promise<DetectionEvaluationReport[]> {

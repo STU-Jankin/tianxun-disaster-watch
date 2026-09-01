@@ -84,6 +84,21 @@ test("persists benchmark cases and reads spatial-temporal replay candidates", as
       requiredSource: "NASA LHASA",
     };
     await database.upsertEvaluationCase(forecastBenchmark);
+    await database.upsertLhasaV1GranuleProbe({
+      caseId: forecastBenchmark.caseId,
+      productDate: "2020-12-31",
+      status: "available",
+      collectionConceptId: "C2036912694-GES_DISC",
+      granuleConceptId: "G2041291075-GES_DISC",
+      producerGranuleId: "Global_Landslide_Nowcast_v1.1_20201231.tif",
+      downloadUrl: "https://data.gesdisc.earthdata.nasa.gov/data/Landslide/Global_Landslide_Nowcast.1.1/2020/Global_Landslide_Nowcast_v1.1_20201231.tif",
+      granuleSizeMb: 6.8,
+      timeStart: "2020-12-31T00:00:00.000Z",
+      timeEnd: "2020-12-31T23:59:59.000Z",
+      message: "CMR已确认；尚未下载。",
+      checkedAt: "2026-09-01T12:00:00.000Z",
+    });
+    assert.equal((await database.listLhasaV1GranuleProbes())[0].producerGranuleId, "Global_Landslide_Nowcast_v1.1_20201231.tif");
     await database.persistIngestionArtifacts({
       refreshId: "refresh-evaluation-forecast",
       sources: [],
@@ -105,6 +120,7 @@ test("persists benchmark cases and reads spatial-temporal replay candidates", as
     assert.equal(await database.deleteEvaluationCase(benchmark.caseId), true);
     assert.equal(await database.deleteEvaluationCase(forecastBenchmark.caseId), true);
     assert.equal((await database.listEvaluationCases()).length, 0);
+    assert.equal((await database.listLhasaV1GranuleProbes()).length, 0);
   } finally {
     await rm(directory, { recursive: true, force: true }).catch((error) => { if (error?.code !== "EBUSY") throw error; });
   }

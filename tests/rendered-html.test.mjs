@@ -541,6 +541,10 @@ test("separates landslide forecast verification from event detection metrics", a
   assert.match(route, /import_landslide_cases/);
   assert.match(route, /import_official_landslide_pilot/);
   assert.match(route, /nasaGlcMaximumCsvBytes/);
+  assert.match(route, /probe_official_lhasa_v1/);
+  assert.match(route, /earthdataCredentialConfigured/);
+  assert.match(center, /核查历史产品/);
+  assert.match(center, /存在不等于已经下载或命中/);
   assert.match(route, /evaluationSourceSuccessTimes/);
   assert.match(migration, /forecast_raster_products/);
   assert.match(migration, /calibration_group/);

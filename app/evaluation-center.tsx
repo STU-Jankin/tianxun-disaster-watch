@@ -10,7 +10,30 @@ type EvaluationPayload = {
   latest: DetectionEvaluationReport | null;
   forecastArchive?: { productCount: number; firstProductAt: string | null; lastProductAt: string | null; archivedBytes: number };
   officialPilotCatalog?: { catalog: string; datasetUrl: string; targetCount: number; importedCount: number; verificationPolicy: "draft_only"; comparisonModel: string };
+  lhasaV1Historical?: {
+    datasetUrl: string;
+    doi: string;
+    coverageStart: string;
+    coverageEnd: string;
+    temporalResolution: string;
+    spatialResolution: string;
+    earthdataCredentialConfigured: boolean;
+    probes: LhasaV1Probe[];
+    summary: { total: number; available: number; notFound: number; errors: number; lastCheckedAt: string | null };
+  };
   error?: string;
+};
+type LhasaV1Probe = {
+  caseId: string;
+  productDate: string;
+  status: "available" | "not_found" | "metadata_error";
+  collectionConceptId: string;
+  granuleConceptId?: string;
+  producerGranuleId?: string;
+  downloadUrl?: string;
+  granuleSizeMb?: number;
+  message: string;
+  checkedAt: string;
 };
 type EvaluationForm = {
   title: string;
@@ -53,6 +76,7 @@ export function EvaluationCenter({ open, role, onClose }: { open: boolean; role:
   const [payload, setPayload] = useState<EvaluationPayload>({ cases: [], runs: [], latest: null });
   const [state, setState] = useState<"idle" | "loading" | "saving" | "running" | "error">("idle");
   const [message, setMessage] = useState("");
+  const [pilotAction, setPilotAction] = useState<"import" | "probe" | null>(null);
   const [form, setForm] = useState<EvaluationForm>(() => initialForm("event_detection", "earthquake"));
   const [historyDays, setHistoryDays] = useState<30 | 90 | 365 | "all">(90);
   const report = payload.latest;
@@ -213,6 +237,7 @@ export function EvaluationCenter({ open, role, onClose }: { open: boolean; role:
   };
 
   const importOfficialPilot = async () => {
+    setPilotAction("import");
     setState("saving");
     setMessage("");
     try {
@@ -228,7 +253,50 @@ export function EvaluationCenter({ open, role, onClose }: { open: boolean; role:
     } catch (error) {
       setState("error");
       setMessage(error instanceof Error ? error.message : "官方试验库导入失败");
+    } finally {
+      setPilotAction(null);
     }
+  };
+
+  const probeOfficialLhasaV1 = async () => {
+    setPilotAction("probe");
+    setState("saving");
+    setMessage("");
+    try {
+      const response = await fetch("/api/evaluation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "probe_official_lhasa_v1" }),
+      });
+      const result = await response.json() as { summary?: { total: number; available: number; notFound: number; errors: number }; error?: string };
+      if (!response.ok || !result.summary) throw new Error(result.error || "LHASA历史产品核查失败");
+      await load();
+      setMessage(`LHASA 1.1元数据核查完成：${result.summary.available}/${result.summary.total}条样本确认存在逐日GeoTIFF，${result.summary.notFound}条未找到，${result.summary.errors}条查询失败。存在不等于已经下载或命中。`);
+    } catch (error) {
+      setState("error");
+      setMessage(error instanceof Error ? error.message : "LHASA历史产品核查失败");
+    } finally {
+      setPilotAction(null);
+    }
+  };
+
+  const downloadLhasaV1Manifest = () => {
+    const probes = payload.lhasaV1Historical?.probes.filter((item) => item.status === "available" && item.downloadUrl) ?? [];
+    if (!probes.length) return;
+    const manifest = {
+      schema: "tianxun.lhasa-v1-granule-manifest/v1",
+      generatedAt: new Date().toISOString(),
+      dataset: "NASA Global Landslide Nowcast from LHASA 1.1",
+      doi: payload.lhasaV1Historical?.doi,
+      note: "清单只证明CMR中存在对应GeoTIFF；下载需要Earthdata认证，文件像元尚未读取，不代表预测命中。",
+      granules: probes.map(({ caseId, productDate, granuleConceptId, producerGranuleId, downloadUrl, granuleSizeMb }) => ({ caseId, productDate, granuleConceptId, producerGranuleId, downloadUrl, granuleSizeMb })),
+    };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(manifest, null, 2)], { type: "application/json" }));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "天巡-LHASA-v1-历史产品清单.json";
+    anchor.click();
+    URL.revokeObjectURL(url);
   };
 
   const runEvaluation = async () => {
@@ -283,11 +351,16 @@ export function EvaluationCenter({ open, role, onClose }: { open: boolean; role:
       </section>
 
       <section className="evaluation-official-pilot">
-        <div className="evaluation-section-title"><div><span>官方历史试验库</span><strong>{payload.officialPilotCatalog?.importedCount ?? 0}/{payload.officialPilotCatalog?.targetCount ?? 20} 条</strong></div>{role === "admin" ? <button type="button" onClick={() => void importOfficialPilot()} disabled={state === "saving" || state === "running"}>{state === "saving" ? "正在处理…" : (payload.officialPilotCatalog?.importedCount ?? 0) >= (payload.officialPilotCatalog?.targetCount ?? 20) ? "重新核对目录" : "导入首批草稿"}</button> : null}</div>
+        <div className="evaluation-section-title"><div><span>官方历史试验库</span><strong>{payload.officialPilotCatalog?.importedCount ?? 0}/{payload.officialPilotCatalog?.targetCount ?? 20} 条样本 · {payload.lhasaV1Historical?.summary.available ?? 0}/{payload.lhasaV1Historical?.summary.total ?? 0} 期产品</strong></div>{role === "admin" ? <div className="evaluation-pilot-actions"><button type="button" onClick={() => void importOfficialPilot()} disabled={state === "saving" || state === "running"}>{pilotAction === "import" ? "正在导入…" : (payload.officialPilotCatalog?.importedCount ?? 0) >= (payload.officialPilotCatalog?.targetCount ?? 20) ? "重新核对目录" : "导入首批草稿"}</button><button type="button" onClick={() => void probeOfficialLhasaV1()} disabled={state === "saving" || state === "running" || !(payload.officialPilotCatalog?.importedCount ?? 0)}>{pilotAction === "probe" ? "正在核查…" : "核查历史产品"}</button></div> : null}</div>
         <p>从 NASA Global Landslide Catalog 在线读取，严格限定降雨诱因、2000—2020年、HTTPS原始来源以及 exact/1 km/5 km 定位精度，再按灾种和国家有界抽样。</p>
         <div className="evaluation-pilot-rules"><span>13 条 landslide</span><span>5 条 mudslide</span><span>2 条 debris flow</span><span>单国最多2条</span><span>同源/同日近邻去重</span><span>全部先标记草稿</span></div>
-        <small>类别名称沿用 NASA 原始目录；严格条件下 debris_flow 仅有2条合格记录，因此不为凑数放宽定位或来源要求。目录正样本不自动等同于权威核验，也不会自动生成“无事件”对照；日期级记录以12:00 UTC占位，必须核对原始报道、当地时区和灾种。历史回放还需另行接入NASA LHASA v1栅格。</small>
-        <a href={payload.officialPilotCatalog?.datasetUrl ?? "https://data.nasa.gov/dataset/global-landslide-catalog-export"} target="_blank" rel="noreferrer">查看 NASA 官方目录 ↗</a>
+        <div className="evaluation-lhasa-status">
+          <div><span>LHASA 1.1逐日产品存在性</span><strong>{payload.lhasaV1Historical?.summary.available ?? 0}/{payload.lhasaV1Historical?.summary.total ?? 0}</strong><small>{payload.lhasaV1Historical?.summary.lastCheckedAt ? `最近核查 ${formatDateTime(payload.lhasaV1Historical.summary.lastCheckedAt)}` : "尚未核查CMR元数据"}</small></div>
+          <div><span>实际GeoTIFF读取</span><strong>未开始</strong><small>{payload.lhasaV1Historical?.earthdataCredentialConfigured ? "Earthdata凭据已配置，仍需实现像元读取验收" : "需要Earthdata凭据；不得以元数据存在代替风险值"}</small></div>
+        </div>
+        {payload.lhasaV1Historical?.probes.length ? <details className="evaluation-granule-probes"><summary>查看逐样本历史产品清单</summary><div>{payload.lhasaV1Historical.probes.map((probe) => <article key={probe.caseId} className={probe.status}><span>{probe.status === "available" ? "已找到" : probe.status === "not_found" ? "未找到" : "查询失败"}</span><strong>{payload.cases.find((item) => item.caseId === probe.caseId)?.title ?? probe.caseId}</strong><small>{probe.productDate} · {probe.producerGranuleId ?? probe.message}</small></article>)}</div><button type="button" onClick={downloadLhasaV1Manifest} disabled={!payload.lhasaV1Historical.summary.available}>导出下载清单</button></details> : null}
+        <small>类别名称沿用 NASA 原始目录；严格条件下 debris_flow 仅有2条合格记录，因此不为凑数放宽标准。CMR“已找到”只证明官方逐日文件存在，不代表文件已下载、核验点为高风险或模型命中。目录正样本仍需人工核对，且不会自动生成“无事件”对照。</small>
+        <div className="evaluation-pilot-links"><a href={payload.officialPilotCatalog?.datasetUrl ?? "https://data.nasa.gov/dataset/global-landslide-catalog-export"} target="_blank" rel="noreferrer">NASA GLC目录 ↗</a><a href={payload.lhasaV1Historical?.datasetUrl ?? "https://catalog.data.gov/dataset/global-landslide-nowcast-from-lhasa-l4-1-day-1-km-x-1-km-version-1-1-global_landslide_nowc"} target="_blank" rel="noreferrer">LHASA 1.1产品说明 ↗</a></div>
       </section>
 
       {state === "loading" && !payload.cases.length ? <div className="evaluation-empty">正在读取评测资料…</div> : null}

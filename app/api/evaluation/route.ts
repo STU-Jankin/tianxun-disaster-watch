@@ -8,8 +8,10 @@ import {
   listEvaluationCases,
   listEvaluationRuns,
   listForecastRasterProducts,
+  listLhasaV1GranuleProbes,
   persistEvaluationRun,
   upsertEvaluationCase,
+  upsertLhasaV1GranuleProbe,
 } from "../../../db/operational";
 import { apiActor, ApiInputError, authorizeApiRequest, enforceRateLimit, readJsonObject, rejectCrossOriginBrowserWrite } from "../../../lib/api-security";
 import { evaluateDetectionBenchmarks, evaluationCoverageGapMinutes, evaluationWindow, type EvaluationBenchmarkCase, type EvaluationObjective } from "../../../lib/evaluation-center";
@@ -17,6 +19,7 @@ import type { HazardSubtype, HazardType } from "../../../lib/disasters";
 import { decodeLhasaRiskPng, lhasaRiskAtLocation } from "../../../lib/lhasa-nowcast";
 import { readForecastRasterObject } from "../../../lib/forecast-raster-storage";
 import { buildNasaGlcPilot, nasaGlcCsvUrl, nasaGlcDatasetUrl, nasaGlcMaximumCsvBytes, nasaGlcPilotLimit, nasaGlcPilotPrefix } from "../../../lib/official-landslide-benchmark";
+import { lhasaV1CollectionConceptId, lhasaV1CoverageEnd, lhasaV1CoverageStart, lhasaV1DatasetUrl, lhasaV1Doi, lhasaV1ProductDate, probeLhasaV1Granule, type LhasaV1GranuleMetadata, type LhasaV1GranuleProbeRecord } from "../../../lib/lhasa-v1-history";
 
 export const dynamic = "force-dynamic";
 
@@ -28,7 +31,7 @@ const landslideSubtypes = new Set<HazardSubtype>(["landslide", "debris_flow", "r
 export async function GET(request: Request) {
   const unauthorized = await authorizeApiRequest(request, "viewer");
   if (unauthorized) return unauthorized;
-  const [cases, runs, forecastArchive] = await Promise.all([listEvaluationCases(), listEvaluationRuns(10), forecastRasterArchiveStatus()]);
+  const [cases, runs, forecastArchive, lhasaV1Probes] = await Promise.all([listEvaluationCases(), listEvaluationRuns(10), forecastRasterArchiveStatus(), listLhasaV1GranuleProbes()]);
   return Response.json({
     cases,
     runs,
@@ -41,6 +44,19 @@ export async function GET(request: Request) {
       importedCount: cases.filter((item) => item.caseId.startsWith(nasaGlcPilotPrefix)).length,
       verificationPolicy: "draft_only",
       comparisonModel: "NASA LHASA v1 historical",
+    },
+    lhasaV1Historical: {
+      datasetUrl: lhasaV1DatasetUrl,
+      doi: lhasaV1Doi,
+      collectionConceptId: lhasaV1CollectionConceptId,
+      coverageStart: lhasaV1CoverageStart,
+      coverageEnd: lhasaV1CoverageEnd,
+      temporalResolution: "1 day",
+      spatialResolution: "30 arcseconds (~1 km)",
+      valueMeaning: { 0: "low", 1: "moderate", 2: "high", 255: "missing" },
+      earthdataCredentialConfigured: Boolean(process.env.EARTHDATA_BEARER_TOKEN?.trim()),
+      probes: lhasaV1Probes,
+      summary: lhasaProbeSummary(lhasaV1Probes),
     },
   }, { headers: privateHeaders() });
 }
@@ -99,6 +115,47 @@ export async function POST(request: Request) {
         stats: pilot.stats,
         policy: "所有目录记录均以草稿导入；禁止自动进入正式指标",
       }, { headers: privateHeaders() });
+    }
+    if (action === "probe_official_lhasa_v1") {
+      const cases = (await listEvaluationCases()).filter((item) => item.caseId.startsWith(nasaGlcPilotPrefix) && item.objective === "landslide_forecast" && item.outcome === "event");
+      if (!cases.length) throw new ApiInputError("请先导入NASA GLC官方试验库草稿", 409);
+      const checkedAt = new Date().toISOString();
+      const dateResults = new Map<string, LhasaV1GranuleMetadata>();
+      const productDates = [...new Set(cases.map((item) => lhasaV1ProductDate(item.occurredAt)).filter((value): value is string => Boolean(value)))];
+      for (let offset = 0; offset < productDates.length; offset += 4) {
+        const batch = productDates.slice(offset, offset + 4);
+        const results = await Promise.all(batch.map(async (productDate) => {
+          try {
+            return await probeLhasaV1Granule(productDate);
+          } catch (error) {
+            return {
+              productDate,
+              status: "metadata_error" as const,
+              collectionConceptId: lhasaV1CollectionConceptId,
+              message: publicProbeError(error),
+            };
+          }
+        }));
+        for (const result of results) dateResults.set(result.productDate, result);
+      }
+      const probes: LhasaV1GranuleProbeRecord[] = [];
+      for (const benchmark of cases) {
+        const productDate = lhasaV1ProductDate(benchmark.occurredAt);
+        const metadata = productDate ? dateResults.get(productDate) : undefined;
+        const probe: LhasaV1GranuleProbeRecord = metadata
+          ? { caseId: benchmark.caseId, checkedAt, ...metadata }
+          : {
+              caseId: benchmark.caseId,
+              productDate: benchmark.occurredAt.slice(0, 10),
+              status: "metadata_error",
+              collectionConceptId: lhasaV1CollectionConceptId,
+              checkedAt,
+              message: `样本日期不在LHASA 1.1官方覆盖期（${lhasaV1CoverageStart}至${lhasaV1CoverageEnd}）。`,
+            };
+        await upsertLhasaV1GranuleProbe(probe);
+        probes.push(probe);
+      }
+      return Response.json({ probes, summary: lhasaProbeSummary(probes), checkedAt, downloadRequiresEarthdata: true }, { headers: privateHeaders() });
     }
     if (action === "delete_case") {
       const caseId = text(body.caseId, "样本编号", 120);
@@ -218,6 +275,21 @@ async function readBoundedCatalogText(response: Response, maximumBytes: number) 
   let offset = 0;
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
   return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
+function lhasaProbeSummary(probes: LhasaV1GranuleProbeRecord[]) {
+  return {
+    total: probes.length,
+    available: probes.filter((item) => item.status === "available").length,
+    notFound: probes.filter((item) => item.status === "not_found").length,
+    errors: probes.filter((item) => item.status === "metadata_error").length,
+    lastCheckedAt: probes.map((item) => item.checkedAt).sort().at(-1) ?? null,
+  };
+}
+
+function publicProbeError(error: unknown) {
+  const message = error instanceof Error ? error.message : "unknown metadata error";
+  return `NASA CMR元数据查询失败：${message.replace(/https?:\/\/\S+/g, "上游地址").slice(0, 160)}；不能据此判定产品不存在。`;
 }
 
 function benchmarkFromInput(value: unknown, actor: string): EvaluationBenchmarkCase {
