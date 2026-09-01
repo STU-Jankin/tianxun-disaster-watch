@@ -53,7 +53,8 @@ test("uses official polygon geometry when available and enforces provider area l
   const aoi = buildExposureAoi(event);
   assert.equal(aoi.basis, "official_event_geometry");
   assert.ok(aoi.areaKm2 > 100);
-  assert.equal(prepareOverpassExposureQuery({ ...aoi, areaKm2: 2_501 }).state, "skipped");
+  assert.equal(prepareOverpassExposureQuery({ ...aoi, areaKm2: 2_819 }).state, "ready");
+  assert.equal(prepareOverpassExposureQuery({ ...aoi, areaKm2: 3_501 }).state, "skipped");
   const chinaPlan = prepareOverpassExposureQuery({ ...aoi, areaKm2: 31_326 }, { maximumAreaKm2: 50_000, serviceLabel: "中国 OSM 日更镜像", queryTimeoutSeconds: 45 });
   assert.equal(chinaPlan.state, "ready");
   assert.match(chinaPlan.query, /\[timeout:45\]/);

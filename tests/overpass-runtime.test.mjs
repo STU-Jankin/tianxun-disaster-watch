@@ -3,14 +3,15 @@ import test from "node:test";
 
 import { overpassCacheKey, resolveOverpassRuntimeConfig } from "../lib/overpass-runtime.ts";
 
-test("keeps the public Overpass profile on a fixed conservative area limit", () => {
+test("keeps the public Overpass profile bounded while covering a standard earthquake AOI", () => {
   const config = resolveOverpassRuntimeConfig({
     OVERPASS_PROFILE: "public",
     OVERPASS_API_URL: "https://overpass-api.de/api/interpreter",
     OVERPASS_MAX_AREA_KM2: "50000",
   });
   assert.equal(config.profile, "public");
-  assert.equal(config.maximumAreaKm2, 2_500);
+  assert.equal(config.maximumAreaKm2, 3_500);
+  assert.equal(config.queryTimeoutSeconds, 25);
   assert.equal(config.updateCadence, "upstream");
   assert.match(overpassCacheKey(config, "exposure", "aoi:123"), /^public:exposure:/);
 });

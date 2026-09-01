@@ -1,6 +1,10 @@
 export type OverpassProfile = "public" | "china_daily";
 export type OverpassCacheStatus = "refreshed" | "fresh" | "stale";
 
+// Covers the standard 30 km earthquake screening circle (~2,827 km²) with
+// modest geometric headroom while still rejecting genuinely broad scans.
+export const publicOverpassMaximumAreaKm2 = 3_500;
+
 export type OverpassRuntimeConfig = {
   endpoint: URL;
   profile: OverpassProfile;
@@ -27,14 +31,14 @@ export function resolveOverpassRuntimeConfig(environment: Record<string, string 
   }
   const endpoint = parseEndpoint(configuredEndpoint || publicEndpoint, profile, environment.OVERPASS_ALLOW_PRIVATE_ENDPOINT === "true");
   const maximumAreaKm2 = profile === "public"
-    ? 2_500
+    ? publicOverpassMaximumAreaKm2
     : boundedNumber(environment.OVERPASS_MAX_AREA_KM2, 50_000, 2_500, 100_000);
   const cacheTtlHours = profile === "public"
     ? boundedNumber(environment.OVERPASS_CACHE_TTL_HOURS, 24, 1, 24)
     : boundedNumber(environment.OVERPASS_CACHE_TTL_HOURS, 26, 6, 72);
   const staleIfErrorHours = boundedNumber(environment.OVERPASS_STALE_IF_ERROR_HOURS, profile === "public" ? 72 : 168, cacheTtlHours, 720);
   const queryTimeoutSeconds = profile === "public"
-    ? 15
+    ? 25
     : boundedNumber(environment.OVERPASS_QUERY_TIMEOUT_SECONDS, 45, 15, 120);
   const configuredUserAgent = environment.OVERPASS_USER_AGENT?.trim().replace(/[\r\n]+/g, " ").slice(0, 180);
   return {

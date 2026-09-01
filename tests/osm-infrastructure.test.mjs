@@ -9,7 +9,7 @@ test("builds a bounded, anonymous Overpass query for local route infrastructure"
   const { prepareInfrastructureQuery } = await infrastructure();
   const plan = prepareInfrastructureQuery([{ routeId: "route-1", coordinates: [[120.25, 31.5], [120.31, 31.52]] }]);
   assert.equal(plan.state, "ready");
-  assert.ok(plan.areaKm2 < 2_500);
+  assert.ok(plan.areaKm2 < 3_500);
   assert.match(plan.query, /\[out:json\]\[timeout:12\]/);
   assert.match(plan.query, /\["bridge"\]\["bridge"!="no"\]/);
   assert.match(plan.query, /node\["highway"="ford"\]/);
@@ -22,7 +22,7 @@ test("refuses a heavy public Overpass request for a wide route envelope", async 
   const { prepareInfrastructureQuery } = await infrastructure();
   const plan = prepareInfrastructureQuery([{ routeId: "wide", coordinates: [[119, 30], [121, 32]] }]);
   assert.equal(plan.state, "too_large");
-  assert.ok(plan.queryAreaKm2 > 2_500);
+  assert.ok(plan.queryAreaKm2 > 3_500);
   assert.match(plan.message, /未向公共 Overpass|超过公共 Overpass/);
 });
 

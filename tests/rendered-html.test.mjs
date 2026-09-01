@@ -376,7 +376,7 @@ test("adds a bounded phase-three response simulation, disruption review and infr
   assert.match(infrastructureApi, /queryTimeoutSeconds \+ 5/);
   assert.match(overpassRuntime, /queryTimeoutSeconds: number/);
   assert.match(overpassRuntime, /OVERPASS_PROFILE/);
-  assert.match(infrastructure, /maximumBboxAreaKm2 = 2_500/);
+  assert.match(infrastructure, /maximumBboxAreaKm2 = publicOverpassMaximumAreaKm2/);
   assert.match(infrastructure, /不代表设施当前完好/);
   assert.match(operational, /CREATE TABLE IF NOT EXISTS road_disruptions/);
   assert.match(operational, /road_disruption_history/);

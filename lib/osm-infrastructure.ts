@@ -1,4 +1,4 @@
-import type { OverpassCacheStatus, OverpassProfile } from "./overpass-runtime.ts";
+import { publicOverpassMaximumAreaKm2, type OverpassCacheStatus, type OverpassProfile } from "./overpass-runtime.ts";
 
 export type InfrastructureKind = "bridge" | "tunnel" | "ford";
 export type InfrastructureGeometry =
@@ -73,7 +73,7 @@ export type InfrastructureQueryPlan = {
 
 const attribution = "© OpenStreetMap contributors · ODbL" as const;
 const osmCopyrightUrl = "https://www.openstreetmap.org/copyright" as const;
-const maximumBboxAreaKm2 = 2_500;
+const maximumBboxAreaKm2 = publicOverpassMaximumAreaKm2;
 const crossingToleranceKm = 0.06;
 
 export function prepareInfrastructureQuery(input: unknown, options: { maximumAreaKm2?: number; serviceLabel?: string; queryTimeoutSeconds?: number } = {}): InfrastructureQueryPlan {

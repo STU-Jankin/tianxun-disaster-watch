@@ -1,12 +1,12 @@
 import type { DisasterEvent, EventGeometry, HazardType } from "./disasters.ts";
 import { aoiFingerprint, eventRevisionFingerprint } from "./event-integrity.ts";
 import { normalizeAntimeridianGeometry, validateGeoGeometry } from "./geo-geometry.ts";
-import type { OverpassCacheStatus, OverpassProfile } from "./overpass-runtime.ts";
+import { publicOverpassMaximumAreaKm2, type OverpassCacheStatus, type OverpassProfile } from "./overpass-runtime.ts";
 import polygonClipping, { type MultiPolygon as ClippingMultiPolygon, type Polygon as ClippingPolygon } from "polygon-clipping";
 
-export const exposureAssessmentModelVersion = "tianxun-exposure-screening-v2" as const;
+export const exposureAssessmentModelVersion = "tianxun-exposure-screening-v3" as const;
 export const maximumWorldPopAreaKm2 = 50_000;
-export const maximumOverpassAreaKm2 = 2_500;
+export const maximumOverpassAreaKm2 = publicOverpassMaximumAreaKm2;
 
 export type ExposureFacilityKind = "health" | "emergency" | "shelter" | "education" | "power" | "water";
 
