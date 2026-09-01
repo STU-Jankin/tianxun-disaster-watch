@@ -170,6 +170,8 @@ export function lhasaCandidatesFromRaster(
     sourceUrl: officialViewerUrl,
     sourceSeverity: `LHASA ${cluster.maximumRiskPercent}% · ${cluster.cellCount} 个约 ${coarseCellLabel(raster)} 风险格`,
     severity: riskSeverity(cluster.maximumRiskPercent),
+    magnitude: cluster.maximumRiskPercent,
+    magnitudeUnit: "%",
     description: `NASA LHASA 降雨触发滑坡 nowcast；本系统仅保留风险值不低于 80% 的连通高风险格，并用外包矩形展示。该范围是模型风险筛查区，不是已发生滑坡或泥石流的边界，也不能替代地方地质灾害预警。产品批次 ${productTime}，原始栅格 ${sourceRasterUrl}；任何任务均需人工复核 AOI。`,
     requiresReview: true,
   }));

@@ -7,6 +7,7 @@ const benchmark = (overrides = {}) => ({
   caseId: "benchmark-verified-001",
   title: "权威核验地震样本",
   hazard: "earthquake",
+  objective: "event_detection",
   occurredAt: "2026-09-01T00:15:00.000Z",
   latitude: 31,
   longitude: 120,
@@ -21,6 +22,46 @@ const benchmark = (overrides = {}) => ({
   createdBy: "tester",
   createdAt: "2026-09-01T02:00:00.000Z",
   updatedAt: "2026-09-01T02:00:00.000Z",
+  ...overrides,
+});
+
+const forecastBenchmark = (overrides = {}) => benchmark({
+  caseId: "benchmark-forecast-001",
+  title: "权威核验泥石流样本",
+  hazard: "landslide",
+  objective: "landslide_forecast",
+  hazardSubtype: "debris_flow",
+  occurredAt: "2026-09-01T12:00:00.000Z",
+  latitude: 29.5,
+  longitude: 90.5,
+  locationToleranceKm: 20,
+  eventTimeToleranceHours: 24,
+  acceptedLeadMinutes: 1_440,
+  detectionDeadlineMinutes: 60,
+  minimumForecastRiskPercent: 80,
+  requiredSource: "NASA LHASA",
+  expectedSeverity: undefined,
+  ...overrides,
+});
+
+const forecastEvent = (overrides = {}) => event({
+  id: "lhasa-event-1",
+  masterEventId: "ME-lhasa-event-1",
+  title: "NASA LHASA 高滑坡风险区 · 92%",
+  hazard: "landslide",
+  occurredAt: "2026-08-31T12:00:00.000Z",
+  latitude: 29.5,
+  longitude: 90.5,
+  phenomenonStage: "forecast",
+  validFrom: "2026-08-31T12:00:00.000Z",
+  validTo: "2026-09-01T12:00:00.000Z",
+  geometry: { type: "Polygon", coordinates: [[[90, 29], [91, 29], [91, 30], [90, 30], [90, 29]]] },
+  severity: "orange",
+  source: "NASA LHASA",
+  sourceSeverity: "LHASA 92%",
+  magnitude: 92,
+  magnitudeUnit: "%",
+  evidence: [{ source: "NASA LHASA" }],
   ...overrides,
 });
 
@@ -91,4 +132,36 @@ test("keeps draft and not-yet-due cases out of formal recall", () => {
   assert.equal(report.results.find((item) => item.caseId === "benchmark-draft-001").status, "draft");
   assert.equal(report.results.find((item) => item.caseId === "benchmark-pending-001").status, "pending");
   assert.equal(report.metrics.eligibleCases, 0);
+});
+
+test("evaluates verified landslide forecasts as pre-event geometry hits", () => {
+  const report = evaluateDetectionBenchmarks({
+    runId: "evaluation-run-forecast",
+    computedAt: "2026-09-01T13:00:00.000Z",
+    cases: [forecastBenchmark()],
+    candidatesByCase: {
+      "benchmark-forecast-001": [{ snapshotId: "snapshot-forecast", capturedAt: "2026-08-31T14:00:00.000Z", event: forecastEvent() }],
+    },
+    snapshotTimes: Array.from({ length: 24 }, (_, index) => new Date(Date.parse("2026-08-31T12:00:00.000Z") + index * 60 * 60_000).toISOString()),
+    sourceSuccessTimesByCase: { "benchmark-forecast-001": ["2026-08-31T12:10:00.000Z"] },
+  });
+  assert.equal(report.metrics.recallPercent, null, "forecast cases must not be mixed into detection recall");
+  assert.equal(report.metrics.forecastHitRatePercent, 100);
+  assert.equal(report.metrics.medianForecastLeadMinutes, 1_320);
+  assert.equal(report.results[0].status, "detected");
+  assert.equal(report.results[0].spatialMatch, "geometry_contains");
+  assert.equal(report.results[0].forecastRiskPercent, 92);
+});
+
+test("does not call a landslide forecast miss when the required source was unavailable", () => {
+  const report = evaluateDetectionBenchmarks({
+    runId: "evaluation-run-forecast-source-gap",
+    computedAt: "2026-09-01T13:00:00.000Z",
+    cases: [forecastBenchmark()],
+    candidatesByCase: {},
+    snapshotTimes: Array.from({ length: 24 }, (_, index) => new Date(Date.parse("2026-08-31T12:00:00.000Z") + index * 60 * 60_000).toISOString()),
+    sourceSuccessTimesByCase: {},
+  });
+  assert.equal(report.results[0].status, "insufficient_history");
+  assert.equal(report.metrics.forecastEligibleCases, 0);
 });

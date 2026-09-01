@@ -2,6 +2,7 @@ import {
   deleteEvaluationCase,
   evaluationSnapshotTimes,
   evaluationSourceReliability,
+  evaluationSourceSuccessTimes,
   listEvaluationCandidates,
   listEvaluationCases,
   listEvaluationRuns,
@@ -9,13 +10,15 @@ import {
   upsertEvaluationCase,
 } from "../../../db/operational";
 import { apiActor, ApiInputError, authorizeApiRequest, enforceRateLimit, readJsonObject, rejectCrossOriginBrowserWrite } from "../../../lib/api-security";
-import { evaluateDetectionBenchmarks, evaluationCoverageGapMinutes, evaluationWindow, type EvaluationBenchmarkCase } from "../../../lib/evaluation-center";
-import type { HazardType } from "../../../lib/disasters";
+import { evaluateDetectionBenchmarks, evaluationCoverageGapMinutes, evaluationWindow, type EvaluationBenchmarkCase, type EvaluationObjective } from "../../../lib/evaluation-center";
+import type { HazardSubtype, HazardType } from "../../../lib/disasters";
 
 export const dynamic = "force-dynamic";
 
 const hazards = new Set<HazardType>(["earthquake", "tsunami", "wildfire", "flood", "cyclone", "volcano", "landslide", "drought", "dust", "ice"]);
 const severities = new Set(["blue", "yellow", "orange", "red"]);
+const objectives = new Set<EvaluationObjective>(["event_detection", "landslide_forecast"]);
+const landslideSubtypes = new Set<HazardSubtype>(["landslide", "debris_flow", "rockfall", "slope_failure", "mass_movement"]);
 
 export async function GET(request: Request) {
   const unauthorized = await authorizeApiRequest(request, "viewer");
@@ -40,6 +43,21 @@ export async function POST(request: Request) {
       await upsertEvaluationCase(benchmark);
       return Response.json({ case: benchmark }, { headers: privateHeaders() });
     }
+    if (action === "import_landslide_cases") {
+      if (body.schema !== "tianxun.landslide-benchmark/v1" || !Array.isArray(body.cases) || !body.cases.length || body.cases.length > 25) {
+        throw new ApiInputError("滑坡样本文件格式无效，单次最多导入 25 条", 400);
+      }
+      const actor = await apiActor(request);
+      const benchmarks = body.cases.map((item) => benchmarkFromInput({ ...(item as Record<string, unknown>), objective: "landslide_forecast", hazard: "landslide" }, actor));
+      const existingCases = await listEvaluationCases();
+      const existingIds = new Set(existingCases.map((item) => item.caseId));
+      const newIds = new Set(benchmarks.map((item) => item.caseId));
+      if (newIds.size !== benchmarks.length) throw new ApiInputError("样本文件包含重复编号，请先去重", 400);
+      const addedCount = [...newIds].filter((caseId) => !existingIds.has(caseId)).length;
+      if (existingCases.length + addedCount > 100) throw new ApiInputError("导入后将超过 100 个样本上限，请先清理旧样本", 409);
+      for (const benchmark of benchmarks) await upsertEvaluationCase(benchmark);
+      return Response.json({ imported: benchmarks.length, cases: benchmarks }, { headers: privateHeaders() });
+    }
     if (action === "delete_case") {
       const caseId = text(body.caseId, "样本编号", 120);
       if (!/^benchmark-[a-zA-Z0-9_-]{8,100}$/.test(caseId)) throw new ApiInputError("样本编号无效", 400);
@@ -57,8 +75,12 @@ export async function POST(request: Request) {
       const from = new Date(Math.min(...windows.map((item) => Date.parse(item.startAt))) - coveragePaddingMs).toISOString();
       const to = new Date(Math.min(Date.parse(computedAt), Math.max(...windows.map((item) => Date.parse(item.expectedBy))) + coveragePaddingMs)).toISOString();
       const candidatesByCase: Record<string, Awaited<ReturnType<typeof listEvaluationCandidates>>> = {};
+      const sourceSuccessTimesByCase: Record<string, string[]> = {};
       for (const benchmark of cases) {
         candidatesByCase[benchmark.caseId] = benchmark.verificationStatus === "verified" ? await listEvaluationCandidates(benchmark) : [];
+        sourceSuccessTimesByCase[benchmark.caseId] = benchmark.verificationStatus === "verified" && benchmark.requiredSource
+          ? await evaluationSourceSuccessTimes(benchmark.requiredSource, evaluationWindow(benchmark).startAt, evaluationWindow(benchmark).expectedBy)
+          : [];
       }
       const [snapshotTimes, sourceReliability] = await Promise.all([
         evaluationSnapshotTimes(from, to),
@@ -70,6 +92,7 @@ export async function POST(request: Request) {
         cases,
         candidatesByCase,
         snapshotTimes,
+        sourceSuccessTimesByCase,
         sourceReliability,
       });
       await persistEvaluationRun(report, await apiActor(request));
@@ -94,25 +117,40 @@ function benchmarkFromInput(value: unknown, actor: string): EvaluationBenchmarkC
   const title = text(input.title, "样本名称", 160);
   const hazard = text(input.hazard, "灾种", 30) as HazardType;
   if (!hazards.has(hazard)) throw new ApiInputError("灾种无效", 400);
+  const objective = (optionalText(input.objective, 40) ?? "event_detection") as EvaluationObjective;
+  if (!objectives.has(objective)) throw new ApiInputError("评测目标无效", 400);
+  if (objective === "landslide_forecast" && hazard !== "landslide") throw new ApiInputError("事前预测评测目前仅支持滑坡和泥石流", 400);
+  const hazardSubtypeText = optionalText(input.hazardSubtype, 40);
+  if (hazardSubtypeText && !landslideSubtypes.has(hazardSubtypeText as HazardSubtype)) throw new ApiInputError("滑坡灾害子类型无效", 400);
   const occurredAt = isoDate(input.occurredAt, "发生时间");
   if (Date.parse(occurredAt) > Date.now() + 60_000) throw new ApiInputError("权威核验样本不能使用未来发生时间", 400);
   const expectedSeverity = optionalText(input.expectedSeverity, 20);
   if (expectedSeverity && !severities.has(expectedSeverity)) throw new ApiInputError("期望等级无效", 400);
   const provenanceUrl = sourceUrl(input.provenanceUrl);
-  const verificationStatus = input.verificationStatus === "draft" ? "draft" : "verified";
+  if (input.verificationStatus !== undefined && !["draft", "verified"].includes(String(input.verificationStatus))) throw new ApiInputError("核验状态无效", 400);
+  const verificationStatus = input.verificationStatus === "verified" ? "verified" : "draft";
+  const acceptedLeadMinutes = integer(input.acceptedLeadMinutes, objective === "landslide_forecast" ? "最大预测提前量" : "允许提前发现时间", 0, 10_080);
+  const detectionDeadlineMinutes = integer(input.detectionDeadlineMinutes, objective === "landslide_forecast" ? "最小有效提前量" : "检测时限", objective === "landslide_forecast" ? 0 : 1, 10_080);
+  if (objective === "landslide_forecast" && acceptedLeadMinutes <= detectionDeadlineMinutes) throw new ApiInputError("最大预测提前量必须大于最小有效提前量", 400);
+  const minimumForecastRiskPercent = objective === "landslide_forecast"
+    ? finiteNumber(input.minimumForecastRiskPercent ?? 80, "最低预测风险值", 80, 100)
+    : undefined;
   return {
     caseId,
     title,
     hazard,
+    objective,
+    hazardSubtype: hazardSubtypeText as HazardSubtype | undefined,
     occurredAt,
     latitude: finiteNumber(input.latitude, "纬度", -90, 90),
     longitude: finiteNumber(input.longitude, "经度", -180, 180),
     locationToleranceKm: finiteNumber(input.locationToleranceKm, "位置容差", 0.1, 1_000),
     eventTimeToleranceHours: finiteNumber(input.eventTimeToleranceHours, "事件时间容差", 0.1, 168),
-    acceptedLeadMinutes: integer(input.acceptedLeadMinutes, "允许提前发现时间", 0, 10_080),
-    detectionDeadlineMinutes: integer(input.detectionDeadlineMinutes, "检测时限", 1, 10_080),
+    acceptedLeadMinutes,
+    detectionDeadlineMinutes,
     expectedSeverity: expectedSeverity as EvaluationBenchmarkCase["expectedSeverity"],
-    requiredSource: optionalText(input.requiredSource, 120),
+    requiredSource: objective === "landslide_forecast" ? optionalText(input.requiredSource, 120) ?? "NASA LHASA" : optionalText(input.requiredSource, 120),
+    minimumForecastRiskPercent,
     provenanceUrl,
     notes: optionalText(input.notes, 500) ?? "",
     verificationStatus,
@@ -154,10 +192,10 @@ function sourceUrl(value: unknown) {
   const raw = text(value, "权威来源链接", 1_500);
   try {
     const parsed = new URL(raw);
-    if (!["https:", "http:"].includes(parsed.protocol) || parsed.username || parsed.password || !parsed.hostname) throw new Error("unsafe");
+    if (!["https:", "http:"].includes(parsed.protocol) || parsed.username || parsed.password || !parsed.hostname || parsed.hostname.endsWith(".invalid")) throw new Error("unsafe");
     return parsed.toString();
   } catch {
-    throw new ApiInputError("权威来源链接必须是有效的 HTTP(S) 地址，且不能包含账号密码", 400);
+    throw new ApiInputError("权威来源链接必须替换为真实的 HTTP(S) 权威地址，且不能包含账号密码", 400);
   }
 }
 

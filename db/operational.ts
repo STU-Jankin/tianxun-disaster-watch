@@ -343,7 +343,7 @@ export function ensureOperationalSchema() {
     `CREATE TABLE IF NOT EXISTS aoi_work_package_history (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, package_id TEXT NOT NULL, revision INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, from_status TEXT, to_status TEXT NOT NULL, payload_json TEXT NOT NULL, changed_at TEXT NOT NULL)`,
     `CREATE UNIQUE INDEX IF NOT EXISTS aoi_work_package_history_revision_uidx ON aoi_work_package_history (package_id, revision)`,
     `CREATE INDEX IF NOT EXISTS aoi_work_package_history_time_idx ON aoi_work_package_history (package_id, changed_at)`,
-    `CREATE TABLE IF NOT EXISTS evaluation_benchmark_cases (case_id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, hazard TEXT NOT NULL, occurred_at TEXT NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL, location_tolerance_km REAL NOT NULL, event_time_tolerance_hours REAL NOT NULL, accepted_lead_minutes INTEGER NOT NULL DEFAULT 0, detection_deadline_minutes INTEGER NOT NULL, expected_severity TEXT, required_source TEXT, provenance_url TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '', verification_status TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS evaluation_benchmark_cases (case_id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, hazard TEXT NOT NULL, objective TEXT NOT NULL DEFAULT 'event_detection', hazard_subtype TEXT, occurred_at TEXT NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL, location_tolerance_km REAL NOT NULL, event_time_tolerance_hours REAL NOT NULL, accepted_lead_minutes INTEGER NOT NULL DEFAULT 0, detection_deadline_minutes INTEGER NOT NULL, expected_severity TEXT, required_source TEXT, minimum_forecast_risk_percent REAL, provenance_url TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '', verification_status TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS evaluation_cases_hazard_time_idx ON evaluation_benchmark_cases (hazard, occurred_at)`,
     `CREATE INDEX IF NOT EXISTS evaluation_cases_verification_time_idx ON evaluation_benchmark_cases (verification_status, occurred_at)`,
     `CREATE TABLE IF NOT EXISTS evaluation_runs (run_id TEXT PRIMARY KEY NOT NULL, model_version TEXT NOT NULL, case_count INTEGER NOT NULL, eligible_count INTEGER NOT NULL, detected_count INTEGER NOT NULL, report_json TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL)`,
@@ -359,6 +359,13 @@ export function ensureOperationalSchema() {
     if (!names.has("aoi_hash")) migrations.push(db.prepare(`ALTER TABLE satellite_tasks ADD COLUMN aoi_hash TEXT NOT NULL DEFAULT ''`));
     if (!names.has("owner")) migrations.push(db.prepare(`ALTER TABLE satellite_tasks ADD COLUMN owner TEXT NOT NULL DEFAULT 'legacy'`));
     if (migrations.length) await db.batch(migrations);
+    const evaluationColumns = await db.prepare(`PRAGMA table_info(evaluation_benchmark_cases)`).all<{ name: string }>();
+    const evaluationNames = new Set(evaluationColumns.results.map((column) => column.name));
+    const evaluationMigrations: DatabaseStatement[] = [];
+    if (!evaluationNames.has("objective")) evaluationMigrations.push(db.prepare(`ALTER TABLE evaluation_benchmark_cases ADD COLUMN objective TEXT NOT NULL DEFAULT 'event_detection'`));
+    if (!evaluationNames.has("hazard_subtype")) evaluationMigrations.push(db.prepare(`ALTER TABLE evaluation_benchmark_cases ADD COLUMN hazard_subtype TEXT`));
+    if (!evaluationNames.has("minimum_forecast_risk_percent")) evaluationMigrations.push(db.prepare(`ALTER TABLE evaluation_benchmark_cases ADD COLUMN minimum_forecast_risk_percent REAL`));
+    if (evaluationMigrations.length) await db.batch(evaluationMigrations);
     const intentColumns = await db.prepare(`PRAGMA table_info(task_cancellation_intents)`).all<{ name: string }>();
     if (!intentColumns.results.some((column) => column.name === "owner")) await db.prepare(`ALTER TABLE task_cancellation_intents ADD COLUMN owner TEXT NOT NULL DEFAULT 'legacy'`).run();
     const sessionColumns = await db.prepare(`PRAGMA table_info(web_sessions)`).all<{ name: string }>();
@@ -550,7 +557,7 @@ export async function listIngestionSnapshots(limit = 24) {
 export async function listEvaluationCases(limit = 100): Promise<EvaluationBenchmarkCase[]> {
   await ensureOperationalSchema();
   const db = await database();
-  const rows = await db.prepare(`SELECT case_id AS caseId, title, hazard, occurred_at AS occurredAt, latitude, longitude, location_tolerance_km AS locationToleranceKm, event_time_tolerance_hours AS eventTimeToleranceHours, accepted_lead_minutes AS acceptedLeadMinutes, detection_deadline_minutes AS detectionDeadlineMinutes, expected_severity AS expectedSeverity, required_source AS requiredSource, provenance_url AS provenanceUrl, notes, verification_status AS verificationStatus, created_by AS createdBy, created_at AS createdAt, updated_at AS updatedAt FROM evaluation_benchmark_cases ORDER BY occurred_at DESC, case_id LIMIT ?`)
+  const rows = await db.prepare(`SELECT case_id AS caseId, title, hazard, objective, hazard_subtype AS hazardSubtype, occurred_at AS occurredAt, latitude, longitude, location_tolerance_km AS locationToleranceKm, event_time_tolerance_hours AS eventTimeToleranceHours, accepted_lead_minutes AS acceptedLeadMinutes, detection_deadline_minutes AS detectionDeadlineMinutes, expected_severity AS expectedSeverity, required_source AS requiredSource, minimum_forecast_risk_percent AS minimumForecastRiskPercent, provenance_url AS provenanceUrl, notes, verification_status AS verificationStatus, created_by AS createdBy, created_at AS createdAt, updated_at AS updatedAt FROM evaluation_benchmark_cases ORDER BY occurred_at DESC, case_id LIMIT ?`)
     .bind(Math.max(1, Math.min(100, limit))).all<Record<string, unknown>>();
   return rows.results.map(evaluationCaseFromRow).filter((item): item is EvaluationBenchmarkCase => Boolean(item));
 }
@@ -558,10 +565,10 @@ export async function listEvaluationCases(limit = 100): Promise<EvaluationBenchm
 export async function upsertEvaluationCase(benchmark: EvaluationBenchmarkCase) {
   await ensureOperationalSchema();
   const db = await database();
-  await db.prepare(`INSERT INTO evaluation_benchmark_cases (case_id, title, hazard, occurred_at, latitude, longitude, location_tolerance_km, event_time_tolerance_hours, accepted_lead_minutes, detection_deadline_minutes, expected_severity, required_source, provenance_url, notes, verification_status, created_by, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(case_id) DO UPDATE SET title=excluded.title, hazard=excluded.hazard, occurred_at=excluded.occurred_at, latitude=excluded.latitude, longitude=excluded.longitude, location_tolerance_km=excluded.location_tolerance_km, event_time_tolerance_hours=excluded.event_time_tolerance_hours, accepted_lead_minutes=excluded.accepted_lead_minutes, detection_deadline_minutes=excluded.detection_deadline_minutes, expected_severity=excluded.expected_severity, required_source=excluded.required_source, provenance_url=excluded.provenance_url, notes=excluded.notes, verification_status=excluded.verification_status, updated_at=excluded.updated_at`)
-    .bind(benchmark.caseId, benchmark.title, benchmark.hazard, benchmark.occurredAt, benchmark.latitude, benchmark.longitude, benchmark.locationToleranceKm, benchmark.eventTimeToleranceHours, benchmark.acceptedLeadMinutes, benchmark.detectionDeadlineMinutes, benchmark.expectedSeverity ?? null, benchmark.requiredSource ?? null, benchmark.provenanceUrl, benchmark.notes, benchmark.verificationStatus, benchmark.createdBy, benchmark.createdAt, benchmark.updatedAt).run();
+  await db.prepare(`INSERT INTO evaluation_benchmark_cases (case_id, title, hazard, objective, hazard_subtype, occurred_at, latitude, longitude, location_tolerance_km, event_time_tolerance_hours, accepted_lead_minutes, detection_deadline_minutes, expected_severity, required_source, minimum_forecast_risk_percent, provenance_url, notes, verification_status, created_by, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(case_id) DO UPDATE SET title=excluded.title, hazard=excluded.hazard, objective=excluded.objective, hazard_subtype=excluded.hazard_subtype, occurred_at=excluded.occurred_at, latitude=excluded.latitude, longitude=excluded.longitude, location_tolerance_km=excluded.location_tolerance_km, event_time_tolerance_hours=excluded.event_time_tolerance_hours, accepted_lead_minutes=excluded.accepted_lead_minutes, detection_deadline_minutes=excluded.detection_deadline_minutes, expected_severity=excluded.expected_severity, required_source=excluded.required_source, minimum_forecast_risk_percent=excluded.minimum_forecast_risk_percent, provenance_url=excluded.provenance_url, notes=excluded.notes, verification_status=excluded.verification_status, updated_at=excluded.updated_at`)
+    .bind(benchmark.caseId, benchmark.title, benchmark.hazard, benchmark.objective, benchmark.hazardSubtype ?? null, benchmark.occurredAt, benchmark.latitude, benchmark.longitude, benchmark.locationToleranceKm, benchmark.eventTimeToleranceHours, benchmark.acceptedLeadMinutes, benchmark.detectionDeadlineMinutes, benchmark.expectedSeverity ?? null, benchmark.requiredSource ?? null, benchmark.minimumForecastRiskPercent ?? null, benchmark.provenanceUrl, benchmark.notes, benchmark.verificationStatus, benchmark.createdBy, benchmark.createdAt, benchmark.updatedAt).run();
   return benchmark;
 }
 
@@ -600,7 +607,21 @@ export async function listEvaluationCandidates(benchmark: EvaluationBenchmarkCas
   const latitudeDelta = Math.min(90, benchmark.locationToleranceKm / 110.574);
   const longitudeScale = Math.max(0.05, Math.abs(Math.cos(benchmark.latitude * Math.PI / 180)));
   const longitudeDelta = Math.min(180, benchmark.locationToleranceKm / (111.32 * longitudeScale));
-  const rows = await db.prepare(`SELECT s.snapshot_id AS snapshotId, s.captured_at AS capturedAt, event.value AS eventJson
+  const requiredSource = benchmark.requiredSource?.trim().toLocaleLowerCase() ?? "";
+  const requiredSourcePattern = requiredSource ? `%${requiredSource.replaceAll("%", "").replaceAll("_", "")}%` : "";
+  const rows = benchmark.objective === "landslide_forecast"
+    ? await db.prepare(`SELECT s.snapshot_id AS snapshotId, MIN(s.captured_at) AS capturedAt, event.value AS eventJson
+      FROM ingestion_snapshots s, json_each(s.payload_json, '$.events') AS event
+      WHERE s.captured_at BETWEEN ? AND ?
+        AND json_extract(event.value, '$.hazard') = 'landslide'
+        AND json_extract(event.value, '$.phenomenonStage') IN ('forecast', 'warning')
+        AND (? = '' OR lower(json_extract(event.value, '$.source')) LIKE ?)
+      GROUP BY json_extract(event.value, '$.masterEventId')
+      ORDER BY capturedAt, s.snapshot_id
+      LIMIT 5000`)
+      .bind(window.startAt, window.expectedBy, requiredSource, requiredSourcePattern)
+      .all<{ snapshotId: string; capturedAt: string; eventJson: string }>()
+    : await db.prepare(`SELECT s.snapshot_id AS snapshotId, s.captured_at AS capturedAt, event.value AS eventJson
     FROM ingestion_snapshots s, json_each(s.payload_json, '$.events') AS event
     WHERE s.captured_at BETWEEN ? AND ?
       AND json_extract(event.value, '$.hazard') = ?
@@ -618,6 +639,17 @@ export async function listEvaluationCandidates(benchmark: EvaluationBenchmarkCas
       return [{ snapshotId: row.snapshotId, capturedAt: row.capturedAt, event }];
     } catch { return []; }
   });
+}
+
+export async function evaluationSourceSuccessTimes(requiredSource: string, from: string, to: string) {
+  await ensureOperationalSchema();
+  const db = await database();
+  const pattern = `%${requiredSource.trim().toLocaleLowerCase().replaceAll("%", "").replaceAll("_", "")}%`;
+  const rows = await db.prepare(`SELECT r.fetched_at AS fetchedAt FROM source_fetch_runs r LEFT JOIN source_registry s ON s.source_id=r.source_id
+    WHERE r.ok=1 AND r.fetched_at BETWEEN ? AND ? AND (lower(r.source_id) LIKE ? OR lower(COALESCE(s.name, '')) LIKE ?)
+    ORDER BY r.fetched_at LIMIT 5000`)
+    .bind(from, to, pattern, pattern).all<{ fetchedAt: string }>();
+  return rows.results.map((row) => row.fetchedAt);
 }
 
 export async function evaluationSnapshotTimes(from: string, to: string) {
@@ -652,11 +684,16 @@ export async function evaluationSourceReliability(from: string, to: string): Pro
 function evaluationCaseFromRow(row: Record<string, unknown>): EvaluationBenchmarkCase | null {
   if (!row.caseId || !row.title || !row.hazard || !row.occurredAt) return null;
   return {
-    caseId: String(row.caseId), title: String(row.title), hazard: String(row.hazard) as EvaluationBenchmarkCase["hazard"], occurredAt: String(row.occurredAt),
+    caseId: String(row.caseId), title: String(row.title), hazard: String(row.hazard) as EvaluationBenchmarkCase["hazard"],
+    objective: row.objective === "landslide_forecast" ? "landslide_forecast" : "event_detection",
+    hazardSubtype: row.hazardSubtype ? String(row.hazardSubtype) as EvaluationBenchmarkCase["hazardSubtype"] : undefined,
+    occurredAt: String(row.occurredAt),
     latitude: Number(row.latitude), longitude: Number(row.longitude), locationToleranceKm: Number(row.locationToleranceKm), eventTimeToleranceHours: Number(row.eventTimeToleranceHours),
     acceptedLeadMinutes: Number(row.acceptedLeadMinutes), detectionDeadlineMinutes: Number(row.detectionDeadlineMinutes),
     expectedSeverity: row.expectedSeverity ? String(row.expectedSeverity) as EvaluationBenchmarkCase["expectedSeverity"] : undefined,
-    requiredSource: row.requiredSource ? String(row.requiredSource) : undefined, provenanceUrl: String(row.provenanceUrl), notes: String(row.notes ?? ""),
+    requiredSource: row.requiredSource ? String(row.requiredSource) : undefined,
+    minimumForecastRiskPercent: row.minimumForecastRiskPercent === null || row.minimumForecastRiskPercent === undefined ? undefined : Number(row.minimumForecastRiskPercent),
+    provenanceUrl: String(row.provenanceUrl), notes: String(row.notes ?? ""),
     verificationStatus: String(row.verificationStatus) as EvaluationBenchmarkCase["verificationStatus"], createdBy: String(row.createdBy), createdAt: String(row.createdAt), updatedAt: String(row.updatedAt),
   };
 }

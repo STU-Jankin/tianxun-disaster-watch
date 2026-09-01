@@ -13,6 +13,7 @@ test("persists benchmark cases and reads spatial-temporal replay candidates", as
       caseId: "benchmark-db-case-001",
       title: "数据库评测样本",
       hazard: "landslide",
+      objective: "event_detection",
       occurredAt: "2026-09-01T00:00:00.000Z",
       latitude: 29.5,
       longitude: 90.5,
@@ -48,8 +49,39 @@ test("persists benchmark cases and reads spatial-temporal replay candidates", as
     const candidates = await database.listEvaluationCandidates(benchmark);
     assert.equal(candidates.length, 1);
     assert.equal(candidates[0].event.masterEventId, "ME-landslide-1");
-    assert.deepEqual(await database.evaluationSnapshotTimes("2026-09-01T00:00:00.000Z", "2026-09-01T02:00:00.000Z"), ["2026-09-01T01:00:00.000Z"]);
+    const forecastBenchmark = {
+      ...benchmark,
+      caseId: "benchmark-db-forecast-001",
+      title: "数据库滑坡预测样本",
+      objective: "landslide_forecast",
+      hazardSubtype: "debris_flow",
+      occurredAt: "2026-09-02T00:00:00.000Z",
+      acceptedLeadMinutes: 1_440,
+      detectionDeadlineMinutes: 60,
+      minimumForecastRiskPercent: 80,
+      requiredSource: "NASA LHASA",
+    };
+    await database.upsertEvaluationCase(forecastBenchmark);
+    await database.persistIngestionArtifacts({
+      refreshId: "refresh-evaluation-forecast",
+      sources: [],
+      fetches: [],
+      snapshot: {
+        snapshotId: "snapshot-evaluation-forecast",
+        refreshId: "refresh-evaluation-forecast",
+        capturedAt: "2026-09-01T02:00:00.000Z",
+        payloadSha256: "f".repeat(64),
+        eventCount: 1,
+        sourceCount: 0,
+        payload: { events: [{ id: "lhasa-1", masterEventId: "ME-lhasa-1", title: "LHASA 92%", hazard: "landslide", occurredAt: "2026-09-01T00:00:00.000Z", latitude: 29.5, longitude: 90.5, severity: "orange", source: "NASA LHASA", phenomenonStage: "forecast", validFrom: "2026-09-01T00:00:00.000Z", validTo: "2026-09-02T01:00:00.000Z", magnitude: 92, magnitudeUnit: "%", geometry: { type: "Polygon", coordinates: [[[90, 29], [91, 29], [91, 30], [90, 30], [90, 29]]] }, evidence: [{ source: "NASA LHASA" }] }] },
+      },
+    });
+    const forecastCandidates = await database.listEvaluationCandidates(forecastBenchmark);
+    assert.equal(forecastCandidates.length, 1);
+    assert.equal(forecastCandidates[0].event.masterEventId, "ME-lhasa-1");
+    assert.deepEqual(await database.evaluationSnapshotTimes("2026-09-01T00:00:00.000Z", "2026-09-01T02:00:00.000Z"), ["2026-09-01T01:00:00.000Z", "2026-09-01T02:00:00.000Z"]);
     assert.equal(await database.deleteEvaluationCase(benchmark.caseId), true);
+    assert.equal(await database.deleteEvaluationCase(forecastBenchmark.caseId), true);
     assert.equal((await database.listEvaluationCases()).length, 0);
   } finally {
     await rm(directory, { recursive: true, force: true }).catch((error) => { if (error?.code !== "EBUSY") throw error; });

@@ -527,6 +527,21 @@ test("adds evidence-safe landslide terrain screening and complementary SAR task 
   assert.match(planning, /不代表滑坡概率/);
 });
 
+test("separates landslide forecast verification from event detection metrics", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const center = await readFile(new URL("../app/evaluation-center.tsx", import.meta.url), "utf8");
+  const evaluation = await readFile(new URL("../lib/evaluation-center.ts", import.meta.url), "utf8");
+  const route = await readFile(new URL("../app/api/evaluation/route.ts", import.meta.url), "utf8");
+  const migration = await readFile(new URL("../drizzle/0011_landslide_forecast_evaluation.sql", import.meta.url), "utf8");
+  for (const text of ["滑坡预测命中率", "预测提前量中位数", "下载滑坡模板", "tianxun.landslide-benchmark/v1"]) assert.ok(center.includes(text));
+  assert.match(evaluation, /event\.validTo/);
+  assert.match(evaluation, /geometryContainsPoint/);
+  assert.match(evaluation, /precisionAvailable: false/);
+  assert.match(route, /import_landslide_cases/);
+  assert.match(route, /evaluationSourceSuccessTimes/);
+  assert.match(migration, /minimum_forecast_risk_percent/);
+});
+
 test("adds on-demand hourly weather to event details and satellite tasks", async () => {
   const { readFile } = await import("node:fs/promises");
   const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
