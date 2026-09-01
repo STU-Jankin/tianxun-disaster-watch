@@ -61,6 +61,7 @@ test("binds TY-50 to the user-provided XSAR profile and keeps CSAR parameters in
   assert.equal(ty50?.commonName, "TY-50");
   assert.equal(ty50?.commonCode, "电建一号");
   assert.equal(ty50?.payloadProfileId, "ty-xsar-v1");
+  assert.equal(ty50?.orbitModelProfileId, "stk-sgp4-wgs72-v1");
   const xsar = sarPayloadProfiles["ty-xsar-v1"];
   const csar = sarPayloadProfiles["ty-csar-v2"];
   assert.equal(xsar.payloadType, "XSAR");
@@ -84,4 +85,23 @@ test("binds TY-50 to the user-provided XSAR profile and keeps CSAR parameters in
   assert.deepEqual(csar.productLevels.map(({ level, code }) => ({ level, code })), [{ level: "L1", code: "SLC" }, { level: "L2", code: "ORG" }]);
   const snapshot = buildSatelliteOrbitSnapshot([], new Date("2026-08-19T00:00:00Z"));
   assert.equal(snapshot.find((item) => item.noradId === 69100)?.payloadProfile?.id, "ty-xsar-v1");
+  assert.deepEqual(
+    snapshot.find((item) => item.noradId === 69100)?.orbitModel,
+    {
+      id: "stk-sgp4-wgs72-v1",
+      propagator: "SGP4",
+      gravityModel: "WGS72",
+      inertialFrame: "J2000",
+      groundFrame: "Earth Fixed",
+      timeSystem: "UTCG",
+      runtimeElementPolicy: "daily_tle",
+      referenceApplication: "STK 11",
+      referenceStepSeconds: 60,
+      referenceSamplesPerSatellite: 3001,
+      validationStatus: "verified_against_stk_export",
+      validationMaximumGroundDifferenceM: 0.25,
+      note: "运行时继续采用服务器每日更新并通过校验的TLE；STK导出的过期状态向量仅用于验证SGP4/WGS72、J2000/UTCG计算口径，不参与实时任务规划。",
+    },
+  );
+  assert.equal(snapshot.find((item) => item.noradId === 58918)?.orbitModel, undefined);
 });

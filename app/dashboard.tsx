@@ -309,6 +309,21 @@ type SatelliteOrbitView = {
     parameterStatus: "user_provided" | "provisional_assumption";
     parameterNote: string;
   };
+  orbitModel?: {
+    id: string;
+    propagator: "SGP4";
+    gravityModel: "WGS72";
+    inertialFrame: "J2000";
+    groundFrame: "Earth Fixed";
+    timeSystem: "UTCG";
+    runtimeElementPolicy: "daily_tle";
+    referenceApplication: "STK 11";
+    referenceStepSeconds: number;
+    referenceSamplesPerSatellite: number;
+    validationStatus: "verified_against_stk_export";
+    validationMaximumGroundDifferenceM: number;
+    note: string;
+  };
   providerName?: string;
   epoch?: string;
   fetchedAt?: string;
@@ -3039,12 +3054,13 @@ function TaskPanel({ open, tasks, syncState, storageMode, fleet, activeTaskId, o
           <div><b>{satellite.interfaceName || satellite.commonName}</b><span>NORAD {satellite.noradId}</span></div>
           <strong>{satellite.commonCode || satellite.interfaceCode || satellite.commonName}</strong>
           <small>{satellite.identityStatus === "unverified" ? "业务身份待核验" : "业务映射已配置"} · CelesTrak：{satellite.providerName || "尚无返回名称"}</small>
+          {satellite.orbitModel ? <small>轨道模型：{satellite.orbitModel.propagator}/{satellite.orbitModel.gravityModel} · {satellite.orbitModel.inertialFrame}/{satellite.orbitModel.timeSystem} · 已用 {satellite.orbitModel.referenceApplication} 同源样本核验</small> : <small>轨道模型：尚未完成 STK 同源核验</small>}
           {satellite.payloadProfile ? <small>{satellite.payloadProfile.payloadType} · {satellite.payloadProfile.frequencyBand}频段 · 左右侧视 · 入射角 {satellite.payloadProfile.incidenceAngleDeg.min}°～{satellite.payloadProfile.incidenceAngleDeg.max}° · 极化 {satellite.payloadProfile.polarizations.join("/") || "待提供"} · {satellite.payloadProfile.parameterStatus === "provisional_assumption" ? "临时假设参数" : "用户提供参数"}</small> : null}
           {satellite.payloadProfile ? <small>{satellite.payloadProfile.imagingModes.map((mode) => `${mode.name} ${mode.resolutionLabel}/${mode.nominalSceneCrossTrackKm}×${mode.nominalSceneAlongTrackKm} km`).join(" · ")}</small> : null}
           {satellite.payloadProfile?.productLevels.length ? <small>产品：{satellite.payloadProfile.productLevels.map((product) => `${product.level} ${product.name}（${product.code}）`).join(" · ")}</small> : satellite.payloadProfile ? <small>产品级别：尚未提供</small> : null}
           <time>{satellite.epoch ? `轨道历元 ${formatTimeWithYear(satellite.epoch)} UTC+08 · ${satellite.elementAgeHours ?? "--"}小时` : satellite.lastError || "尚未取得有效TLE"}</time>
         </article>)}
-        <footer>每天自动刷新一次；失败保留上次有效TLE。业务名称与CelesTrak目录名称分开保存。 <a href="https://celestrak.org/NORAD/documentation/gp-data-formats.php" target="_blank" rel="noreferrer">接口说明 ↗</a></footer>
+        <footer>运行轨道每天自动刷新一次；失败保留上次有效TLE。STK压缩包中的过期TLE和状态向量仅作模型核验，不参与实时规划。 <a href="https://celestrak.org/NORAD/documentation/gp-data-formats.php" target="_blank" rel="noreferrer">接口说明 ↗</a></footer>
       </div>
     </details>
     {storageMode === "public-read-only" ? <div className="task-storage-banner" role="status"><strong>公网只读模式</strong><span>任务可在本机规划、导入和删除，但不会写入服务器；远程同步需启用 HTTPS 登录和任务权限。</span></div> : storageMode === "unavailable" ? <div className="task-storage-banner warning" role="alert"><strong>任务服务不可用</strong><span>当前修改仅保存在本机，恢复连接后可重试同步。</span></div> : null}

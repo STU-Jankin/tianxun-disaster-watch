@@ -179,7 +179,7 @@ function toOpportunity(input: {
     imagingMode: "TLE轨道级粗筛",
     simulationLevel: "orbit_only",
     confidence: "screening_only",
-    orbitVersion: `celestrak:${satellite.noradId}:${satellite.epoch ?? "unknown"}`,
+    orbitVersion: `celestrak:${satellite.noradId}:${satellite.epoch ?? "unknown"}${satellite.orbitModel ? `:model:${satellite.orbitModel.id}` : ""}`,
     computedAt,
     start: new Date(firstMs).toISOString(),
     end: new Date(endMs).toISOString(),
