@@ -59,6 +59,10 @@ for file in package.json package-lock.json tsconfig.json vite.config.ts next.con
   [[ -f "$project_dir/$file" ]] || { echo "Missing release file: $file" >&2; exit 1; }
   cp -a "$project_dir/$file" "$release_dir/"
 done
+# ZIP/TAR packages created on Windows may drop Unix executable bits even when
+# Git records the scripts as executable. Normalize them before systemd points
+# at the new release so timers cannot fail with status 203/EXEC.
+find "$release_dir/vps/scripts" -type f -name '*.sh' -exec chmod 0755 {} +
 chmod 0755 "$release_dir"
 
 cd "$release_dir"

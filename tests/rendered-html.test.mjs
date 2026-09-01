@@ -483,6 +483,7 @@ test("includes every Vinext build dependency in the hardened VPS release allow-l
   assert.match(viteConfig, /\.\/build\/sites-vite-plugin\.ts/);
   assert.match(viteConfig, /main: "\.\/worker\/index\.ts"/);
   assert.match(installer, /for directory in \.openai app build db drizzle lib public tests types vps worker/);
+  assert.match(installer, /find "\$release_dir\/vps\/scripts" -type f -name '\*\.sh' -exec chmod 0755 \{\} \+/);
   assert.match(installer, /npm_config_cache=.*"\$npm_bin" run verify/);
 });
 
