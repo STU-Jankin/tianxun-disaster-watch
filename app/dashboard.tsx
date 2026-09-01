@@ -2203,13 +2203,15 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
   }, [assessment, computing, event, historicalReadOnly]);
 
   useEffect(() => {
-    if (!canCompute || computing || assessment?.status !== "pending" || automaticPollsRef.current >= 12) return;
+    const pendingParts = assessment?.osm.state === "pending" ? assessment.osm.totalParts ?? 0 : assessment?.population.state === "pending" ? assessment.population.totalParts ?? 0 : 0;
+    const automaticPollLimit = Math.min(64, Math.max(12, pendingParts + 8));
+    if (!canCompute || computing || assessment?.status !== "pending" || automaticPollsRef.current >= automaticPollLimit) return;
     const timer = window.setTimeout(() => {
       automaticPollsRef.current += 1;
       void compute();
     }, 20_000);
     return () => window.clearTimeout(timer);
-  }, [assessment?.computedAt, assessment?.status, canCompute, compute, computing]);
+  }, [assessment?.computedAt, assessment?.osm.state, assessment?.osm.totalParts, assessment?.population.state, assessment?.population.totalParts, assessment?.status, canCompute, compute, computing]);
 
   const population = assessment?.population;
   const osm = assessment?.osm;
@@ -2243,7 +2245,7 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
       {assessment.riskInput ? <p className="exposure-risk-basis"><strong>指数依据：</strong>{exposureRiskBasisForDisplay(assessment)}</p> : null}
       {populationOnly ? <p className="exposure-data-note"><strong>人口筛查已完成。</strong>建筑、道路和关键设施属于补充项，本次未统计；上方人口是筛查范围内模型人口，不是实际受灾人口。</p> : null}
       {population && population.state !== "ready" ? <p className={`exposure-source-state ${population.state}`}>WorldPop：{population.message}</p> : null}
-      {osm?.state === "pending" ? <p className="exposure-source-state pending"><strong>OSM 分块统计中。</strong>{osm.message}</p> : null}
+      {osm?.state === "pending" ? <p className="exposure-source-state pending"><strong>OSM 分块统计中。</strong>{osm.message} 页面保持打开时会约每 20 秒自动续算；可以离开详情，已完成分块不会丢失。</p> : null}
       <details className="exposure-limitations"><summary>查看数据来源与限制</summary>{population ? <p>WorldPop：{population.message}</p> : null}{osm ? <p>OSM：{osm.message}</p> : null}{osm?.state === "skipped" ? <p>大范围建筑和道路存量需要自建 OSM 数据库离线汇总；高德 POI 只能补充设施位置，不能替代 OSM 存量统计。</p> : null}{assessment.limitations.map((item) => <p key={item}>{item}</p>)}<p>人口暴露指数只参与初筛排序；没有脆弱性模型时，系统不会生成综合影响风险分数。</p></details>
       <div className="exposure-links"><a href="https://api.worldpop.org/v2/" target="_blank" rel="noreferrer">WorldPop API ↗</a><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors ↗</a></div>
     </> : !loading && !historicalReadOnly ? <p className="exposure-empty">尚未计算。系统会按事件范围查询人口模型，并筛查已映射的建筑、道路和关键设施。</p> : null}

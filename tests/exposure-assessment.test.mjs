@@ -54,13 +54,22 @@ test("derives a labelled hazard buffer and prepares a bounded polygon Overpass q
 
 test("splits a standard earthquake AOI into resumable Overpass chunks", () => {
   const aoi = buildExposureAoi(pointEvent({ hazard: "earthquake", title: "测试地震", locationAccuracyKm: 5 }));
-  const plan = prepareOverpassExposurePlan(aoi, { maximumAreaKm2: 3_500, chunkAreaKm2: 750, queryTimeoutSeconds: 25 });
+  const plan = prepareOverpassExposurePlan(aoi, { maximumAreaKm2: 10_000, chunkAreaKm2: 750, queryTimeoutSeconds: 25 });
   assert.equal(plan.state, "ready");
   assert.ok(plan.chunks.length >= 4 && plan.chunks.length <= 8);
   assert.ok(plan.chunks.every((chunk) => chunk.areaKm2 <= 750));
   assert.ok(Math.abs(plan.chunks.reduce((sum, chunk) => sum + chunk.areaKm2, 0) - aoi.areaKm2) / aoi.areaKm2 < 0.005);
   assert.match(plan.message, /每次处理 1 块/);
-  assert.equal(prepareOverpassExposurePlan({ ...aoi, areaKm2: 3_501 }, { maximumAreaKm2: 3_500, chunkAreaKm2: 750 }).state, "skipped");
+  assert.equal(prepareOverpassExposurePlan({ ...aoi, areaKm2: 10_001 }, { maximumAreaKm2: 10_000, chunkAreaKm2: 750 }).state, "skipped");
+});
+
+test("accepts and partitions a routine 50 km flood screening buffer", () => {
+  const aoi = buildExposureAoi(pointEvent({ hazard: "flood", title: "测试洪灾", locationAccuracyKm: 50 }));
+  const plan = prepareOverpassExposurePlan(aoi, { maximumAreaKm2: 10_000, chunkAreaKm2: 750, queryTimeoutSeconds: 25 });
+  assert.equal(plan.state, "ready");
+  assert.ok(aoi.areaKm2 > 7_800 && aoi.areaKm2 < 7_900);
+  assert.ok(plan.chunks.length > 12 && plan.chunks.length <= 20);
+  assert.ok(plan.chunks.every((chunk) => chunk.areaKm2 <= 750));
 });
 
 test("uses official polygon geometry when available and enforces provider area limits", () => {
@@ -72,7 +81,7 @@ test("uses official polygon geometry when available and enforces provider area l
   assert.equal(aoi.basis, "official_event_geometry");
   assert.ok(aoi.areaKm2 > 100);
   assert.equal(prepareOverpassExposureQuery({ ...aoi, areaKm2: 2_819 }).state, "ready");
-  assert.equal(prepareOverpassExposureQuery({ ...aoi, areaKm2: 3_501 }).state, "skipped");
+  assert.equal(prepareOverpassExposureQuery({ ...aoi, areaKm2: 10_001 }).state, "skipped");
   const chinaPlan = prepareOverpassExposureQuery({ ...aoi, areaKm2: 31_326 }, { maximumAreaKm2: 50_000, serviceLabel: "中国 OSM 日更镜像", queryTimeoutSeconds: 45 });
   assert.equal(chinaPlan.state, "ready");
   assert.match(chinaPlan.query, /\[timeout:45\]/);

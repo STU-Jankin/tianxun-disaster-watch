@@ -4,7 +4,7 @@ import { normalizeAntimeridianGeometry, validateGeoGeometry } from "./geo-geomet
 import { publicOverpassMaximumAreaKm2, type OverpassCacheStatus, type OverpassProfile } from "./overpass-runtime.ts";
 import polygonClipping, { type MultiPolygon as ClippingMultiPolygon, type Polygon as ClippingPolygon } from "polygon-clipping";
 
-export const exposureAssessmentModelVersion = "tianxun-exposure-screening-v4" as const;
+export const exposureAssessmentModelVersion = "tianxun-exposure-screening-v5" as const;
 export const maximumWorldPopAreaKm2 = 50_000;
 export const maximumOverpassAreaKm2 = publicOverpassMaximumAreaKm2;
 

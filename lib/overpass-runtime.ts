@@ -1,9 +1,10 @@
 export type OverpassProfile = "public" | "china_daily";
 export type OverpassCacheStatus = "refreshed" | "fresh" | "stale";
 
-// Covers the standard 30 km earthquake screening circle (~2,827 km²) with
-// modest geometric headroom while still rejecting genuinely broad scans.
-export const publicOverpassMaximumAreaKm2 = 3_500;
+// Covers the largest routine point-buffer screen that we support on the public
+// service (50 km, ~7,854 km²). The limit applies to the resumable task as a
+// whole; each upstream request remains bounded by the much smaller chunk cap.
+export const publicOverpassMaximumAreaKm2 = 10_000;
 export const publicOverpassChunkAreaKm2 = 750;
 
 export type OverpassRuntimeConfig = {
