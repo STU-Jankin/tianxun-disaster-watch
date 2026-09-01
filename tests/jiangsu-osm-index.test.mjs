@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { buildJiangsuIndex } from "../vps/osm-jiangsu/build-index.mjs";
-import { parseOsmPoly, queryJiangsuExposureIndex } from "../vps/osm-jiangsu/index-core.mjs";
+import { buildJiangsuIndex, readGeoPackageEnvelopeCenter } from "../vps/osm-jiangsu/build-index.mjs";
+import { geometriesIntersect, parseOsmPoly, queryJiangsuExposureIndex } from "../vps/osm-jiangsu/index-core.mjs";
 
 const jiangsuPoly = `jiangsu
 1
@@ -24,6 +24,51 @@ test("parses Geofabrik poly coverage and rejects an AOI outside Jiangsu", () => 
   assert.equal(coverage.coordinates.length, 1);
 });
 
+test("parses the scientific notation used by the live Geofabrik Jiangsu boundary", () => {
+  const coverage = parseOsmPoly(`none
+1
+  1.163895E+02 3.462742E+01
+  1.164895E+02 3.462742E+01
+  1.164895E+02 3.472742E+01
+  1.163895E+02 3.462742E+01
+END
+END
+`);
+  assert.deepEqual(coverage.coordinates[0][0][0], [116.3895, 34.62742]);
+});
+
+test("reads a WGS 84 center from a GeoPackage geometry envelope", () => {
+  const geometry = Buffer.alloc(40);
+  geometry[0] = 0x47;
+  geometry[1] = 0x50;
+  geometry[3] = 0b00000011; // little endian, XY envelope
+  geometry.writeDoubleLE(120.2, 8);
+  geometry.writeDoubleLE(120.4, 16);
+  geometry.writeDoubleLE(31.4, 24);
+  geometry.writeDoubleLE(31.6, 32);
+  assert.deepEqual(readGeoPackageEnvelopeCenter(geometry), { longitude: 120.30000000000001, latitude: 31.5 });
+});
+
+test("reads a GeoPackage point when its header omits an optional envelope", () => {
+  const geometry = Buffer.alloc(29);
+  geometry[0] = 0x47;
+  geometry[1] = 0x50;
+  geometry[3] = 0b00000001;
+  geometry[8] = 1;
+  geometry.writeUInt32LE(1, 9);
+  geometry.writeDoubleLE(120.31, 13);
+  geometry.writeDoubleLE(31.57, 21);
+  assert.deepEqual(readGeoPackageEnvelopeCenter(geometry), { longitude: 120.31, latitude: 31.57 });
+});
+
+test("recognizes AOIs that cross the Jiangsu boundary as partial coverage", () => {
+  const coverage = parseOsmPoly(jiangsuPoly);
+  const crossing = rectangle(122.9, 31, 123.1, 31.2);
+  const outside = rectangle(124, 31, 125, 32);
+  assert.equal(geometriesIntersect(crossing, coverage), true);
+  assert.equal(geometriesIntersect(outside, coverage), false);
+});
+
 test("builds and queries the Jiangsu screening index without Overpass chunks", async () => {
   const directory = await mkdtemp(join(tmpdir(), "tianxun-osm-jiangsu-"));
   const gpkg = join(directory, "jiangsu.gpkg");
@@ -37,12 +82,17 @@ test("builds and queries the Jiangsu screening index without Overpass chunks", a
   try {
     const result = queryJiangsuExposureIndex(database, rectangle(120.20, 31.45, 120.40, 31.65));
     assert.equal(result.supported, true);
+    assert.equal(result.coverageMode, "full");
     assert.equal(result.mappedBuildingCount, 2);
     assert.equal(result.mappedRoadWayCount, 1);
     assert.equal(result.mappedKeyFacilityCount, 2);
     assert.deepEqual(result.facilityCounts, { health: 1, emergency: 1 });
     assert.equal(result.facilities.length, 2);
     assert.equal(result.sourceTimestamp, "2026-08-31T20:21:06.000Z");
+
+    const partial = queryJiangsuExposureIndex(database, rectangle(122.9, 31, 123.1, 31.2));
+    assert.equal(partial.supported, true);
+    assert.equal(partial.coverageMode, "jiangsu_intersection");
 
     const outside = queryJiangsuExposureIndex(database, rectangle(114, 30, 115, 31));
     assert.equal(outside.supported, false);

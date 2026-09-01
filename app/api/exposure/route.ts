@@ -119,6 +119,7 @@ export async function POST(request: Request) {
         "WorldPop 是指定年份人口模型估计，不代表灾害发生时刻的人口分布。",
         "OSM 为志愿者维护的已映射要素；零记录或缺失记录不能证明现实中不存在。",
         ...(osm.aggregationMethod === "feature_bbox_centroid_grid" ? ["江苏本地索引的建筑和道路数量按约 1 km 网格中的要素包围盒代表点汇总，用于快速筛查，不等同于 AOI 边界逐要素精确求交。"] : []),
+        ...(osm.dataProfile === jiangsuOsmDataProfile && osm.coverage === "focused" ? ["该 AOI 跨出江苏数据边界；建筑、道路和关键设施仅统计 AOI 与江苏日更索引覆盖区的交集，不代表 AOI 省外部分。"] : []),
         ...(osm.coverage === "focused" ? ["OSM 建筑、道路和关键设施仅统计明确标注的重点筛查区，不代表完整灾害影响范围，也不得按面积比例外推。"] : []),
         identity.aoi.basis === "derived_screening_buffer" ? "当前没有可直接采用的官方影响面，AOI 为事件代表点缓冲区，需要在地图中核对。" : "AOI 采用来源几何，但来源范围不等于实际受灾边界。",
       ],
@@ -398,6 +399,12 @@ async function fetchJiangsuOsmExposure(scope: OsmExposureScope, config: JiangsuO
   if (!result.supported) return result;
   const fetchedAt = new Date().toISOString();
   const approximateResolutionKm = Math.round(result.gridSizeDegrees * 111 * 10) / 10;
+  const partialCoverage = result.coverageMode === "jiangsu_intersection";
+  const scopeMetadata = partialCoverage ? {
+    coverage: "focused" as const,
+    scopeLabel: `${scope.label}与江苏日更索引覆盖区的交集`,
+    sourceAoiAreaKm2: scope.sourceAoiAreaKm2,
+  } : localOsmScopeMetadata(scope);
   return {
     supported: true,
     exposure: {
@@ -416,10 +423,10 @@ async function fetchJiangsuOsmExposure(scope: OsmExposureScope, config: JiangsuO
       updateCadence: "daily",
       aggregationMethod: result.aggregationMethod,
       aggregationResolutionKm: approximateResolutionKm,
-      ...localOsmScopeMetadata(scope),
+      ...scopeMetadata,
       completedParts: 1,
       totalParts: 1,
-      message: `江苏 OSM 本地日更索引 · 建筑和道路按约 ${approximateResolutionKm} km 网格中的要素包围盒代表点汇总，关键设施按代表点落入 AOI 筛选；无需公共 Overpass 分块。数据时点 ${result.sourceTimestamp}`,
+      message: `江苏 OSM 本地日更索引 · ${partialCoverage ? "仅统计 AOI 与江苏覆盖区的交集；" : ""}建筑和道路按约 ${approximateResolutionKm} km 网格中的要素包围盒代表点汇总，关键设施按代表点落入 AOI 筛选；无需公共 Overpass 分块。数据时点 ${result.sourceTimestamp}`,
     },
   };
 }

@@ -50,7 +50,10 @@ gpkg_path="$(find "$staging/gpkg" -maxdepth 2 -type f -name '*.gpkg' -print -qui
   --out "$staging/jiangsu.sqlite" \
   --source-timestamp "$source_timestamp" \
   --grid-size 0.01 >/dev/null
-sqlite3 "$staging/jiangsu.sqlite" "PRAGMA quick_check; SELECT value FROM metadata WHERE key='source_timestamp';" | grep -q '^ok$'
+validation_output="$(sqlite3 "$staging/jiangsu.sqlite" "PRAGMA quick_check; SELECT value FROM metadata WHERE key='source_timestamp';")"
+[[ "$(printf '%s\n' "$validation_output" | sed -n '1p')" == "ok" ]] || { echo "Jiangsu OSM index integrity check failed." >&2; exit 1; }
+validation_timestamp="$(printf '%s\n' "$validation_output" | sed -n '2p')"
+[[ -n "$validation_timestamp" && "$(date -u -d "$validation_timestamp" +%s)" == "$(date -u -d "$source_timestamp" +%s)" ]] || { echo "Jiangsu OSM source timestamp validation failed." >&2; exit 1; }
 chown tianxun-osm:tianxun-osm "$staging/jiangsu.sqlite"
 chmod 0640 "$staging/jiangsu.sqlite"
 

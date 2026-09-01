@@ -18,6 +18,7 @@ export type JiangsuOsmExposureResult = {
   sourceUrl?: string;
   gridSizeDegrees: number;
   aggregationMethod: "feature_bbox_centroid_grid";
+  coverageMode: "full" | "jiangsu_intersection";
   mappedBuildingCount: number;
   mappedRoadWayCount: number;
   mappedKeyFacilityCount: number;
@@ -49,9 +50,9 @@ export function resolveJiangsuOsmRuntimeConfig(environment: Record<string, strin
 export function isJiangsuOsmCandidate(geometry: EventGeometry) {
   if (geometry.type !== "Polygon" && geometry.type !== "MultiPolygon") return false;
   const bbox = geometryBbox(geometry);
-  // Broad gate only avoids needless service calls. The data service performs
-  // the authoritative containment check against Geofabrik's Jiangsu .poly.
-  return bbox[0] >= 116 && bbox[1] >= 30.4 && bbox[2] <= 122.3 && bbox[3] <= 35.4;
+  // Broad intersection gate only avoids needless service calls. The data
+  // service performs the authoritative polygon intersection check.
+  return bbox[2] >= 116 && bbox[3] >= 30.4 && bbox[0] <= 122.3 && bbox[1] <= 35.4;
 }
 
 export function parseJiangsuOsmExposure(payload: unknown): JiangsuOsmExposureResult | { supported: false; reason: string; sourceTimestamp?: string } {
@@ -89,6 +90,7 @@ export function parseJiangsuOsmExposure(payload: unknown): JiangsuOsmExposureRes
     sourceUrl: safeHttpUrl(value.sourceUrl),
     gridSizeDegrees,
     aggregationMethod: "feature_bbox_centroid_grid",
+    coverageMode: value.coverageMode === "jiangsu_intersection" ? "jiangsu_intersection" : "full",
     mappedBuildingCount,
     mappedRoadWayCount,
     mappedKeyFacilityCount,

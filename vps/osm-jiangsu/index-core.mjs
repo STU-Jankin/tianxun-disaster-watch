@@ -59,7 +59,7 @@ export function parseOsmPoly(text) {
       }
       continue;
     }
-    const coordinate = /^(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)$/.exec(line);
+    const coordinate = /^([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?)\s+([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?)$/.exec(line);
     if (coordinate) {
       if (!ring) throw new Error("江苏 OSM 覆盖边界缺少环标识");
       const longitude = Number(coordinate[1]);
@@ -136,18 +136,32 @@ export function geometryContainedByCoverage(geometry, coverage) {
   return true;
 }
 
+export function geometriesIntersect(left, right) {
+  const leftBbox = geometryBbox(left);
+  const rightBbox = geometryBbox(right);
+  if (leftBbox[2] < rightBbox[0] || leftBbox[0] > rightBbox[2] || leftBbox[3] < rightBbox[1] || leftBbox[1] > rightBbox[3]) return false;
+  for (const point of geometryPoints(left)) if (pointInGeometry(point, right)) return true;
+  for (const point of geometryPoints(right)) if (pointInGeometry(point, left)) return true;
+  const rightSegments = geometrySegments(right);
+  for (const [leftStart, leftEnd] of geometrySegments(left)) {
+    for (const [rightStart, rightEnd] of rightSegments) if (segmentsIntersect(leftStart, leftEnd, rightStart, rightEnd)) return true;
+  }
+  return false;
+}
+
 export function queryJiangsuExposureIndex(database, rawGeometry, options = {}) {
   const geometry = validateScreeningGeometry(rawGeometry);
   const metadata = readMetadata(database);
   if (metadata.schema_version !== jiangsuIndexSchemaVersion) throw new Error("江苏 OSM 索引版本不兼容");
   const coverage = validateScreeningGeometry(JSON.parse(metadata.coverage_geojson), 100_000);
-  if (!geometryContainedByCoverage(geometry, coverage)) {
+  if (!geometriesIntersect(geometry, coverage)) {
     return {
       supported: false,
-      reason: "AOI 未完整落在江苏数据覆盖边界内，已交由全球 OSM 数据源处理",
+      reason: "AOI 与江苏数据覆盖边界不相交，已交由全球 OSM 数据源处理",
       sourceTimestamp: metadata.source_timestamp,
     };
   }
+  const coverageMode = geometryContainedByCoverage(geometry, coverage) ? "full" : "jiangsu_intersection";
   const gridSizeDegrees = boundedNumber(metadata.grid_size_degrees, defaultGridSizeDegrees, 0.001, 0.1);
   const [west, south, east, north] = geometryBbox(geometry);
   const minCellX = gridCell(west, gridSizeDegrees, 180);
@@ -185,6 +199,7 @@ export function queryJiangsuExposureIndex(database, rawGeometry, options = {}) {
     sourceUrl: metadata.source_url,
     gridSizeDegrees,
     aggregationMethod: "feature_bbox_centroid_grid",
+    coverageMode,
     mappedBuildingCount,
     mappedRoadWayCount,
     mappedKeyFacilityCount: matchedFacilities.length,
@@ -200,6 +215,42 @@ export function queryJiangsuExposureIndex(database, rawGeometry, options = {}) {
     })),
     facilitiesTruncated: matchedFacilities.length > facilityLimit,
   };
+}
+
+function geometryPoints(geometry) {
+  const polygons = geometry.type === "Polygon" ? [geometry.coordinates] : geometry.coordinates;
+  return polygons.flatMap((polygon) => polygon.flatMap((ring) => ring));
+}
+
+function geometrySegments(geometry) {
+  const polygons = geometry.type === "Polygon" ? [geometry.coordinates] : geometry.coordinates;
+  const segments = [];
+  for (const polygon of polygons) for (const ring of polygon) {
+    for (let index = 1; index < ring.length; index += 1) segments.push([ring[index - 1], ring[index]]);
+  }
+  return segments;
+}
+
+function segmentsIntersect(a, b, c, d) {
+  const abC = orientation(a, b, c);
+  const abD = orientation(a, b, d);
+  const cdA = orientation(c, d, a);
+  const cdB = orientation(c, d, b);
+  if (abC === 0 && onSegment(a, b, c)) return true;
+  if (abD === 0 && onSegment(a, b, d)) return true;
+  if (cdA === 0 && onSegment(c, d, a)) return true;
+  if (cdB === 0 && onSegment(c, d, b)) return true;
+  return (abC > 0) !== (abD > 0) && (cdA > 0) !== (cdB > 0);
+}
+
+function orientation(a, b, c) {
+  const value = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+  return Math.abs(value) < 1e-12 ? 0 : value;
+}
+
+function onSegment(a, b, point) {
+  return point[0] >= Math.min(a[0], b[0]) - 1e-12 && point[0] <= Math.max(a[0], b[0]) + 1e-12
+    && point[1] >= Math.min(a[1], b[1]) - 1e-12 && point[1] <= Math.max(a[1], b[1]) + 1e-12;
 }
 
 export function writeMetadata(database, values) {
