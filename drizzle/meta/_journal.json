@@ -85,6 +85,13 @@
       "when": 1788570000000,
       "tag": "0011_landslide_forecast_evaluation",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1788573600000,
+      "tag": "0012_forecast_raster_calibration",
+      "breakpoints": true
     }
   ]
 }

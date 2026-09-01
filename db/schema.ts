@@ -386,6 +386,8 @@ export const evaluationBenchmarkCases = sqliteTable("evaluation_benchmark_cases"
   hazard: text("hazard").notNull(),
   objective: text("objective").notNull().default("event_detection"),
   hazardSubtype: text("hazard_subtype"),
+  outcome: text("outcome").notNull().default("event"),
+  calibrationGroup: text("calibration_group"),
   occurredAt: text("occurred_at").notNull(),
   latitude: real("latitude").notNull(),
   longitude: real("longitude").notNull(),
@@ -417,3 +419,27 @@ export const evaluationRuns = sqliteTable("evaluation_runs", {
   createdBy: text("created_by").notNull(),
   createdAt: text("created_at").notNull(),
 }, (table) => [index("evaluation_runs_created_idx").on(table.createdAt)]);
+
+export const forecastRasterProducts = sqliteTable("forecast_raster_products", {
+  productId: text("product_id").primaryKey(),
+  sourceId: text("source_id").notNull(),
+  productTime: text("product_time").notNull(),
+  validFrom: text("valid_from").notNull(),
+  validTo: text("valid_to").notNull(),
+  sourceUrl: text("source_url").notNull(),
+  payloadSha256: text("payload_sha256").notNull(),
+  storageKey: text("storage_key").notNull(),
+  storageBackend: text("storage_backend").notNull(),
+  contentType: text("content_type").notNull(),
+  byteLength: integer("byte_length").notNull(),
+  sourceWidth: integer("source_width").notNull(),
+  sourceHeight: integer("source_height").notNull(),
+  groupPixels: integer("group_pixels").notNull(),
+  gridWidth: integer("grid_width").notNull(),
+  gridHeight: integer("grid_height").notNull(),
+  summaryJson: text("summary_json").notNull(),
+  archivedAt: text("archived_at").notNull(),
+}, (table) => [
+  uniqueIndex("forecast_raster_products_source_time_uidx").on(table.sourceId, table.productTime),
+  index("forecast_raster_products_time_idx").on(table.productTime, table.sourceId),
+]);

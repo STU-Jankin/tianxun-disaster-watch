@@ -32,6 +32,28 @@ test("persists benchmark cases and reads spatial-temporal replay candidates", as
     };
     await database.upsertEvaluationCase(benchmark);
     assert.equal((await database.listEvaluationCases())[0].caseId, benchmark.caseId);
+    await database.upsertForecastRasterProduct({
+      productId: "lhasa-20260901-0000",
+      sourceId: "nasa-lhasa",
+      productTime: "2026-09-01T00:00:00.000Z",
+      validFrom: "2026-09-01T00:00:00.000Z",
+      validTo: "2026-09-02T00:00:00.000Z",
+      sourceUrl: "https://example.test/lhasa.png",
+      payloadSha256: "a".repeat(64),
+      storageKey: "lhasa/2026/09/test.png",
+      storageBackend: "filesystem",
+      contentType: "image/png",
+      byteLength: 100,
+      sourceWidth: 360,
+      sourceHeight: 180,
+      groupPixels: 5,
+      gridWidth: 72,
+      gridHeight: 36,
+      summary: { cellCount: 2592, minimumRiskPercent: 0, maximumRiskPercent: 90, meanRiskPercent: 1, histogram: [2591, ...Array(89).fill(0), 1, ...Array(10).fill(0)], thresholdCellCounts: { "50": 1 } },
+      archivedAt: "2026-09-01T00:05:00.000Z",
+    });
+    assert.equal((await database.forecastRasterArchiveStatus()).productCount, 1);
+    assert.equal((await database.listForecastRasterProducts("2026-09-01T00:00:00.000Z", "2026-09-01T01:00:00.000Z"))[0].productId, "lhasa-20260901-0000");
     await database.persistIngestionArtifacts({
       refreshId: "refresh-evaluation-1",
       sources: [],

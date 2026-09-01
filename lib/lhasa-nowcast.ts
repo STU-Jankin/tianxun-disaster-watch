@@ -19,6 +19,15 @@ export type LhasaRiskCluster = {
   geometry: { type: "Polygon"; coordinates: number[][][] };
 };
 
+export type LhasaRiskRasterSummary = {
+  cellCount: number;
+  minimumRiskPercent: number;
+  maximumRiskPercent: number;
+  meanRiskPercent: number;
+  histogram: number[];
+  thresholdCellCounts: Record<string, number>;
+};
+
 const pngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
 const officialViewerUrl = "https://pmmpublisher.pps.eosdis.nasa.gov/precip-apps/";
 
@@ -88,6 +97,27 @@ export async function decodeLhasaRiskPng(input: ArrayBuffer | Uint8Array, groupP
   return { sourceWidth: width, sourceHeight: height, groupPixels, width: coarseWidth, height: coarseHeight, values };
 }
 
+export function coarsenLhasaRiskRaster(raster: LhasaCoarseRiskRaster, groupPixels: number): LhasaCoarseRiskRaster {
+  if (raster.groupPixels !== 1 || raster.width !== raster.sourceWidth || raster.height !== raster.sourceHeight || raster.values.length !== raster.sourceWidth * raster.sourceHeight) {
+    throw new Error("LHASA 风险栅格必须从原始分辨率开始聚合");
+  }
+  if (!Number.isInteger(groupPixels) || groupPixels < 1 || groupPixels > 50) throw new Error("LHASA 聚合像素参数无效");
+  if (groupPixels === 1) return raster;
+  const width = Math.ceil(raster.sourceWidth / groupPixels);
+  const height = Math.ceil(raster.sourceHeight / groupPixels);
+  const values = new Uint8Array(width * height);
+  for (let sourceY = 0; sourceY < raster.sourceHeight; sourceY += 1) {
+    const targetRow = Math.floor(sourceY / groupPixels) * width;
+    const sourceRow = sourceY * raster.sourceWidth;
+    for (let sourceX = 0; sourceX < raster.sourceWidth; sourceX += 1) {
+      const target = targetRow + Math.floor(sourceX / groupPixels);
+      const risk = raster.values[sourceRow + sourceX];
+      if (risk > values[target]) values[target] = risk;
+    }
+  }
+  return { sourceWidth: raster.sourceWidth, sourceHeight: raster.sourceHeight, groupPixels, width, height, values };
+}
+
 export function lhasaRiskClusters(raster: LhasaCoarseRiskRaster, thresholdPercent = 80, limit = 60): LhasaRiskCluster[] {
   const threshold = Math.max(50, Math.min(100, Math.round(thresholdPercent)));
   const maximum = Math.max(1, Math.min(100, Math.round(limit)));
@@ -142,6 +172,52 @@ export function lhasaRiskClusters(raster: LhasaCoarseRiskRaster, thresholdPercen
   return clusters
     .sort((left, right) => right.maximumRiskPercent - left.maximumRiskPercent || right.cellCount - left.cellCount || left.clusterId.localeCompare(right.clusterId))
     .slice(0, maximum);
+}
+
+/**
+ * Returns the decoded risk value at a geographic point. The raster follows the
+ * global north-to-south, west-to-east layout used by the official LHASA PNG.
+ * Keeping this operation independent from the alert threshold is essential for
+ * retrospective calibration: a 62% forecast must remain observable even when
+ * the operational map only surfaces regions at or above 80%.
+ */
+export function lhasaRiskAtLocation(raster: LhasaCoarseRiskRaster, latitude: number, longitude: number) {
+  if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) return null;
+  if (raster.values.length !== raster.width * raster.height || raster.width < 1 || raster.height < 1) return null;
+  const normalizedLongitude = longitude === 180 ? 180 - Number.EPSILON : longitude;
+  const normalizedLatitude = latitude === -90 ? -90 + Number.EPSILON : latitude;
+  const sourceX = Math.floor((normalizedLongitude + 180) / 360 * raster.sourceWidth);
+  const sourceY = Math.floor((90 - normalizedLatitude) / 180 * raster.sourceHeight);
+  const x = Math.max(0, Math.min(raster.width - 1, Math.floor(sourceX / raster.groupPixels)));
+  const y = Math.max(0, Math.min(raster.height - 1, Math.floor(sourceY / raster.groupPixels)));
+  return raster.values[y * raster.width + x];
+}
+
+export function summarizeLhasaRiskRaster(raster: LhasaCoarseRiskRaster): LhasaRiskRasterSummary {
+  if (raster.values.length !== raster.width * raster.height || !raster.values.length) throw new Error("LHASA 粗栅格结构无效");
+  const histogram = Array.from({ length: 101 }, () => 0);
+  let minimumRiskPercent = 100;
+  let maximumRiskPercent = 0;
+  let total = 0;
+  for (const value of raster.values) {
+    const risk = Math.max(0, Math.min(100, value));
+    histogram[risk] += 1;
+    minimumRiskPercent = Math.min(minimumRiskPercent, risk);
+    maximumRiskPercent = Math.max(maximumRiskPercent, risk);
+    total += risk;
+  }
+  const thresholdCellCounts: Record<string, number> = {};
+  for (let threshold = 50; threshold <= 100; threshold += 5) {
+    thresholdCellCounts[String(threshold)] = histogram.slice(threshold).reduce((sum, count) => sum + count, 0);
+  }
+  return {
+    cellCount: raster.values.length,
+    minimumRiskPercent,
+    maximumRiskPercent,
+    meanRiskPercent: Math.round(total / raster.values.length * 100) / 100,
+    histogram,
+    thresholdCellCounts,
+  };
 }
 
 export function lhasaCandidatesFromRaster(

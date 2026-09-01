@@ -532,14 +532,16 @@ test("separates landslide forecast verification from event detection metrics", a
   const center = await readFile(new URL("../app/evaluation-center.tsx", import.meta.url), "utf8");
   const evaluation = await readFile(new URL("../lib/evaluation-center.ts", import.meta.url), "utf8");
   const route = await readFile(new URL("../app/api/evaluation/route.ts", import.meta.url), "utf8");
-  const migration = await readFile(new URL("../drizzle/0011_landslide_forecast_evaluation.sql", import.meta.url), "utf8");
-  for (const text of ["滑坡预测命中率", "预测提前量中位数", "下载滑坡模板", "tianxun.landslide-benchmark/v1"]) assert.ok(center.includes(text));
+  const migration = await readFile(new URL("../drizzle/0012_forecast_raster_calibration.sql", import.meta.url), "utf8");
+  for (const text of ["滑坡预测命中率", "滑坡预测精确率", "Brier 分数", "下载滑坡模板", "tianxun.landslide-benchmark/v2", "无事件对照", "滑坡阈值校准"]) assert.ok(center.includes(text));
   assert.match(evaluation, /event\.validTo/);
   assert.match(evaluation, /geometryContainsPoint/);
-  assert.match(evaluation, /precisionAvailable: false/);
+  assert.match(evaluation, /forecastThresholdScores/);
+  assert.match(evaluation, /precisionAvailable: forecastEligible/);
   assert.match(route, /import_landslide_cases/);
   assert.match(route, /evaluationSourceSuccessTimes/);
-  assert.match(migration, /minimum_forecast_risk_percent/);
+  assert.match(migration, /forecast_raster_products/);
+  assert.match(migration, /calibration_group/);
 });
 
 test("adds on-demand hourly weather to event details and satellite tasks", async () => {

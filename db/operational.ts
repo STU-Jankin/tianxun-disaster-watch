@@ -19,6 +19,8 @@ import {
   type EvaluationCandidate,
   type EvaluationSourceReliability,
 } from "../lib/evaluation-center.ts";
+import type { ForecastRasterStorageBackend } from "../lib/forecast-raster-storage.ts";
+import type { LhasaRiskRasterSummary } from "../lib/lhasa-nowcast.ts";
 
 type TaskRecord = Record<string, unknown> & {
   taskId: string;
@@ -89,6 +91,27 @@ export type IngestionSnapshotRecord = {
   eventCount: number;
   sourceCount: number;
   payload: Record<string, unknown>;
+};
+
+export type ForecastRasterProductRecord = {
+  productId: string;
+  sourceId: string;
+  productTime: string;
+  validFrom: string;
+  validTo: string;
+  sourceUrl: string;
+  payloadSha256: string;
+  storageKey: string;
+  storageBackend: ForecastRasterStorageBackend;
+  contentType: string;
+  byteLength: number;
+  sourceWidth: number;
+  sourceHeight: number;
+  groupPixels: number;
+  gridWidth: number;
+  gridHeight: number;
+  summary: LhasaRiskRasterSummary;
+  archivedAt: string;
 };
 
 type EventExposureAssessmentRow = {
@@ -343,11 +366,14 @@ export function ensureOperationalSchema() {
     `CREATE TABLE IF NOT EXISTS aoi_work_package_history (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, package_id TEXT NOT NULL, revision INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, from_status TEXT, to_status TEXT NOT NULL, payload_json TEXT NOT NULL, changed_at TEXT NOT NULL)`,
     `CREATE UNIQUE INDEX IF NOT EXISTS aoi_work_package_history_revision_uidx ON aoi_work_package_history (package_id, revision)`,
     `CREATE INDEX IF NOT EXISTS aoi_work_package_history_time_idx ON aoi_work_package_history (package_id, changed_at)`,
-    `CREATE TABLE IF NOT EXISTS evaluation_benchmark_cases (case_id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, hazard TEXT NOT NULL, objective TEXT NOT NULL DEFAULT 'event_detection', hazard_subtype TEXT, occurred_at TEXT NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL, location_tolerance_km REAL NOT NULL, event_time_tolerance_hours REAL NOT NULL, accepted_lead_minutes INTEGER NOT NULL DEFAULT 0, detection_deadline_minutes INTEGER NOT NULL, expected_severity TEXT, required_source TEXT, minimum_forecast_risk_percent REAL, provenance_url TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '', verification_status TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS evaluation_benchmark_cases (case_id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, hazard TEXT NOT NULL, objective TEXT NOT NULL DEFAULT 'event_detection', hazard_subtype TEXT, outcome TEXT NOT NULL DEFAULT 'event', calibration_group TEXT, occurred_at TEXT NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL, location_tolerance_km REAL NOT NULL, event_time_tolerance_hours REAL NOT NULL, accepted_lead_minutes INTEGER NOT NULL DEFAULT 0, detection_deadline_minutes INTEGER NOT NULL, expected_severity TEXT, required_source TEXT, minimum_forecast_risk_percent REAL, provenance_url TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '', verification_status TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS evaluation_cases_hazard_time_idx ON evaluation_benchmark_cases (hazard, occurred_at)`,
     `CREATE INDEX IF NOT EXISTS evaluation_cases_verification_time_idx ON evaluation_benchmark_cases (verification_status, occurred_at)`,
     `CREATE TABLE IF NOT EXISTS evaluation_runs (run_id TEXT PRIMARY KEY NOT NULL, model_version TEXT NOT NULL, case_count INTEGER NOT NULL, eligible_count INTEGER NOT NULL, detected_count INTEGER NOT NULL, report_json TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS evaluation_runs_created_idx ON evaluation_runs (created_at)`,
+    `CREATE TABLE IF NOT EXISTS forecast_raster_products (product_id TEXT PRIMARY KEY NOT NULL, source_id TEXT NOT NULL, product_time TEXT NOT NULL, valid_from TEXT NOT NULL, valid_to TEXT NOT NULL, source_url TEXT NOT NULL, payload_sha256 TEXT NOT NULL, storage_key TEXT NOT NULL, storage_backend TEXT NOT NULL, content_type TEXT NOT NULL, byte_length INTEGER NOT NULL, source_width INTEGER NOT NULL, source_height INTEGER NOT NULL, group_pixels INTEGER NOT NULL, grid_width INTEGER NOT NULL, grid_height INTEGER NOT NULL, summary_json TEXT NOT NULL, archived_at TEXT NOT NULL)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS forecast_raster_products_source_time_uidx ON forecast_raster_products (source_id, product_time)`,
+    `CREATE INDEX IF NOT EXISTS forecast_raster_products_time_idx ON forecast_raster_products (product_time, source_id)`,
   ];
   schemaReady = database().then(async (db) => {
     await db.batch(statements.map((statement) => db.prepare(statement)));
@@ -365,6 +391,8 @@ export function ensureOperationalSchema() {
     if (!evaluationNames.has("objective")) evaluationMigrations.push(db.prepare(`ALTER TABLE evaluation_benchmark_cases ADD COLUMN objective TEXT NOT NULL DEFAULT 'event_detection'`));
     if (!evaluationNames.has("hazard_subtype")) evaluationMigrations.push(db.prepare(`ALTER TABLE evaluation_benchmark_cases ADD COLUMN hazard_subtype TEXT`));
     if (!evaluationNames.has("minimum_forecast_risk_percent")) evaluationMigrations.push(db.prepare(`ALTER TABLE evaluation_benchmark_cases ADD COLUMN minimum_forecast_risk_percent REAL`));
+    if (!evaluationNames.has("outcome")) evaluationMigrations.push(db.prepare(`ALTER TABLE evaluation_benchmark_cases ADD COLUMN outcome TEXT NOT NULL DEFAULT 'event'`));
+    if (!evaluationNames.has("calibration_group")) evaluationMigrations.push(db.prepare(`ALTER TABLE evaluation_benchmark_cases ADD COLUMN calibration_group TEXT`));
     if (evaluationMigrations.length) await db.batch(evaluationMigrations);
     const intentColumns = await db.prepare(`PRAGMA table_info(task_cancellation_intents)`).all<{ name: string }>();
     if (!intentColumns.results.some((column) => column.name === "owner")) await db.prepare(`ALTER TABLE task_cancellation_intents ADD COLUMN owner TEXT NOT NULL DEFAULT 'legacy'`).run();
@@ -554,10 +582,67 @@ export async function listIngestionSnapshots(limit = 24) {
   return rows.results;
 }
 
+export async function getForecastRasterProduct(productId: string): Promise<ForecastRasterProductRecord | null> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const row = await db.prepare(`${forecastRasterSelectSql} WHERE product_id=? LIMIT 1`).bind(productId).first<Record<string, unknown>>();
+  return row ? forecastRasterProductFromRow(row) : null;
+}
+
+export async function upsertForecastRasterProduct(product: ForecastRasterProductRecord) {
+  await ensureOperationalSchema();
+  const db = await database();
+  await db.prepare(`INSERT INTO forecast_raster_products (product_id, source_id, product_time, valid_from, valid_to, source_url, payload_sha256, storage_key, storage_backend, content_type, byte_length, source_width, source_height, group_pixels, grid_width, grid_height, summary_json, archived_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(product_id) DO UPDATE SET source_id=excluded.source_id, product_time=excluded.product_time, valid_from=excluded.valid_from, valid_to=excluded.valid_to, source_url=excluded.source_url, payload_sha256=excluded.payload_sha256, storage_key=excluded.storage_key, storage_backend=excluded.storage_backend, content_type=excluded.content_type, byte_length=excluded.byte_length, source_width=excluded.source_width, source_height=excluded.source_height, group_pixels=excluded.group_pixels, grid_width=excluded.grid_width, grid_height=excluded.grid_height, summary_json=excluded.summary_json, archived_at=excluded.archived_at`)
+    .bind(product.productId, product.sourceId, product.productTime, product.validFrom, product.validTo, product.sourceUrl, product.payloadSha256, product.storageKey, product.storageBackend, product.contentType, product.byteLength, product.sourceWidth, product.sourceHeight, product.groupPixels, product.gridWidth, product.gridHeight, JSON.stringify(product.summary), product.archivedAt).run();
+  return product;
+}
+
+export async function listForecastRasterProducts(from?: string, to?: string, limit = 1_500): Promise<ForecastRasterProductRecord[]> {
+  await ensureOperationalSchema();
+  const db = await database();
+  const boundedLimit = Math.max(1, Math.min(1_500, Math.round(limit)));
+  const rows = from && to
+    ? await db.prepare(`${forecastRasterSelectSql} WHERE product_time BETWEEN ? AND ? ORDER BY product_time, product_id LIMIT ?`).bind(from, to, boundedLimit).all<Record<string, unknown>>()
+    : await db.prepare(`${forecastRasterSelectSql} ORDER BY product_time DESC, product_id LIMIT ?`).bind(boundedLimit).all<Record<string, unknown>>();
+  return rows.results.map(forecastRasterProductFromRow).filter((item): item is ForecastRasterProductRecord => Boolean(item));
+}
+
+export async function forecastRasterArchiveStatus() {
+  await ensureOperationalSchema();
+  const db = await database();
+  const row = await db.prepare(`SELECT COUNT(*) AS productCount, MIN(product_time) AS firstProductAt, MAX(product_time) AS lastProductAt, SUM(byte_length) AS archivedBytes FROM forecast_raster_products`).first<Record<string, unknown>>();
+  return {
+    productCount: Number(row?.productCount ?? 0),
+    firstProductAt: row?.firstProductAt ? String(row.firstProductAt) : null,
+    lastProductAt: row?.lastProductAt ? String(row.lastProductAt) : null,
+    archivedBytes: Number(row?.archivedBytes ?? 0),
+  };
+}
+
+const forecastRasterSelectSql = `SELECT product_id AS productId, source_id AS sourceId, product_time AS productTime, valid_from AS validFrom, valid_to AS validTo, source_url AS sourceUrl, payload_sha256 AS payloadSha256, storage_key AS storageKey, storage_backend AS storageBackend, content_type AS contentType, byte_length AS byteLength, source_width AS sourceWidth, source_height AS sourceHeight, group_pixels AS groupPixels, grid_width AS gridWidth, grid_height AS gridHeight, summary_json AS summaryJson, archived_at AS archivedAt FROM forecast_raster_products`;
+
+function forecastRasterProductFromRow(row: Record<string, unknown>): ForecastRasterProductRecord | null {
+  try {
+    if (!row.productId || !row.sourceId || !row.productTime || !row.storageKey || !["r2", "filesystem"].includes(String(row.storageBackend))) return null;
+    const summary = JSON.parse(String(row.summaryJson)) as LhasaRiskRasterSummary;
+    if (!Array.isArray(summary.histogram) || summary.histogram.length !== 101) return null;
+    return {
+      productId: String(row.productId), sourceId: String(row.sourceId), productTime: String(row.productTime), validFrom: String(row.validFrom), validTo: String(row.validTo),
+      sourceUrl: String(row.sourceUrl), payloadSha256: String(row.payloadSha256), storageKey: String(row.storageKey), storageBackend: String(row.storageBackend) as ForecastRasterStorageBackend,
+      contentType: String(row.contentType), byteLength: Number(row.byteLength), sourceWidth: Number(row.sourceWidth), sourceHeight: Number(row.sourceHeight), groupPixels: Number(row.groupPixels),
+      gridWidth: Number(row.gridWidth), gridHeight: Number(row.gridHeight), summary, archivedAt: String(row.archivedAt),
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function listEvaluationCases(limit = 100): Promise<EvaluationBenchmarkCase[]> {
   await ensureOperationalSchema();
   const db = await database();
-  const rows = await db.prepare(`SELECT case_id AS caseId, title, hazard, objective, hazard_subtype AS hazardSubtype, occurred_at AS occurredAt, latitude, longitude, location_tolerance_km AS locationToleranceKm, event_time_tolerance_hours AS eventTimeToleranceHours, accepted_lead_minutes AS acceptedLeadMinutes, detection_deadline_minutes AS detectionDeadlineMinutes, expected_severity AS expectedSeverity, required_source AS requiredSource, minimum_forecast_risk_percent AS minimumForecastRiskPercent, provenance_url AS provenanceUrl, notes, verification_status AS verificationStatus, created_by AS createdBy, created_at AS createdAt, updated_at AS updatedAt FROM evaluation_benchmark_cases ORDER BY occurred_at DESC, case_id LIMIT ?`)
+  const rows = await db.prepare(`SELECT case_id AS caseId, title, hazard, objective, hazard_subtype AS hazardSubtype, outcome, calibration_group AS calibrationGroup, occurred_at AS occurredAt, latitude, longitude, location_tolerance_km AS locationToleranceKm, event_time_tolerance_hours AS eventTimeToleranceHours, accepted_lead_minutes AS acceptedLeadMinutes, detection_deadline_minutes AS detectionDeadlineMinutes, expected_severity AS expectedSeverity, required_source AS requiredSource, minimum_forecast_risk_percent AS minimumForecastRiskPercent, provenance_url AS provenanceUrl, notes, verification_status AS verificationStatus, created_by AS createdBy, created_at AS createdAt, updated_at AS updatedAt FROM evaluation_benchmark_cases ORDER BY occurred_at DESC, case_id LIMIT ?`)
     .bind(Math.max(1, Math.min(100, limit))).all<Record<string, unknown>>();
   return rows.results.map(evaluationCaseFromRow).filter((item): item is EvaluationBenchmarkCase => Boolean(item));
 }
@@ -565,10 +650,10 @@ export async function listEvaluationCases(limit = 100): Promise<EvaluationBenchm
 export async function upsertEvaluationCase(benchmark: EvaluationBenchmarkCase) {
   await ensureOperationalSchema();
   const db = await database();
-  await db.prepare(`INSERT INTO evaluation_benchmark_cases (case_id, title, hazard, objective, hazard_subtype, occurred_at, latitude, longitude, location_tolerance_km, event_time_tolerance_hours, accepted_lead_minutes, detection_deadline_minutes, expected_severity, required_source, minimum_forecast_risk_percent, provenance_url, notes, verification_status, created_by, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(case_id) DO UPDATE SET title=excluded.title, hazard=excluded.hazard, objective=excluded.objective, hazard_subtype=excluded.hazard_subtype, occurred_at=excluded.occurred_at, latitude=excluded.latitude, longitude=excluded.longitude, location_tolerance_km=excluded.location_tolerance_km, event_time_tolerance_hours=excluded.event_time_tolerance_hours, accepted_lead_minutes=excluded.accepted_lead_minutes, detection_deadline_minutes=excluded.detection_deadline_minutes, expected_severity=excluded.expected_severity, required_source=excluded.required_source, minimum_forecast_risk_percent=excluded.minimum_forecast_risk_percent, provenance_url=excluded.provenance_url, notes=excluded.notes, verification_status=excluded.verification_status, updated_at=excluded.updated_at`)
-    .bind(benchmark.caseId, benchmark.title, benchmark.hazard, benchmark.objective, benchmark.hazardSubtype ?? null, benchmark.occurredAt, benchmark.latitude, benchmark.longitude, benchmark.locationToleranceKm, benchmark.eventTimeToleranceHours, benchmark.acceptedLeadMinutes, benchmark.detectionDeadlineMinutes, benchmark.expectedSeverity ?? null, benchmark.requiredSource ?? null, benchmark.minimumForecastRiskPercent ?? null, benchmark.provenanceUrl, benchmark.notes, benchmark.verificationStatus, benchmark.createdBy, benchmark.createdAt, benchmark.updatedAt).run();
+  await db.prepare(`INSERT INTO evaluation_benchmark_cases (case_id, title, hazard, objective, hazard_subtype, outcome, calibration_group, occurred_at, latitude, longitude, location_tolerance_km, event_time_tolerance_hours, accepted_lead_minutes, detection_deadline_minutes, expected_severity, required_source, minimum_forecast_risk_percent, provenance_url, notes, verification_status, created_by, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(case_id) DO UPDATE SET title=excluded.title, hazard=excluded.hazard, objective=excluded.objective, hazard_subtype=excluded.hazard_subtype, outcome=excluded.outcome, calibration_group=excluded.calibration_group, occurred_at=excluded.occurred_at, latitude=excluded.latitude, longitude=excluded.longitude, location_tolerance_km=excluded.location_tolerance_km, event_time_tolerance_hours=excluded.event_time_tolerance_hours, accepted_lead_minutes=excluded.accepted_lead_minutes, detection_deadline_minutes=excluded.detection_deadline_minutes, expected_severity=excluded.expected_severity, required_source=excluded.required_source, minimum_forecast_risk_percent=excluded.minimum_forecast_risk_percent, provenance_url=excluded.provenance_url, notes=excluded.notes, verification_status=excluded.verification_status, updated_at=excluded.updated_at`)
+    .bind(benchmark.caseId, benchmark.title, benchmark.hazard, benchmark.objective, benchmark.hazardSubtype ?? null, benchmark.outcome === "no_event" ? "no_event" : "event", benchmark.calibrationGroup ?? null, benchmark.occurredAt, benchmark.latitude, benchmark.longitude, benchmark.locationToleranceKm, benchmark.eventTimeToleranceHours, benchmark.acceptedLeadMinutes, benchmark.detectionDeadlineMinutes, benchmark.expectedSeverity ?? null, benchmark.requiredSource ?? null, benchmark.minimumForecastRiskPercent ?? null, benchmark.provenanceUrl, benchmark.notes, benchmark.verificationStatus, benchmark.createdBy, benchmark.createdAt, benchmark.updatedAt).run();
   return benchmark;
 }
 
@@ -687,6 +772,8 @@ function evaluationCaseFromRow(row: Record<string, unknown>): EvaluationBenchmar
     caseId: String(row.caseId), title: String(row.title), hazard: String(row.hazard) as EvaluationBenchmarkCase["hazard"],
     objective: row.objective === "landslide_forecast" ? "landslide_forecast" : "event_detection",
     hazardSubtype: row.hazardSubtype ? String(row.hazardSubtype) as EvaluationBenchmarkCase["hazardSubtype"] : undefined,
+    outcome: row.outcome === "no_event" ? "no_event" : "event",
+    calibrationGroup: row.calibrationGroup ? String(row.calibrationGroup) : undefined,
     occurredAt: String(row.occurredAt),
     latitude: Number(row.latitude), longitude: Number(row.longitude), locationToleranceKm: Number(row.locationToleranceKm), eventTimeToleranceHours: Number(row.eventTimeToleranceHours),
     acceptedLeadMinutes: Number(row.acceptedLeadMinutes), detectionDeadlineMinutes: Number(row.detectionDeadlineMinutes),

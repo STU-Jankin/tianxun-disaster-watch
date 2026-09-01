@@ -7,19 +7,27 @@ async function lhasa() {
 }
 
 test("decodes the official 8-bit grayscale layout and creates review-only high-risk clusters", async () => {
-  const { decodeLhasaRiskPng, lhasaCandidatesFromRaster, lhasaRiskClusters } = await lhasa();
+  const { coarsenLhasaRiskRaster, decodeLhasaRiskPng, lhasaCandidatesFromRaster, lhasaRiskAtLocation, lhasaRiskClusters, summarizeLhasaRiskRaster } = await lhasa();
   const width = 360;
   const height = 180;
   const pixels = new Uint8Array(width * height);
   for (let y = 80; y < 85; y += 1) for (let x = 200; x < 205; x += 1) pixels[y * width + x] = 245;
   pixels[20 * width + 20] = 201;
-  const raster = await decodeLhasaRiskPng(grayPng(width, height, pixels), 5);
+  const fullResolutionRaster = await decodeLhasaRiskPng(grayPng(width, height, pixels), 1);
+  const raster = coarsenLhasaRiskRaster(fullResolutionRaster, 5);
   assert.equal(raster.width, 72);
   assert.equal(raster.height, 36);
   const clusters = lhasaRiskClusters(raster);
   assert.equal(clusters.length, 1);
   assert.equal(clusters[0].maximumRiskPercent, 96);
   assert.equal(clusters[0].geometry.type, "Polygon");
+  assert.equal(lhasaRiskAtLocation(raster, 7.5, 22.5), 96);
+  assert.equal(lhasaRiskAtLocation(raster, 89, -179), 0);
+  const summary = summarizeLhasaRiskRaster(raster);
+  assert.equal(summary.cellCount, 72 * 36);
+  assert.equal(summary.maximumRiskPercent, 96);
+  assert.equal(summary.histogram.reduce((total, count) => total + count, 0), summary.cellCount);
+  assert.equal(summarizeLhasaRiskRaster(fullResolutionRaster).cellCount, width * height);
   const productTime = "2026-08-26T00:00:00.000Z";
   const candidates = lhasaCandidatesFromRaster(raster, productTime, "https://example.test/lhasa.png", Date.parse("2026-08-26T06:00:00Z"));
   assert.equal(candidates.length, 1);

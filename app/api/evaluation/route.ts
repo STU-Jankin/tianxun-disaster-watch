@@ -3,15 +3,19 @@ import {
   evaluationSnapshotTimes,
   evaluationSourceReliability,
   evaluationSourceSuccessTimes,
+  forecastRasterArchiveStatus,
   listEvaluationCandidates,
   listEvaluationCases,
   listEvaluationRuns,
+  listForecastRasterProducts,
   persistEvaluationRun,
   upsertEvaluationCase,
 } from "../../../db/operational";
 import { apiActor, ApiInputError, authorizeApiRequest, enforceRateLimit, readJsonObject, rejectCrossOriginBrowserWrite } from "../../../lib/api-security";
 import { evaluateDetectionBenchmarks, evaluationCoverageGapMinutes, evaluationWindow, type EvaluationBenchmarkCase, type EvaluationObjective } from "../../../lib/evaluation-center";
 import type { HazardSubtype, HazardType } from "../../../lib/disasters";
+import { decodeLhasaRiskPng, lhasaRiskAtLocation } from "../../../lib/lhasa-nowcast";
+import { readForecastRasterObject } from "../../../lib/forecast-raster-storage";
 
 export const dynamic = "force-dynamic";
 
@@ -23,8 +27,8 @@ const landslideSubtypes = new Set<HazardSubtype>(["landslide", "debris_flow", "r
 export async function GET(request: Request) {
   const unauthorized = await authorizeApiRequest(request, "viewer");
   if (unauthorized) return unauthorized;
-  const [cases, runs] = await Promise.all([listEvaluationCases(), listEvaluationRuns(10)]);
-  return Response.json({ cases, runs, latest: runs[0] ?? null }, { headers: privateHeaders() });
+  const [cases, runs, forecastArchive] = await Promise.all([listEvaluationCases(), listEvaluationRuns(10), forecastRasterArchiveStatus()]);
+  return Response.json({ cases, runs, latest: runs[0] ?? null, forecastArchive }, { headers: privateHeaders() });
 }
 
 export async function POST(request: Request) {
@@ -44,7 +48,7 @@ export async function POST(request: Request) {
       return Response.json({ case: benchmark }, { headers: privateHeaders() });
     }
     if (action === "import_landslide_cases") {
-      if (body.schema !== "tianxun.landslide-benchmark/v1" || !Array.isArray(body.cases) || !body.cases.length || body.cases.length > 25) {
+      if (!new Set(["tianxun.landslide-benchmark/v1", "tianxun.landslide-benchmark/v2"]).has(String(body.schema)) || !Array.isArray(body.cases) || !body.cases.length || body.cases.length > 25) {
         throw new ApiInputError("滑坡样本文件格式无效，单次最多导入 25 条", 400);
       }
       const actor = await apiActor(request);
@@ -67,7 +71,11 @@ export async function POST(request: Request) {
         : Response.json({ error: "评测样本不存在" }, { status: 404, headers: privateHeaders() });
     }
     if (action === "run") {
-      const cases = await listEvaluationCases();
+      const historyDays = body.historyDays === null || body.historyDays === undefined ? null : integer(body.historyDays, "回放天数", 30, 365);
+      if (historyDays !== null && ![30, 90, 365].includes(historyDays)) throw new ApiInputError("回放范围仅支持30、90或365天", 400);
+      const allCases = await listEvaluationCases();
+      const replayFrom = historyDays === null ? Number.NEGATIVE_INFINITY : Date.now() - historyDays * 86_400_000;
+      const cases = allCases.filter((item) => Date.parse(item.occurredAt) >= replayFrom);
       if (!cases.length) throw new ApiInputError("请先录入至少一个权威核验样本", 400);
       const computedAt = new Date().toISOString();
       const windows = cases.map(evaluationWindow);
@@ -86,6 +94,43 @@ export async function POST(request: Request) {
         evaluationSnapshotTimes(from, to),
         evaluationSourceReliability(from, to),
       ]);
+      const forecastCases = cases.filter((benchmark) => benchmark.objective === "landslide_forecast" && benchmark.verificationStatus === "verified");
+      const forecastProducts = forecastCases.length ? await listForecastRasterProducts(from, to, 1_500) : [];
+      const forecastObservationsByCase: Record<string, Array<{ productId: string; capturedAt: string; validFrom: string; validTo: string; riskPercent: number }>> = {};
+      let forecastArchiveUnreadableCount = 0;
+      if (forecastProducts.length) {
+        for (const benchmark of forecastCases) forecastObservationsByCase[benchmark.caseId] = [];
+        for (const product of forecastProducts) {
+          const relevantCases = forecastCases.filter((benchmark) => {
+            const window = evaluationWindow(benchmark);
+            return Date.parse(product.archivedAt) >= Date.parse(window.startAt)
+              && Date.parse(product.archivedAt) <= Date.parse(window.expectedBy)
+              && Date.parse(product.validFrom) <= Date.parse(benchmark.occurredAt)
+              && Date.parse(product.validTo) >= Date.parse(benchmark.occurredAt);
+          });
+          if (!relevantCases.length) continue;
+          try {
+            const bytes = await readForecastRasterObject(product.storageKey, product.storageBackend);
+            if (!bytes) { forecastArchiveUnreadableCount += 1; continue; }
+            const raster = await decodeLhasaRiskPng(bytes, product.groupPixels);
+            if (raster.sourceWidth !== product.sourceWidth || raster.sourceHeight !== product.sourceHeight) { forecastArchiveUnreadableCount += 1; continue; }
+            for (const benchmark of relevantCases) {
+              const riskPercent = lhasaRiskAtLocation(raster, benchmark.latitude, benchmark.longitude);
+              if (riskPercent === null) continue;
+              forecastObservationsByCase[benchmark.caseId].push({
+                productId: product.productId,
+                capturedAt: product.archivedAt,
+                validFrom: product.validFrom,
+                validTo: product.validTo,
+                riskPercent,
+              });
+            }
+          } catch (error) {
+            forecastArchiveUnreadableCount += 1;
+            console.error(`forecast archive ${product.productId} could not be replayed`, error);
+          }
+        }
+      }
       const report = evaluateDetectionBenchmarks({
         runId: `evaluation-${crypto.randomUUID()}`,
         computedAt,
@@ -93,6 +138,10 @@ export async function POST(request: Request) {
         candidatesByCase,
         snapshotTimes,
         sourceSuccessTimesByCase,
+        forecastObservationsByCase: forecastProducts.length ? forecastObservationsByCase : undefined,
+        forecastArchiveProductCount: forecastProducts.length,
+        forecastArchiveUnreadableCount,
+        historyDays,
         sourceReliability,
       });
       await persistEvaluationRun(report, await apiActor(request));
@@ -120,6 +169,8 @@ function benchmarkFromInput(value: unknown, actor: string): EvaluationBenchmarkC
   const objective = (optionalText(input.objective, 40) ?? "event_detection") as EvaluationObjective;
   if (!objectives.has(objective)) throw new ApiInputError("评测目标无效", 400);
   if (objective === "landslide_forecast" && hazard !== "landslide") throw new ApiInputError("事前预测评测目前仅支持滑坡和泥石流", 400);
+  const outcome = input.outcome === "no_event" ? "no_event" : "event";
+  if (objective !== "landslide_forecast" && outcome === "no_event") throw new ApiInputError("无事件对照目前仅用于滑坡/泥石流事前预测校准", 400);
   const hazardSubtypeText = optionalText(input.hazardSubtype, 40);
   if (hazardSubtypeText && !landslideSubtypes.has(hazardSubtypeText as HazardSubtype)) throw new ApiInputError("滑坡灾害子类型无效", 400);
   const occurredAt = isoDate(input.occurredAt, "发生时间");
@@ -133,14 +184,18 @@ function benchmarkFromInput(value: unknown, actor: string): EvaluationBenchmarkC
   const detectionDeadlineMinutes = integer(input.detectionDeadlineMinutes, objective === "landslide_forecast" ? "最小有效提前量" : "检测时限", objective === "landslide_forecast" ? 0 : 1, 10_080);
   if (objective === "landslide_forecast" && acceptedLeadMinutes <= detectionDeadlineMinutes) throw new ApiInputError("最大预测提前量必须大于最小有效提前量", 400);
   const minimumForecastRiskPercent = objective === "landslide_forecast"
-    ? finiteNumber(input.minimumForecastRiskPercent ?? 80, "最低预测风险值", 80, 100)
+    ? finiteNumber(input.minimumForecastRiskPercent ?? 80, "最低预测风险值", 50, 100)
     : undefined;
+  const notes = optionalText(input.notes, 500) ?? "";
+  if (outcome === "no_event" && verificationStatus === "verified" && notes.length < 10) throw new ApiInputError("已核验无事件对照必须在备注中说明核验目录和时间范围", 400);
   return {
     caseId,
     title,
     hazard,
     objective,
     hazardSubtype: hazardSubtypeText as HazardSubtype | undefined,
+    outcome,
+    calibrationGroup: objective === "landslide_forecast" ? optionalText(input.calibrationGroup, 80) : undefined,
     occurredAt,
     latitude: finiteNumber(input.latitude, "纬度", -90, 90),
     longitude: finiteNumber(input.longitude, "经度", -180, 180),
@@ -152,7 +207,7 @@ function benchmarkFromInput(value: unknown, actor: string): EvaluationBenchmarkC
     requiredSource: objective === "landslide_forecast" ? optionalText(input.requiredSource, 120) ?? "NASA LHASA" : optionalText(input.requiredSource, 120),
     minimumForecastRiskPercent,
     provenanceUrl,
-    notes: optionalText(input.notes, 500) ?? "",
+    notes,
     verificationStatus,
     createdBy: actor,
     createdAt: now,

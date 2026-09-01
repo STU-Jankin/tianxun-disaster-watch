@@ -165,3 +165,59 @@ test("does not call a landslide forecast miss when the required source was unava
   assert.equal(report.results[0].status, "insufficient_history");
   assert.equal(report.metrics.forecastEligibleCases, 0);
 });
+
+test("calibrates landslide thresholds only after positive and negative controls are both available", () => {
+  const occurredAt = "2026-09-01T12:00:00.000Z";
+  const cases = [
+    ...Array.from({ length: 5 }, (_, index) => forecastBenchmark({ caseId: `benchmark-positive-${index}`, outcome: "event", occurredAt, latitude: 29 + index * 0.01 })),
+    ...Array.from({ length: 5 }, (_, index) => forecastBenchmark({ caseId: `benchmark-negative-${index}`, outcome: "no_event", occurredAt, latitude: 30 + index * 0.01 })),
+  ];
+  const forecastObservationsByCase = Object.fromEntries(cases.map((benchmark) => [benchmark.caseId, [{
+    productId: "lhasa-20260831-0000",
+    capturedAt: "2026-08-31T12:00:00.000Z",
+    validFrom: "2026-08-31T12:00:00.000Z",
+    validTo: occurredAt,
+    riskPercent: benchmark.outcome === "event" ? 85 : 30,
+  }]]));
+  const report = evaluateDetectionBenchmarks({
+    runId: "evaluation-run-calibration",
+    computedAt: "2026-09-01T13:00:00.000Z",
+    cases,
+    candidatesByCase: {},
+    snapshotTimes: [],
+    forecastObservationsByCase,
+    forecastArchiveProductCount: 1,
+    historyDays: 30,
+  });
+  assert.equal(report.metrics.forecastHitRatePercent, 100);
+  assert.equal(report.metrics.forecastPrecisionPercent, 100);
+  assert.equal(report.metrics.forecastFalseAlarmRatePercent, 0);
+  assert.equal(report.metrics.precisionAvailable, true);
+  assert.equal(report.forecastCalibration.recommendationStatus, "ready");
+  assert.equal(report.forecastCalibration.recommendedThresholdPercent, 85);
+  assert.equal(report.forecastCalibration.groups[0].calibrationGroup, "未分组");
+  assert.equal(report.forecastCalibration.groups[0].recommendedThresholdPercent, 85);
+  assert.equal(report.results.filter((result) => result.status === "correct_rejection").length, 5);
+});
+
+test("marks an archived high-risk prediction in a verified no-event window as a false alarm", () => {
+  const control = forecastBenchmark({ caseId: "benchmark-negative-control", outcome: "no_event" });
+  const report = evaluateDetectionBenchmarks({
+    runId: "evaluation-run-false-alarm",
+    computedAt: "2026-09-01T13:00:00.000Z",
+    cases: [control],
+    candidatesByCase: {},
+    snapshotTimes: [],
+    forecastObservationsByCase: { [control.caseId]: [{
+      productId: "lhasa-high-risk",
+      capturedAt: "2026-08-31T14:00:00.000Z",
+      validFrom: "2026-08-31T12:00:00.000Z",
+      validTo: control.occurredAt,
+      riskPercent: 91,
+    }] },
+    forecastArchiveProductCount: 1,
+  });
+  assert.equal(report.results[0].status, "false_alarm");
+  assert.equal(report.metrics.forecastFalseAlarmRatePercent, 100);
+  assert.equal(report.metrics.forecastHits, 0);
+});

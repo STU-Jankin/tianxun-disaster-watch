@@ -14,7 +14,7 @@ import {
 import { normalizeAntimeridianGeometry, validateGeoGeometry } from "../../../lib/geo-geometry";
 import { latestByKey } from "../../../lib/latest-by-key";
 import { applyEventSourcePresence } from "../../../lib/event-presence";
-import { listRetainedCanonicalEvents, persistCanonicalEvents, persistIngestionArtifacts, resolveCanonicalEventsByReferences, type SourceFetchCapture } from "../../../db/operational";
+import { getForecastRasterProduct, listRetainedCanonicalEvents, persistCanonicalEvents, persistIngestionArtifacts, resolveCanonicalEventsByReferences, upsertForecastRasterProduct, type SourceFetchCapture } from "../../../db/operational";
 import { circularGeometryCenter, cycloneSeverityFromKnots, firmsConfidenceScore, firmsHeatSeverity, latestTrackPoint } from "../../../lib/source-normalization";
 import { authorizeApiRequest } from "../../../lib/api-security";
 import { buildHourlyCycloneImpactField, buildJmaCycloneForecast, extractKmlFromKmz, parseNhcConeKml, parseNhcTrackKml, parseNhcWindRadiiKml } from "../../../lib/cyclone-forecast";
@@ -45,7 +45,8 @@ import {
   parseUsgsGroundFailureDetails,
 } from "../../../lib/landslide-sources";
 import { parseMemGeohazardBulletin, parseMemGeohazardListing } from "../../../lib/china-geohazard-sources";
-import { decodeLhasaRiskPng, lhasaCandidatesFromRaster } from "../../../lib/lhasa-nowcast";
+import { coarsenLhasaRiskRaster, decodeLhasaRiskPng, lhasaCandidatesFromRaster, summarizeLhasaRiskRaster } from "../../../lib/lhasa-nowcast";
+import { storeForecastRasterObject } from "../../../lib/forecast-raster-storage";
 import { amapConfiguration, buildAmapGeocodeUrl, parseAmapGeocodes, type RoutingCoordinate } from "../../../lib/amap-routing";
 import { assessImpactRisk } from "../../../lib/impact-risk";
 import { sanitizeSnapshotUrl, sourceGovernance, sourceIdForName, sourceNameForUrl, type SourceGovernance, type SourceRole, type SourceTier } from "../../../lib/source-governance";
@@ -640,16 +641,18 @@ async function fetchKmzKml(url: string) {
 }
 
 async function recordBinarySourceFetch(url: string, response: Response, body: ArrayBuffer, startedAt: number, explicitSourceName?: string) {
-  if (!activeRefreshId) return;
+  const payloadSha256 = await sha256Bytes(body);
+  if (!activeRefreshId) return payloadSha256;
   const sourceName = sourceNameForUrl(url, explicitSourceName);
   const bodyText = "[二进制响应仅保存摘要；请按来源和抓取时刻获取原始文件]";
   sourceFetchCaptureBuffer.push({
     runId: crypto.randomUUID(), refreshId: activeRefreshId, sourceId: sourceIdForName(sourceName),
     requestedUrl: sanitizeSnapshotUrl(url), fetchedAt: new Date().toISOString(), durationMs: Math.max(0, Date.now() - startedAt),
-    httpStatus: response.status, ok: response.ok, payloadSha256: await sha256Bytes(body),
+    httpStatus: response.status, ok: response.ok, payloadSha256,
     contentType: response.headers.get("content-type") ?? "application/octet-stream", bodyText, byteLength: body.byteLength,
     storedByteLength: new TextEncoder().encode(bodyText).byteLength, truncated: true, errorMessage: null,
   });
+  return payloadSha256;
 }
 
 async function readLimitedBytes(response: Response, maximumBytes: number, label: string) {
@@ -1653,8 +1656,46 @@ async function fetchLhasa(): Promise<DisasterEvent[]> {
       return [];
     }
     const image = await readLimitedBytes(response, 2_000_000, "LHASA PNG");
-    await recordBinarySourceFetch(imageUrl, response, image, startedAt, "NASA LHASA");
-    const raster = await decodeLhasaRiskPng(image, 5);
+    const payloadSha256 = await recordBinarySourceFetch(imageUrl, response, image, startedAt, "NASA LHASA");
+    const fullResolutionRaster = await decodeLhasaRiskPng(image, 1);
+    const raster = coarsenLhasaRiskRaster(fullResolutionRaster, 5);
+    const productId = `lhasa-${date}-0000`;
+    try {
+      const existing = await getForecastRasterProduct(productId);
+      if (!existing || existing.payloadSha256 !== payloadSha256) {
+        const storageKey = `lhasa/${date.slice(0, 4)}/${date.slice(4, 6)}/global_landslide_nowcast_${date}.0000_float-${payloadSha256.slice(0, 12)}.png`;
+        const storageBackend = await storeForecastRasterObject({
+          storageKey,
+          bytes: image,
+          contentType: "image/png",
+          metadata: { source: "NASA LHASA", productTime, payloadSha256 },
+        });
+        await upsertForecastRasterProduct({
+          productId,
+          sourceId: sourceIdForName("NASA LHASA"),
+          productTime,
+          validFrom: productTime,
+          validTo: new Date(Date.parse(productTime) + 24 * 3_600_000).toISOString(),
+          sourceUrl: imageUrl,
+          payloadSha256,
+          storageKey,
+          storageBackend,
+          contentType: "image/png",
+          byteLength: image.byteLength,
+          sourceWidth: fullResolutionRaster.sourceWidth,
+          sourceHeight: fullResolutionRaster.sourceHeight,
+          groupPixels: fullResolutionRaster.groupPixels,
+          gridWidth: fullResolutionRaster.width,
+          gridHeight: fullResolutionRaster.height,
+          summary: summarizeLhasaRiskRaster(fullResolutionRaster),
+          archivedAt: new Date().toISOString(),
+        });
+      }
+    } catch (error) {
+      // Archival quality is reported separately. A temporary storage problem
+      // must not suppress the current high-risk event feed.
+      console.error("LHASA complete probability archive failed", error);
+    }
     return lhasaCandidatesFromRaster(raster, productTime, imageUrl).map((candidate) => publicCandidateEvent(candidate, "NASA LHASA", "lhasa"));
   }
   throw new Error("LHASA 最近5天没有可识别的官方批次 PNG");
