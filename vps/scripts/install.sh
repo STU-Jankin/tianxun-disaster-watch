@@ -46,6 +46,7 @@ done
 
 install -d -o root -g root -m 0755 /var/lib/tianxun
 install -d -o tianxun-engine -g tianxun-engine -m 0750 /var/lib/tianxun/engine
+install -d -o tianxun-engine -g tianxun-engine -m 0750 /var/lib/tianxun/engine/forecast-archive
 install -d -o tianxun-notifier -g tianxun-notifier -m 0750 /var/lib/tianxun/notifier
 install -d -o root -g root -m 0755 "$install_root/releases" "$release_dir"
 # Copy an explicit release allow-list. This prevents local .env files, VCS
@@ -114,6 +115,12 @@ if [[ ! -f /etc/tianxun/notifier.env ]]; then
 fi
 if [[ ! -f /etc/tianxun/backup.env ]]; then
   install -o root -g root -m 0600 "$release_dir/vps/backup.env.example" /etc/tianxun/backup.env
+fi
+forecast_archive_dir="/var/lib/tianxun/engine/forecast-archive"
+if grep -q '^TIANXUN_FORECAST_ARCHIVE_DIR=' /etc/tianxun/engine.env; then
+  sed -i -E "s|^TIANXUN_FORECAST_ARCHIVE_DIR=.*$|TIANXUN_FORECAST_ARCHIVE_DIR=$forecast_archive_dir|" /etc/tianxun/engine.env
+else
+  printf '%s=%s\n' 'TIANXUN_FORECAST_ARCHIVE_DIR' "$forecast_archive_dir" >> /etc/tianxun/engine.env
 fi
 engine_token="$(sed -n 's/^TIANXUN_API_TOKEN=//p' /etc/tianxun/engine.env | head -n1)"
 if [[ ! "$engine_token" =~ ^[a-fA-F0-9]{64}$ ]]; then
