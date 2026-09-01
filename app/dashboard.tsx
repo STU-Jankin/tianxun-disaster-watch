@@ -209,6 +209,10 @@ type SatelliteTask = {
   opportunityEnd?: string;
   opportunityReachableNearKm?: number;
   opportunityReachableFarKm?: number;
+  opportunitySceneNearEdgeKm?: number;
+  opportunitySceneFarEdgeKm?: number;
+  opportunityFootprintRangeMarginKm?: number;
+  opportunityIncidenceConstraintSemantics?: "full_scene_edge_hard_limit_assumed";
   opportunityReachableLookSides?: Array<"left" | "right">;
   sensorParameterStatus?: "user_provided" | "provisional_assumption";
   opportunityFootprint?: GeoGeometry;
@@ -251,8 +255,12 @@ type VisibilityWindow = {
   footprintGeometry?: GeoGeometry;
   reachableNearKm?: number;
   reachableFarKm?: number;
+  sceneNearEdgeKm?: number;
+  sceneFarEdgeKm?: number;
+  footprintRangeMarginKm?: number;
   reachableLookSides?: Array<"left" | "right">;
   reachableBasis?: "tle_sgp4_incidence_envelope";
+  incidenceConstraintSemantics?: "full_scene_edge_hard_limit_assumed";
   orbitDirection?: "ascending" | "descending";
   simulationLevel?: "orbit_only" | "assumed_sensor" | "sensor_model";
   satelliteLabel?: string;
@@ -818,6 +826,8 @@ export function Dashboard({ currentUser, onLogout, logoutBusy = false }: { curre
       opportunityLookSide: undefined, opportunityCoveragePercent: undefined, opportunitySpatialResolutionM: undefined,
       opportunitySceneCrossTrackKm: undefined, opportunitySceneAlongTrackKm: undefined, opportunityStart: undefined, opportunityEnd: undefined,
       opportunityReachableNearKm: undefined, opportunityReachableFarKm: undefined, opportunityReachableLookSides: undefined,
+      opportunitySceneNearEdgeKm: undefined, opportunitySceneFarEdgeKm: undefined, opportunityFootprintRangeMarginKm: undefined,
+      opportunityIncidenceConstraintSemantics: undefined,
       sensorParameterStatus: undefined, opportunityFootprint: undefined,
       simulationLevel: undefined, satelliteNoradId: undefined, closestApproachAt: undefined,
       closestSubpointLatitude: undefined, closestSubpointLongitude: undefined, minimumGroundTrackDistanceKm: undefined,
@@ -1954,14 +1964,14 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
         });
         if (corridor) {
           const corridorLayer = L.geoJSON(unwrapForecastGeometry(corridor.geometry as DisasterEvent["geometry"], targetLongitude) as GeoJSON.GeoJsonObject, { style: { color: "#008eaa", weight: 2, fillColor: "#20bed1", fillOpacity: 0.07, dashArray: "4 4", className: "reachable-imaging-corridor" } }).addTo(layer);
-          corridorLayer.bindTooltip(`计划成像段可达包络 · 入射角 ${Math.max(profileMinimum, activeTask.incidenceAngleMinDeg)}–${Math.min(profileMaximum, activeTask.incidenceAngleMaxDeg)}° · 横轨地距约 ${corridor.nearGroundRangeKm}–${corridor.farGroundRangeKm} km · ${corridor.lookSides.map((side) => side === "left" ? "左视" : "右视").join("/")} · TLE/SGP4 试算`, { sticky: true });
+          corridorLayer.bindTooltip(`计划成像段入射角硬边界 · ${Math.max(profileMinimum, activeTask.incidenceAngleMinDeg)}–${Math.min(profileMaximum, activeTask.incidenceAngleMaxDeg)}° · 横轨地距约 ${corridor.nearGroundRangeKm}–${corridor.farGroundRangeKm} km · ${corridor.lookSides.map((side) => side === "left" ? "左视" : "右视").join("/")} · 蓝色整景不得越过此边界`, { sticky: true });
         }
       }
       const aoiBounds = aoiLayerRef.current?.getBounds();
-      const plannedFootprint = previewWindow?.footprintGeometry ?? activeTask.opportunityFootprint;
+      const plannedFootprint = previewWindow?.footprintGeometry ?? (activeTask.opportunityIncidenceConstraintSemantics === "full_scene_edge_hard_limit_assumed" ? activeTask.opportunityFootprint : undefined);
       if (simulationLevel !== "orbit_only" && plannedFootprint) {
         const footprintLayer = L.geoJSON(unwrapForecastGeometry(plannedFootprint as DisasterEvent["geometry"], targetLongitude) as GeoJSON.GeoJsonObject, { style: { color: "#006dc7", weight: 3, fillColor: "#2c8ee0", fillOpacity: 0.2, dashArray: "7 4", className: "selected-opportunity-footprint" } }).addTo(layer);
-        footprintLayer.bindTooltip(`${previewWindow?.imagingMode ?? activeTask.imagingMode ?? "成像模式"} · 计划/标称成像足迹 ${previewWindow?.nominalSceneCrossTrackKm ?? activeTask.opportunitySceneCrossTrackKm ?? "--"}×${previewWindow?.nominalSceneAlongTrackKm ?? activeTask.opportunitySceneAlongTrackKm ?? "--"} km · 预计覆盖 ${previewWindow?.coveragePercent ?? activeTask.opportunityCoveragePercent ?? "--"}%（不是实拍回执）`, { sticky: true });
+        footprintLayer.bindTooltip(`${previewWindow?.imagingMode ?? activeTask.imagingMode ?? "成像模式"} · 计划/标称成像足迹 ${previewWindow?.nominalSceneCrossTrackKm ?? activeTask.opportunitySceneCrossTrackKm ?? "--"}×${previewWindow?.nominalSceneAlongTrackKm ?? activeTask.opportunitySceneAlongTrackKm ?? "--"} km · ${previewWindow?.footprintRangeMarginKm == null ? "已按整景硬边界筛选" : `最小边界余量 ${previewWindow.footprintRangeMarginKm} km`} · 预计覆盖 ${previewWindow?.coveragePercent ?? activeTask.opportunityCoveragePercent ?? "--"}%（不是实拍回执）`, { sticky: true });
       }
       if (aoiBounds?.isValid()) L.rectangle(aoiBounds, { opacity: 0, fillOpacity: 0, interactive: false }).addTo(layer);
       const passBounds = layer.getBounds();
@@ -2001,7 +2011,7 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
         });
         if (instantaneousSlice) {
           const sliceLayer = L.geoJSON(unwrapForecastGeometry(instantaneousSlice.geometry as DisasterEvent["geometry"], targetLongitude) as GeoJSON.GeoJsonObject, { style: { color: "#00a5c5", weight: 3, fillColor: "#34d6e5", fillOpacity: 0.24, className: "instantaneous-reachable-slice" } }).addTo(layer);
-          sliceLayer.bindTooltip(`当前时刻可达横带 · ${formatTimeWithSeconds(imagingPreviewAt)} UTC+08 · 仅为 ${instantaneousSlice.displaySpanSeconds} 秒显示切片，不是波束方向图`, { sticky: true });
+          sliceLayer.bindTooltip(`当前时刻入射角硬边界切片 · ${formatTimeWithSeconds(imagingPreviewAt)} UTC+08 · 仅为 ${instantaneousSlice.displaySpanSeconds} 秒显示切片，不是波束方向图`, { sticky: true });
         }
         if (imagingWithinCapture) {
           const lookLine = L.polyline([[position.latitude, displaySubpointLongitude], [targetLatitude, targetLongitude]], { color: "#ef8b22", weight: 3, opacity: 0.9, dashArray: "5 4", interactive: true, className: "active-imaging-look-line" });
@@ -2197,8 +2207,8 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
       </div>
       <div className="imaging-pass-labels"><span>−5 分钟</span><span>最近过境</span><span>+5 分钟</span></div>
       <div className="imaging-capture-detail"><span>计划成像</span><time>{formatTimeWithSeconds(new Date(opportunityInterval.start).toISOString())}—{formatTimeWithSeconds(new Date(opportunityInterval.end).toISOString())}</time><b>{captureDurationSeconds.toFixed(1)} 秒</b></div>
-      <div className="imaging-range-legend"><span><i className="instant" />瞬时可达横带</span><span><i className="reachable" />成像段可达包络{displayedReachableNearKm != null && displayedReachableFarKm != null ? ` ${displayedReachableNearKm}–${displayedReachableFarKm} km` : ""}</span><span><i className="planned" />{displayedPlannedFootprint ? "计划成像足迹" : "计划足迹待返回"}</span><span><i className="actual" />实拍产品 {productFootprints.length}</span></div>
-      <small>亮青色横带和卫星标记随时间移动；淡青色是计划成像段包络，蓝色是计划场景，绿色只来自实拍产品。均为 TLE/SGP4 试算，不是波束方向图。</small>
+      <div className="imaging-range-legend"><span><i className="instant" />瞬时入射角边界</span><span><i className="reachable" />成像段硬边界{displayedReachableNearKm != null && displayedReachableFarKm != null ? ` ${displayedReachableNearKm}–${displayedReachableFarKm} km` : ""}</span><span><i className="planned" />{displayedPlannedFootprint ? "已校验计划足迹" : "计划足迹待返回"}</span><span><i className="actual" />实拍产品 {productFootprints.length}</span></div>
+      <small>亮青色边界和卫星标记随时间移动；淡青色是所选侧视方向在计划成像段内的入射角硬边界，蓝色整幅场景必须完全位于其中，越界机会已在服务端剔除。该口径是缺少真实波位表时的保守假设；绿色只来自实拍产品。</small>
     </div> : null}
     {activeTask ? <div className="map-review-toolbar" role="group" aria-label="任务AOI地图复核">
       <div><strong>{activeTask.title}</strong><span>{activeTrackingSlice ? `拍摄时刻台风${activeTrackingTarget === "center" ? "预测中心" : activeTrackingTarget === "wind_field" ? "风圈" : "路径不确定区"} · +${activeTrackingSlice.leadHours}h · ${formatTimeWithYear(opportunityClosestAt!)} UTC+08 · ${activeTrackingSlice.center[1].toFixed(3)}°, ${activeTrackingSlice.center[0].toFixed(3)}°` : ["polygon", "multi"].includes(activeTask.aoiType) ? `${customAoiPartCount(activeTask.customGeometry)} 块自定义 AOI` : "正在显示任务 AOI"}{displayedOpportunityLevel === "orbit_only" ? ` · TLE 轨道粗筛 · 最近约 ${previewWindow?.minimumGroundTrackDistanceKm ?? activeTask.minimumGroundTrackDistanceKm ?? "--"} km` : displayedOpportunityLevel === "assumed_sensor" ? ` · 假设传感器试算 · ${previewWindow?.imagingMode ?? activeTask.imagingMode ?? "模式待选"}` : ""}</span></div>
@@ -3331,6 +3341,7 @@ function TaskPanel({ open, compact, tasks, syncState, storageMode, fleet, active
           {visibility[task.taskId]?.message ? <p>{visibility[task.taskId].message}</p> : null}
           {visibility[task.taskId]?.planningSummary ? <p className="planning-summary">规划约束：{visibility[task.taskId].planningSummary!.eligible + visibility[task.taskId].planningSummary!.conditional} 个可进入试排 · {visibility[task.taskId].planningSummary!.conditional} 个待补工程约束 · {visibility[task.taskId].planningSummary!.dispatchable} 个可进入下发复核</p> : null}
           {task.opportunityId ? <p className="selected-opportunity">已选机会：{task.satelliteId} · {task.opportunityId} · {task.simulationLevel === "orbit_only" ? `轨道级粗筛${task.minimumGroundTrackDistanceKm == null ? "" : ` · 最近 ${task.minimumGroundTrackDistanceKm} km`}` : task.simulationLevel === "assumed_sensor" ? "假设传感器试算" : "传感器级仿真"}</p> : null}
+          {task.opportunityId && task.simulationLevel === "assumed_sensor" && task.opportunityIncidenceConstraintSemantics !== "full_scene_edge_hard_limit_assumed" ? <p className="task-validation" role="alert">该机会由旧版“仅校验中心点”模型生成，计划足迹已停止显示。请重新计算并选择通过整景边界校验的新机会。</p> : null}
           {visibility[task.taskId]?.windows.map((window, windowIndex) => <div key={window.opportunityId || `${window.start}-${windowIndex}`}>
             <strong>{window.satelliteLabel || window.satelliteId || `窗口 ${windowIndex + 1}`}{window.simulationLevel === "orbit_only" ? " · 轨道近接候选" : window.simulationLevel === "assumed_sensor" ? ` · ${window.imagingMode ?? "假设传感器"}` : ""}</strong>
             <span>{formatTimeWithYear(window.start)} — {formatTimeWithYear(window.end)} UTC+08</span>
@@ -3338,7 +3349,7 @@ function TaskPanel({ open, compact, tasks, syncState, storageMode, fleet, active
             {window.closestApproachAt ? <small>最近近接 {formatTimeWithYear(window.closestApproachAt)} UTC+08 · 地面轨迹距 AOI 中心 {window.minimumGroundTrackDistanceKm ?? "--"} km · 高度 {window.altitudeKm ?? "--"} km</small> : null}
             <small>{window.coveragePercent == null ? (window.simulationLevel === "orbit_only" ? "真实覆盖率未计算" : "覆盖率待仿真服务返回") : `覆盖 ${window.coveragePercent}%`}{window.incidenceAngleDeg == null ? (window.simulationLevel === "orbit_only" ? " · 地面入射角未计算" : " · 入射角待验证") : ` · 地面入射角 ${window.incidenceAngleDeg}°`}{window.offNadirAngleDeg == null ? "" : ` · 离轴 ${window.offNadirAngleDeg}°`}{window.lookSide ? ` · ${window.lookSide === "left" ? "左视" : "右视"}` : ""}{window.orbitDirection ? ` · ${window.orbitDirection === "ascending" ? "升轨" : "降轨"}` : ""}</small>
             {window.spatialResolutionM != null ? <small>标称分辨率 {window.spatialResolutionLabel ?? `${window.spatialResolutionM} m`} · 标称场景 {window.nominalSceneCrossTrackKm}×{window.nominalSceneAlongTrackKm} km · 极化 {window.polarizations?.join("/") || "待提供"} · {window.parameterStatus === "provisional_assumption" ? "临时假设参数" : "用户提供参数"}</small> : null}
-            {window.reachableNearKm != null && window.reachableFarKm != null ? <small className="opportunity-range-summary">可达拍摄走廊：横轨地距约 {window.reachableNearKm}–{window.reachableFarKm} km · {window.reachableLookSides?.map((side) => side === "left" ? "左视" : "右视").join("/") || "侧视待定"} · TLE/SGP4 + 入射角包络</small> : null}
+            {window.reachableNearKm != null && window.reachableFarKm != null ? <small className="opportunity-range-summary">整景入射角校验：硬边界 {window.reachableNearKm}–{window.reachableFarKm} km · 场景边缘 {window.sceneNearEdgeKm ?? "--"}–{window.sceneFarEdgeKm ?? "--"} km{window.footprintRangeMarginKm == null ? "" : ` · 最小余量 ${window.footprintRangeMarginKm} km`} · {window.reachableLookSides?.map((side) => side === "left" ? "左视" : "右视").join("/") || "侧视待定"}</small> : null}
             {window.productLevels?.length ? <small>可选产品：{window.productLevels.map((product) => `${product.level} ${product.code}`).join(" / ")}</small> : null}
             {window.constraintAssessment ? <small className={`planning-decision ${window.constraintAssessment.decision}`}><b>{window.constraintAssessment.decision === "eligible" ? "约束已满足" : window.constraintAssessment.decision === "conditional" ? "可试排 · 待补工程约束" : "不满足规划约束"}</b>{window.constraintAssessment.findings.length ? ` · ${window.constraintAssessment.findings.slice(0, 2).map((finding) => finding.message).join("；")}${window.constraintAssessment.findings.length > 2 ? `；另 ${window.constraintAssessment.findings.length - 2} 项` : ""}` : " · 当前已登记约束均通过"}</small> : null}
             {window.constraintNotes?.map((note) => <small className="constraint-note" key={note}>{note}</small>)}
@@ -3348,7 +3359,7 @@ function TaskPanel({ open, compact, tasks, syncState, storageMode, fleet, active
               const excluded = manualRules.excludedOpportunityRefs.includes(reference);
               return <div className="opportunity-manual-actions"><button className={locked ? "active lock" : ""} aria-pressed={locked} onClick={() => setOpportunityRule(reference, "lock")}>{locked ? "已锁定" : "锁定机会"}</button><button className={excluded ? "active exclude" : ""} aria-pressed={excluded} onClick={() => setOpportunityRule(reference, "exclude")}>{excluded ? "已排除" : "排除机会"}</button></div>;
             })() : null}
-            {window.simulationLevel !== "orbit_only" && window.footprintGeometry ? <button className="preview-opportunity" onClick={() => { onPreviewOpportunity({ taskId: task.taskId, window }); onActivate(task.taskId); }}>预览可达范围与计划足迹</button> : null}
+            {window.simulationLevel !== "orbit_only" && window.footprintGeometry ? <button className="preview-opportunity" onClick={() => { onPreviewOpportunity({ taskId: task.taskId, window }); onActivate(task.taskId); }}>预览入射角硬边界与计划足迹</button> : null}
             <button className="choose-opportunity" onClick={() => {
               onUpdate(task.taskId, {
               satelliteId: window.satelliteId, instrumentId: window.instrumentId, imagingMode: window.imagingMode,
@@ -3358,6 +3369,9 @@ function TaskPanel({ open, compact, tasks, syncState, storageMode, fleet, active
               opportunitySpatialResolutionM: window.spatialResolutionM, opportunitySceneCrossTrackKm: window.nominalSceneCrossTrackKm,
               opportunitySceneAlongTrackKm: window.nominalSceneAlongTrackKm, opportunityStart: window.start, opportunityEnd: window.end,
               opportunityReachableNearKm: window.reachableNearKm, opportunityReachableFarKm: window.reachableFarKm,
+              opportunitySceneNearEdgeKm: window.sceneNearEdgeKm, opportunitySceneFarEdgeKm: window.sceneFarEdgeKm,
+              opportunityFootprintRangeMarginKm: window.footprintRangeMarginKm,
+              opportunityIncidenceConstraintSemantics: window.incidenceConstraintSemantics,
               opportunityReachableLookSides: window.reachableLookSides, sensorParameterStatus: window.parameterStatus,
               opportunityFootprint: window.footprintGeometry, simulationLevel: window.simulationLevel ?? "sensor_model",
               satelliteNoradId: window.satelliteNoradId, closestApproachAt: window.closestApproachAt,
@@ -3839,6 +3853,10 @@ function migrateSatelliteTask(task: Partial<SatelliteTask>): SatelliteTask {
     opportunityEnd: task.opportunityEnd,
     opportunityReachableNearKm: task.opportunityReachableNearKm,
     opportunityReachableFarKm: task.opportunityReachableFarKm,
+    opportunitySceneNearEdgeKm: task.opportunitySceneNearEdgeKm,
+    opportunitySceneFarEdgeKm: task.opportunitySceneFarEdgeKm,
+    opportunityFootprintRangeMarginKm: task.opportunityFootprintRangeMarginKm,
+    opportunityIncidenceConstraintSemantics: task.opportunityIncidenceConstraintSemantics,
     opportunityReachableLookSides: task.opportunityReachableLookSides,
     sensorParameterStatus: task.sensorParameterStatus,
     opportunityFootprint: task.opportunityFootprint,

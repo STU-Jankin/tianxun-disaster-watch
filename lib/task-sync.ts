@@ -5,7 +5,7 @@ const taskDraftFields = [
   "aoiApproval", "approvalReason", "createdAt", "updatedAt", "status", "revision", "eventRevision",
   "satelliteId", "instrumentId", "imagingMode", "opportunityId", "orbitVersion", "visibilityComputedAt", "incidenceAngleDeg", "offNadirAngleDeg",
   "opportunityLookSide", "opportunityCoveragePercent", "opportunitySpatialResolutionM", "opportunitySceneCrossTrackKm", "opportunitySceneAlongTrackKm", "opportunityStart", "opportunityEnd",
-  "opportunityReachableNearKm", "opportunityReachableFarKm", "opportunityReachableLookSides", "sensorParameterStatus", "opportunityFootprint",
+  "opportunityReachableNearKm", "opportunityReachableFarKm", "opportunitySceneNearEdgeKm", "opportunitySceneFarEdgeKm", "opportunityFootprintRangeMarginKm", "opportunityIncidenceConstraintSemantics", "opportunityReachableLookSides", "sensorParameterStatus", "opportunityFootprint",
   "simulationLevel", "satelliteNoradId", "closestApproachAt", "closestSubpointLatitude", "closestSubpointLongitude",
   "minimumGroundTrackDistanceKm", "orbitSearchRadiusKm", "opportunityOrbitDirection",
   "orbitDirectionPreference", "referenceAcquisitionRequired", "sarAnalysisMode", "cycloneTrackingTarget",

@@ -21,6 +21,18 @@ export type InstantaneousReachableSlice = ReachableImagingCorridor & {
   displaySpanSeconds: number;
 };
 
+export type ConservativePlannedSceneFootprint = {
+  geometry: GeoGeometry;
+  sceneNearGroundRangeKm: number;
+  sceneFarGroundRangeKm: number;
+  minimumBoundaryMarginKm: number;
+  fullyWithinIncidenceEnvelope: boolean;
+  sampledFrom: string;
+  sampledTo: string;
+  sampleCount: number;
+  basis: "tle_sgp4_full_scene_edge_check";
+};
+
 /**
  * Builds a time-local ground-access envelope, not an antenna beam pattern.
  * Each side is the strip swept between the near/far incidence limits while
@@ -125,6 +137,74 @@ export function buildInstantaneousReachableSlice(input: {
     centeredAt: new Date(centeredAtMs).toISOString(),
     displaySpanSeconds,
   } : null;
+}
+
+/**
+ * Builds the planned scene and verifies it with the same orbit samples and
+ * spherical projection used by the incidence corridor. This deliberately
+ * treats the configured incidence interval as a hard limit for both scene
+ * edges until an authoritative near/far beam-position table is available.
+ */
+export function buildConservativePlannedSceneFootprint(input: {
+  tleLine1: string;
+  tleLine2: string;
+  start: string | Date;
+  end: string | Date;
+  lookSide: SarLookSide;
+  sceneCenterGroundRangeKm: number;
+  sceneCrossTrackKm: number;
+  incidenceAngleMinDeg: number;
+  incidenceAngleMaxDeg: number;
+  stepSeconds?: number;
+}): ConservativePlannedSceneFootprint | null {
+  const startMs = new Date(input.start).getTime();
+  const endMs = new Date(input.end).getTime();
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return null;
+  if (!Number.isFinite(input.sceneCenterGroundRangeKm) || input.sceneCenterGroundRangeKm < 0 || !Number.isFinite(input.sceneCrossTrackKm) || input.sceneCrossTrackKm <= 0) return null;
+  const incidenceMin = clamp(input.incidenceAngleMinDeg, 0.1, 80);
+  const incidenceMax = clamp(input.incidenceAngleMaxDeg, incidenceMin, 80);
+  const sceneNearKm = Math.max(0, input.sceneCenterGroundRangeKm - input.sceneCrossTrackKm / 2);
+  const sceneFarKm = input.sceneCenterGroundRangeKm + input.sceneCrossTrackKm / 2;
+  const durationSeconds = (endMs - startMs) / 1_000;
+  const stepSeconds = clamp(input.stepSeconds ?? Math.ceil(durationSeconds / 12), 0.1, 30);
+  const sampleTimes = new Set<number>([startMs, endMs]);
+  for (let at = startMs; at < endMs; at += stepSeconds * 1_000) sampleTimes.add(at);
+  const samples = [...sampleTimes]
+    .sort((left, right) => left - right)
+    .slice(0, 64)
+    .map((at) => propagateTle(input.tleLine1, input.tleLine2, new Date(at)))
+    .filter((position): position is NonNullable<ReturnType<typeof propagateTle>> => Boolean(position));
+  if (samples.length < 2) return null;
+
+  const far: Array<[number, number]> = [];
+  const near: Array<[number, number]> = [];
+  let minimumBoundaryMarginKm = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < samples.length; index += 1) {
+    const position = samples[index];
+    const previous = samples[Math.max(0, index - 1)];
+    const next = samples[Math.min(samples.length - 1, index + 1)];
+    const bearing = initialBearing(previous.latitude, previous.longitude, next.latitude, next.longitude);
+    const sideBearing = bearing + (input.lookSide === "right" ? 90 : -90);
+    near.push(destinationPoint(position.latitude, position.longitude, sideBearing, sceneNearKm));
+    far.push(destinationPoint(position.latitude, position.longitude, sideBearing, sceneFarKm));
+    const nearMargin = sceneNearKm - groundReachForIncidence(position.altitudeKm, incidenceMin);
+    const farMargin = groundReachForIncidence(position.altitudeKm, incidenceMax) - sceneFarKm;
+    minimumBoundaryMarginKm = Math.min(minimumBoundaryMarginKm, nearMargin, farMargin);
+  }
+  const ring = [...far, ...near.reverse(), far[0]];
+  const normalized = normalizeAntimeridianGeometry({ type: "Polygon", coordinates: [ring] }) as GeoGeometry | null;
+  if (!normalized) return null;
+  return {
+    geometry: normalized,
+    sceneNearGroundRangeKm: round(sceneNearKm, 3),
+    sceneFarGroundRangeKm: round(sceneFarKm, 3),
+    minimumBoundaryMarginKm: round(minimumBoundaryMarginKm, 3),
+    fullyWithinIncidenceEnvelope: minimumBoundaryMarginKm >= -0.01,
+    sampledFrom: new Date(startMs).toISOString(),
+    sampledTo: new Date(endMs).toISOString(),
+    sampleCount: samples.length,
+    basis: "tle_sgp4_full_scene_edge_check",
+  };
 }
 
 export function groundReachForIncidence(altitudeKm: number, incidenceAngleDeg: number) {

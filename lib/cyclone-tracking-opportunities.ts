@@ -51,6 +51,8 @@ export function screenCycloneConfiguredSarOpportunities(input: SharedInput & {
   let rejectedByResolution = 0;
   let rejectedByCoverage = 0;
   let rejectedByIncidence = 0;
+  let rejectedByFootprint = 0;
+  let rejectedByTiming = 0;
   const windows: Array<AssumedSarOpportunity & CycloneTrackingMetadata> = [];
   for (const interval of intervals) {
     const result = screenConfiguredSarOpportunities({
@@ -69,6 +71,8 @@ export function screenCycloneConfiguredSarOpportunities(input: SharedInput & {
     rejectedByResolution += result.rejectedByResolution;
     rejectedByCoverage += result.rejectedByCoverage;
     rejectedByIncidence += result.rejectedByIncidence;
+    rejectedByFootprint += result.rejectedByFootprint;
+    rejectedByTiming += result.rejectedByTiming;
     windows.push(...result.windows.map((window) => annotateCycloneTrackingWindow(window, interval.slice, input.target, input.forecastAdvisoryId)));
   }
   return {
@@ -83,6 +87,8 @@ export function screenCycloneConfiguredSarOpportunities(input: SharedInput & {
     rejectedByResolution,
     rejectedByCoverage,
     rejectedByIncidence,
+    rejectedByFootprint,
+    rejectedByTiming,
   };
 }
 

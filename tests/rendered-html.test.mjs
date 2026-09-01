@@ -282,9 +282,11 @@ test("shows STK-like reachable, planned and actual imaging footprints without co
   const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
   const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   const geometry = await readFile(new URL("../lib/satellite-imaging-geometry.ts", import.meta.url), "utf8");
-  assert.match(dashboard, /预览可达范围与计划足迹/);
-  assert.match(dashboard, /可达拍摄走廊/);
+  assert.match(dashboard, /预览入射角硬边界与计划足迹/);
+  assert.match(dashboard, /整景入射角校验/);
   assert.match(dashboard, /计划\/标称成像足迹/);
+  assert.match(dashboard, /蓝色整幅场景必须完全位于其中/);
+  assert.match(dashboard, /旧版“仅校验中心点”模型/);
   assert.match(dashboard, /实拍产品范围/);
   assert.match(dashboard, /\/api\/products\?taskId=/);
   assert.match(styles, /\.imaging-range-control/);

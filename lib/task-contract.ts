@@ -39,7 +39,7 @@ const allowedTaskFields = new Set([
   "cycloneTrackingTarget", "trackingValidFrom", "trackingValidTo", "trackingLeadHours", "trackingCenterLatitude", "trackingCenterLongitude", "trackingCenterBasis", "trackingThresholdKnots",
   "satelliteId", "instrumentId", "imagingMode", "opportunityId", "orbitVersion", "visibilityComputedAt", "incidenceAngleDeg", "offNadirAngleDeg",
   "opportunityLookSide", "opportunityCoveragePercent", "opportunitySpatialResolutionM", "opportunitySceneCrossTrackKm", "opportunitySceneAlongTrackKm", "opportunityStart", "opportunityEnd",
-  "opportunityReachableNearKm", "opportunityReachableFarKm", "opportunityReachableLookSides", "sensorParameterStatus", "opportunityFootprint",
+  "opportunityReachableNearKm", "opportunityReachableFarKm", "opportunitySceneNearEdgeKm", "opportunitySceneFarEdgeKm", "opportunityFootprintRangeMarginKm", "opportunityIncidenceConstraintSemantics", "opportunityReachableLookSides", "sensorParameterStatus", "opportunityFootprint",
   "simulationLevel", "satelliteNoradId", "closestApproachAt", "closestSubpointLatitude", "closestSubpointLongitude",
   "minimumGroundTrackDistanceKm", "orbitSearchRadiusKm", "opportunityOrbitDirection",
   "orbitDirectionPreference", "referenceAcquisitionRequired", "sarAnalysisMode",
@@ -125,6 +125,12 @@ export function validateSatelliteTask(task: Record<string, unknown>, options: { 
   const reachableNear = task.opportunityReachableNearKm === undefined ? null : boundedNumber(task.opportunityReachableNearKm, 0, 2_000, "可达走廊近端地距", errors);
   const reachableFar = task.opportunityReachableFarKm === undefined ? null : boundedNumber(task.opportunityReachableFarKm, 0, 2_000, "可达走廊远端地距", errors);
   if (reachableNear !== null && reachableFar !== null && reachableFar < reachableNear) errors.push("可达走廊远端地距不能小于近端地距");
+  const sceneNear = task.opportunitySceneNearEdgeKm === undefined ? null : boundedNumber(task.opportunitySceneNearEdgeKm, 0, 2_000, "场景近端地距", errors);
+  const sceneFar = task.opportunitySceneFarEdgeKm === undefined ? null : boundedNumber(task.opportunitySceneFarEdgeKm, 0, 2_000, "场景远端地距", errors);
+  if (sceneNear !== null && sceneFar !== null && sceneFar < sceneNear) errors.push("场景远端地距不能小于近端地距");
+  if (task.opportunityFootprintRangeMarginKm !== undefined) boundedNumber(task.opportunityFootprintRangeMarginKm, 0, 2_000, "整景边界余量", errors);
+  if (task.opportunityIncidenceConstraintSemantics !== undefined && task.opportunityIncidenceConstraintSemantics !== "full_scene_edge_hard_limit_assumed") errors.push("整景入射角约束口径无效");
+  if (task.opportunityIncidenceConstraintSemantics === "full_scene_edge_hard_limit_assumed" && reachableNear !== null && reachableFar !== null && sceneNear !== null && sceneFar !== null && (sceneNear < reachableNear - 0.11 || sceneFar > reachableFar + 0.11)) errors.push("计划场景越过入射角硬边界，请重新计算机会");
   if (task.opportunityReachableLookSides !== undefined && (!Array.isArray(task.opportunityReachableLookSides) || task.opportunityReachableLookSides.length < 1 || task.opportunityReachableLookSides.length > 2 || task.opportunityReachableLookSides.some((side) => !["left", "right"].includes(String(side))) || new Set(task.opportunityReachableLookSides).size !== task.opportunityReachableLookSides.length)) errors.push("可达走廊侧视方向无效");
   if (task.sensorParameterStatus !== undefined && !["user_provided", "provisional_assumption"].includes(String(task.sensorParameterStatus))) errors.push("传感器参数状态无效");
   if (task.opportunityFootprint !== undefined) {

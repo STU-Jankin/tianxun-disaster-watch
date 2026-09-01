@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { groundReachForIncidence, sarLookGeometry, screenConfiguredSarOpportunities } from "../lib/configured-sar-opportunities.ts";
+import { evaluateSceneRangeFeasibility, groundReachForIncidence, sarLookGeometry, screenConfiguredSarOpportunities } from "../lib/configured-sar-opportunities.ts";
 import { propagateTle } from "../lib/orbit-simulation.ts";
 import { sarPayloadProfiles } from "../lib/satellite-payloads.ts";
 import { cycloneTrackingSliceAt, screenCycloneConfiguredSarOpportunities } from "../lib/cyclone-tracking-opportunities.ts";
@@ -48,6 +48,34 @@ test("round-trips configured ground incidence through spherical Earth geometry",
     assert.ok(Math.abs(geometry.incidenceAngleDeg - incidence) < 1e-8);
     assert.ok(geometry.offNadirAngleDeg < geometry.incidenceAngleDeg);
   }
+});
+
+test("requires both cross-track scene edges to remain inside the incidence envelope", () => {
+  const altitudeKm = 500;
+  const nearKm = groundReachForIncidence(altitudeKm, 15);
+  const farKm = groundReachForIncidence(altitudeKm, 45);
+  const valid = evaluateSceneRangeFeasibility({
+    altitudeKm,
+    sceneCenterGroundRangeKm: (nearKm + farKm) / 2,
+    sceneCrossTrackKm: 100,
+    incidenceAngleMinDeg: 15,
+    incidenceAngleMaxDeg: 45,
+  });
+  assert.equal(valid.fullyWithinEnvelope, true);
+  assert.ok(valid.sceneNearEdgeKm >= valid.reachableNearKm);
+  assert.ok(valid.sceneFarEdgeKm <= valid.reachableFarKm);
+  assert.ok(valid.minimumMarginKm > 0);
+
+  const centerValidButFarEdgeInvalid = evaluateSceneRangeFeasibility({
+    altitudeKm,
+    sceneCenterGroundRangeKm: farKm - 10,
+    sceneCrossTrackKm: 40,
+    incidenceAngleMinDeg: 15,
+    incidenceAngleMaxDeg: 45,
+  });
+  assert.ok(sarLookGeometry(altitudeKm, farKm - 10).incidenceAngleDeg < 45);
+  assert.equal(centerValidButFarEdgeInvalid.fullyWithinEnvelope, false);
+  assert.ok(centerValidButFarEdgeInvalid.farMarginKm < 0);
 });
 
 test("creates mode-level assumed sensor opportunities from a current TLE and CSAR profile", () => {
@@ -101,10 +129,42 @@ test("creates mode-level assumed sensor opportunities from a current TLE and CSA
     assert.equal(window.footprintGeometry.type, "Polygon");
     assert.ok(window.reachableNearKm > 0);
     assert.ok(window.reachableFarKm > window.reachableNearKm);
-    assert.deepEqual(window.reachableLookSides, ["left", "right"]);
+    assert.deepEqual(window.reachableLookSides, ["right"]);
     assert.equal(window.reachableBasis, "tle_sgp4_incidence_envelope");
+    assert.equal(window.incidenceConstraintSemantics, "full_scene_edge_hard_limit_assumed");
+    assert.ok(window.sceneNearEdgeKm >= window.reachableNearKm - 0.1);
+    assert.ok(window.sceneFarEdgeKm <= window.reachableFarKm + 0.1);
+    assert.ok(window.footprintRangeMarginKm >= 0);
     assert.match(window.constraintNotes.join(" "), /不得自动下发/);
   }
+});
+
+test("rejects a center-valid opportunity when the full scene crosses the far incidence limit", () => {
+  const centerAt = new Date("2026-08-18T12:00:00.000Z");
+  const lines = tle(51832);
+  const center = propagateTle(lines.line1, lines.line2, centerAt);
+  const before = propagateTle(lines.line1, lines.line2, new Date(centerAt.getTime() - 10_000));
+  const after = propagateTle(lines.line1, lines.line2, new Date(centerAt.getTime() + 10_000));
+  assert.ok(center && before && after);
+  const trackBearing = bearing(before.latitude, before.longitude, after.latitude, after.longitude);
+  const farReachKm = groundReachForIncidence(center.altitudeKm, 45);
+  const target = destination(center.latitude, center.longitude, trackBearing + 90, farReachKm - 10);
+  const satellite = {
+    noradId: 51832, interfaceName: "TY-CSAR-2", commonName: "TY-39", commonCode: "巢湖一号",
+    identityStatus: "configured", payloadProfileId: "ty-csar-v2", payloadProfile: sarPayloadProfiles["ty-csar-v2"],
+    tleLine1: lines.line1, tleLine2: lines.line2, epoch: centerAt.toISOString(), fetchedAt: centerAt.toISOString(),
+    orbitStatus: "current", source: "CelesTrak GP", sourceUrl: "https://example.test/tle",
+  };
+  const result = screenConfiguredSarOpportunities({
+    geometry: { type: "Point", coordinates: [target.longitude, target.latitude] },
+    imagingStart: new Date(centerAt.getTime() - 300_000),
+    imagingEnd: new Date(centerAt.getTime() + 300_000),
+    satellites: [satellite], incidenceAngleMinDeg: 15, incidenceAngleMaxDeg: 45,
+    spatialResolutionMeters: 20, minimumCoveragePercent: 80, sarImagingModeIds: ["tops_1"], now: centerAt,
+  });
+  assert.equal(result.windows.length, 0);
+  assert.equal(result.rejectedByIncidence, 0);
+  assert.ok(result.rejectedByFootprint >= 1);
 });
 
 test("matches each SAR pass to the cyclone forecast slice valid at acquisition time", () => {

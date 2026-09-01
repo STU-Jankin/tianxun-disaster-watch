@@ -165,8 +165,8 @@ export async function POST(request: Request) {
               ? `已按 ${"trackingSliceCount" in result ? result.trackingSliceCount : trackingSlices.length} 个逐时预测 AOI 匹配卫星过境，生成 ${result.windows.length} 个${trackingTargetLabel(trackingTarget)}跟踪机会；新报次到达后必须重算，禁止自动下发${opticalPendingNote}`
               : `已用 ${result.satelliteCount} 颗配置卫星生成 ${result.windows.length} 个假设传感器机会；可用于试排程，禁止自动下发${opticalPendingNote}`
             : dynamicCycloneTracking
-              ? `已完成 ${trackingSlices.length} 个逐时预测 AOI 的动态匹配；当前没有同时满足轨道、入射角、分辨率和覆盖率的${trackingTargetLabel(trackingTarget)}跟踪机会${opticalPendingNote}`
-              : `已完成 ${result.satelliteCount} 颗配置卫星的假设传感器计算；当前时间窗没有同时满足入射角、分辨率和覆盖率的机会${opticalPendingNote}`,
+              ? `已完成 ${trackingSlices.length} 个逐时预测 AOI 的动态匹配；当前没有同时满足轨道、整景入射角边界、完整成像时长、分辨率和覆盖率的${trackingTargetLabel(trackingTarget)}跟踪机会${opticalPendingNote}`
+              : `已完成 ${result.satelliteCount} 颗配置卫星的假设传感器计算；当前时间窗没有同时满足整景入射角边界、完整成像时长、分辨率和覆盖率的机会${opticalPendingNote}`,
         }, { headers: { "Cache-Control": "no-store" } });
       }
       const common = {
