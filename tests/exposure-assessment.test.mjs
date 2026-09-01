@@ -64,6 +64,21 @@ test("splits a standard earthquake AOI into resumable Overpass chunks", () => {
   assert.equal(prepareOverpassExposurePlan({ ...aoi, areaKm2: 10_001 }, { maximumAreaKm2: 10_000, chunkAreaKm2: 750 }).state, "skipped");
 });
 
+test("stabilizes near-identical clipping vertices for the Changning earthquake coordinates", () => {
+  const aoi = buildExposureAoi(pointEvent({
+    hazard: "earthquake",
+    title: "四川宜宾市长宁县 M4.7 地震",
+    latitude: 28.33,
+    longitude: 104.98,
+    locationAccuracyKm: 5,
+    geometry: { type: "Point", coordinates: [104.98, 28.33] },
+  }));
+  const plan = prepareOverpassExposurePlan(aoi, { maximumAreaKm2: 10_000, chunkAreaKm2: 750, queryTimeoutSeconds: 25 });
+  assert.equal(plan.state, "ready");
+  assert.ok(plan.chunks.length >= 4 && plan.chunks.length <= 8);
+  assert.ok(Math.abs(plan.chunks.reduce((sum, chunk) => sum + chunk.areaKm2, 0) - aoi.areaKm2) / aoi.areaKm2 < 0.005);
+});
+
 test("accepts and partitions a routine 50 km flood screening buffer", () => {
   const aoi = buildExposureAoi(pointEvent({ hazard: "flood", title: "测试洪灾", locationAccuracyKm: 50 }));
   const plan = prepareOverpassExposurePlan(aoi, { maximumAreaKm2: 10_000, chunkAreaKm2: 750, queryTimeoutSeconds: 25 });

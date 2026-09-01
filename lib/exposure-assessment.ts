@@ -576,9 +576,9 @@ function intersectGeometryWithBbox(geometry: EventGeometry, bbox: [number, numbe
   const clip: ClippingPolygon = [[[west, south], [east, south], [east, north], [west, north], [west, south]]];
   const clipped = polygonClipping.intersection(subject, clip);
   if (!clipped.length) return [];
-  const candidate: EventGeometry = clipped.length === 1
+  const candidate = stabilizeClippedGeometry(clipped.length === 1
     ? { type: "Polygon", coordinates: clipped[0] }
-    : { type: "MultiPolygon", coordinates: clipped };
+    : { type: "MultiPolygon", coordinates: clipped });
   const normalized = normalizeAntimeridianGeometry(candidate) ?? candidate;
   const validation = validateGeoGeometry(normalized, { maximumAreaKm2: 25_000_000, maximumVertices: 20_000, maximumRingVertices: 5_000, allowOverlappingMultiPolygon: true });
   return validation.ok && validation.areaKm2 > 0.01 ? [normalized] : [];
@@ -595,12 +595,36 @@ function intersectPolygonalGeometries(subjectGeometry: EventGeometry, clipGeomet
     : clipGeometry.coordinates as ClippingMultiPolygon;
   const clipped = polygonClipping.intersection(subject, clip);
   if (!clipped.length) return null;
-  const candidate: EventGeometry = clipped.length === 1
+  const candidate = stabilizeClippedGeometry(clipped.length === 1
     ? { type: "Polygon", coordinates: clipped[0] }
-    : { type: "MultiPolygon", coordinates: clipped };
+    : { type: "MultiPolygon", coordinates: clipped });
   const normalized = normalizeAntimeridianGeometry(candidate) ?? candidate;
   const validation = validateGeoGeometry(normalized, { maximumAreaKm2: 25_000_000, maximumVertices: 20_000, maximumRingVertices: 5_000, allowOverlappingMultiPolygon: true });
   return validation.ok && validation.areaKm2 > 0.01 ? normalized : null;
+}
+
+function stabilizeClippedGeometry(geometry: EventGeometry): EventGeometry {
+  const cleanRing = (ring: Array<[number, number]>) => {
+    const cleaned: Array<[number, number]> = [];
+    for (const coordinate of ring) {
+      const point: [number, number] = [roundCoordinate(coordinate[0]), roundCoordinate(coordinate[1])];
+      const previous = cleaned.at(-1);
+      if (!previous || previous[0] !== point[0] || previous[1] !== point[1]) cleaned.push(point);
+    }
+    if (cleaned.length && (cleaned[0][0] !== cleaned.at(-1)![0] || cleaned[0][1] !== cleaned.at(-1)![1])) cleaned.push([...cleaned[0]]);
+    return cleaned;
+  };
+  if (geometry.type === "Polygon") {
+    return { type: "Polygon", coordinates: (geometry.coordinates as Array<Array<[number, number]>>).map(cleanRing) };
+  }
+  if (geometry.type === "MultiPolygon") {
+    return { type: "MultiPolygon", coordinates: (geometry.coordinates as Array<Array<Array<[number, number]>>>).map((polygon) => polygon.map(cleanRing)) };
+  }
+  return geometry;
+}
+
+function roundCoordinate(value: number) {
+  return Math.round(value * 1_000_000_000) / 1_000_000_000;
 }
 
 function overpassFacility(element: Record<string, unknown>): ExposureFacility[] {
