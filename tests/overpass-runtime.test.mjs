@@ -11,6 +11,7 @@ test("keeps the public Overpass profile bounded while covering a standard earthq
   });
   assert.equal(config.profile, "public");
   assert.equal(config.maximumAreaKm2, 3_500);
+  assert.equal(config.chunkAreaKm2, 750);
   assert.equal(config.queryTimeoutSeconds, 25);
   assert.equal(config.updateCadence, "upstream");
   assert.match(overpassCacheKey(config, "exposure", "aoi:123"), /^public:exposure:/);
@@ -26,6 +27,7 @@ test("requires a distinct endpoint before enabling the China daily profile", () 
   assert.equal(config.dataScope, "china");
   assert.equal(config.updateCadence, "daily");
   assert.equal(config.maximumAreaKm2, 50_000);
+  assert.equal(config.chunkAreaKm2, 2_500);
   assert.equal(config.cacheTtlMs, 26 * 60 * 60_000);
 });
 

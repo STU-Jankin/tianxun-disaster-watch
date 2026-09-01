@@ -2,8 +2,8 @@
 
 天巡应用支持两种 Overpass 运行档位：
 
-- `public`：默认公共服务，单次筛查上限固定为 3,500 km²，可覆盖标准 30 km 地震筛查圆。
-- `china_daily`：面向独立部署的中国 OSM 数据库，默认单次筛查上限为 50,000 km²，页面明确标记“日更、非实时”。
+- `public`：默认公共服务，任务总量上限固定为 3,500 km²，按不超过 750 km² 的分块受控续算，可覆盖标准 30 km 地震筛查圆。
+- `china_daily`：面向独立部署的中国 OSM 数据库，默认任务总量上限为 50,000 km²、单块 2,500 km²，页面明确标记“日更、非实时”。
 
 ## 部署边界
 
@@ -24,6 +24,7 @@
 OVERPASS_PROFILE=china_daily
 OVERPASS_API_URL=https://osm-china.example.com/api/interpreter
 OVERPASS_MAX_AREA_KM2=50000
+OVERPASS_CHUNK_AREA_KM2=2500
 OVERPASS_CACHE_TTL_HOURS=26
 OVERPASS_STALE_IF_ERROR_HOURS=168
 OVERPASS_QUERY_TIMEOUT_SECONDS=45
@@ -41,4 +42,4 @@ OVERPASS_ALLOW_PRIVATE_ENDPOINT=true
 2. OSM 数据时点对应镜像最近一次成功更新，而不是本次查询时间。
 3. 同一 AOI 再次查询显示“本地缓存命中”。
 4. 暂停数据服务后，短期内显示“过期缓存降级”，且不会把缓存结果解释为实时道路状态。
-5. 3,500 km² 以上 AOI 仅在 `china_daily` 档位下放行，仍不得执行全国建筑和道路一次性全量普查。
+5. 公共档位 3,500 km² 以上 AOI 仍会拒绝；`china_daily` 可按总量与单块阈值分批处理，但仍不得执行全国建筑和道路一次性全量普查。

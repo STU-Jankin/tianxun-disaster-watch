@@ -41,8 +41,10 @@ test("persists one current exposure assessment with its event and AOI versions",
       expiresAt: "2026-09-01T02:00:00.000Z",
       osmBaseTimestamp: "2026-08-30T20:00:00.000Z",
     };
-    await database.upsertOsmQueryCache(osmCache);
+    assert.equal(await database.upsertOsmQueryCache(osmCache), true);
     assert.deepEqual(await database.getOsmQueryCache(osmCache.cacheKey, "exposure"), osmCache);
+    assert.equal(await database.upsertOsmQueryCache({ ...osmCache, cacheKey: "oversized", payload: { encodedIds: "x".repeat(2 * 1024 * 1024) } }), false);
+    assert.equal(await database.getOsmQueryCache("oversized", "exposure"), null);
   } finally {
     await rm(directory, { recursive: true, force: true }).catch((error) => { if (error?.code !== "EBUSY") throw error; });
   }

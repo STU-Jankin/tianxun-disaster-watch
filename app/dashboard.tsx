@@ -2162,6 +2162,7 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
 
   const compute = useCallback(async () => {
     if (historicalReadOnly || computing) return;
+    if (assessment?.status !== "pending") automaticPollsRef.current = 0;
     setComputing(true);
     setError("");
     try {
@@ -2187,7 +2188,7 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
   }, [assessment, computing, event, historicalReadOnly]);
 
   useEffect(() => {
-    if (!canCompute || computing || assessment?.status !== "pending" || automaticPollsRef.current >= 3) return;
+    if (!canCompute || computing || assessment?.status !== "pending" || automaticPollsRef.current >= 12) return;
     const timer = window.setTimeout(() => {
       automaticPollsRef.current += 1;
       void compute();
@@ -2199,8 +2200,8 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
   const osm = assessment?.osm;
   const populationReady = population?.state === "ready" && population.totalPopulation !== undefined;
   const osmReady = osm?.state === "ready";
-  const populationOnly = Boolean(assessment?.riskInput && populationReady && !osmReady);
-  const missingOsmLabel = osm?.state === "skipped" ? "范围较大，未运行 OSM 统计" : "OSM 数据暂未取得";
+  const populationOnly = Boolean(assessment?.riskInput && populationReady && (osm?.state === "skipped" || osm?.state === "unavailable"));
+  const missingOsmLabel = osm?.state === "pending" ? `分块统计中 ${osm.completedParts ?? 0}/${osm.totalParts ?? "—"}` : osm?.state === "skipped" ? "范围较大，未运行 OSM 统计" : "OSM 数据暂未取得";
   return <section className="exposure-card" aria-labelledby={`exposure-title-${event.id}`}>
     <div className="exposure-heading">
       <div><h3 id={`exposure-title-${event.id}`}>人口与承灾体暴露</h3><small>WorldPop 人口模型 · OpenStreetMap 已映射要素（非实时设施状态）</small></div>
@@ -2227,10 +2228,11 @@ function ExposureAssessmentCard({ event, assessment, currentUser, historicalRead
       {assessment.riskInput ? <p className="exposure-risk-basis"><strong>指数依据：</strong>{exposureRiskBasisForDisplay(assessment)}</p> : null}
       {populationOnly ? <p className="exposure-data-note"><strong>人口筛查已完成。</strong>建筑、道路和关键设施属于补充项，本次未统计；上方人口是筛查范围内模型人口，不是实际受灾人口。</p> : null}
       {population && population.state !== "ready" ? <p className={`exposure-source-state ${population.state}`}>WorldPop：{population.message}</p> : null}
+      {osm?.state === "pending" ? <p className="exposure-source-state pending"><strong>OSM 分块统计中。</strong>{osm.message}</p> : null}
       <details className="exposure-limitations"><summary>查看数据来源与限制</summary>{population ? <p>WorldPop：{population.message}</p> : null}{osm ? <p>OSM：{osm.message}</p> : null}{osm?.state === "skipped" ? <p>大范围建筑和道路存量需要自建 OSM 数据库离线汇总；高德 POI 只能补充设施位置，不能替代 OSM 存量统计。</p> : null}{assessment.limitations.map((item) => <p key={item}>{item}</p>)}<p>人口暴露指数只参与初筛排序；没有脆弱性模型时，系统不会生成综合影响风险分数。</p></details>
       <div className="exposure-links"><a href="https://api.worldpop.org/v2/" target="_blank" rel="noreferrer">WorldPop API ↗</a><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors ↗</a></div>
     </> : !loading && !historicalReadOnly ? <p className="exposure-empty">尚未计算。系统会按事件范围查询人口模型，并筛查已映射的建筑、道路和关键设施。</p> : null}
-    {canCompute ? <button className="exposure-compute" disabled={computing} onClick={() => void compute()}>{computing ? "正在查询外部数据…" : assessment?.status === "pending" ? population?.totalParts ? `继续查询人口分块（${population.completedParts ?? 0}/${population.totalParts}）` : "继续查询人口任务" : assessment ? "刷新暴露度数据" : "计算暴露度并叠加地图"}</button> : !historicalReadOnly ? <small className="exposure-readonly">当前账号可查看已有结果；计算需要操作员权限。</small> : null}
+    {canCompute ? <button className="exposure-compute" disabled={computing} onClick={() => void compute()}>{computing ? "正在查询外部数据…" : assessment?.status === "pending" ? osm?.state === "pending" ? `继续查询 OSM 分块（${osm.completedParts ?? 0}/${osm.totalParts ?? "—"}）` : population?.totalParts ? `继续查询人口分块（${population.completedParts ?? 0}/${population.totalParts}）` : "继续查询人口任务" : assessment ? "刷新暴露度数据" : "计算暴露度并叠加地图"}</button> : !historicalReadOnly ? <small className="exposure-readonly">当前账号可查看已有结果；计算需要操作员权限。</small> : null}
     {error ? <p className="exposure-error" role="alert">{error}</p> : null}
   </section>;
 }

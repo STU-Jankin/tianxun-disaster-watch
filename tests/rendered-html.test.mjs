@@ -120,9 +120,9 @@ test("adds a bounded and evidence-labelled population and infrastructure exposur
   const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
   const route = await readFile(new URL("../app/api/exposure/route.ts", import.meta.url), "utf8");
   const model = await readFile(new URL("../lib/exposure-assessment.ts", import.meta.url), "utf8");
-  for (const phrase of ["人口与承灾体暴露", "范围内模型人口", "人口指数已生成", "已映射建筑", "已映射道路", "关键设施", "计算暴露度并叠加地图", "不是受损建筑数", "不代表里程或通行状态"]) assert.ok(dashboard.includes(phrase));
+  for (const phrase of ["人口与承灾体暴露", "范围内模型人口", "人口指数已生成", "已映射建筑", "已映射道路", "关键设施", "计算暴露度并叠加地图", "继续查询 OSM 分块", "不是受损建筑数", "不代表里程或通行状态"]) assert.ok(dashboard.includes(phrase));
   for (const contract of ["authorizeApiRequest", "rejectCrossOriginBrowserWrite", "enforceRateLimit", "getCanonicalEventForTask", "upsertEventExposureAssessment", "boundedFetch"]) assert.ok(route.includes(contract));
-  for (const guardrail of ["maximumWorldPopAreaKm2", "maximumOverpassAreaKm2", "derived_screening_buffer", "本指数仅含人口暴露"]) assert.ok(model.includes(guardrail));
+  for (const guardrail of ["maximumWorldPopAreaKm2", "maximumOverpassAreaKm2", "prepareOverpassExposurePlan", "aggregateOverpassExposureChunks", "encodeOsmIdDeltas", "derived_screening_buffer", "本指数仅含人口暴露"]) assert.ok(model.includes(guardrail));
 });
 
 test("includes both domestic connector batches and only filters base-map tiles", async () => {

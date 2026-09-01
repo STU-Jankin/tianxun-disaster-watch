@@ -1,16 +1,22 @@
 import { getCanonicalEventForTask, getEventExposureAssessment, getOsmQueryCache, upsertEventExposureAssessment, upsertOsmQueryCache } from "../../../db/operational.ts";
 import { ApiInputError, apiActor, authorizeApiRequest, enforceRateLimit, readJsonObject, rejectCrossOriginBrowserWrite } from "../../../lib/api-security.ts";
 import {
+  aggregateOverpassExposureChunks,
+  decodeOsmIdDeltas,
+  encodeOsmIdDeltas,
   exposureAssessmentIdentity,
   exposureAssessmentModelVersion,
   exposureAssessmentStatus,
   exposureRiskInput,
-  parseOverpassExposure,
+  parseOverpassExposureChunk,
   parseWorldPopTask,
-  prepareOverpassExposureQuery,
+  prepareOverpassExposurePlan,
   worldPopRequestPlan,
   type ExposureAssessment,
+  type ExposureFacility,
   type OsmExposure,
+  type OsmExposurePart,
+  type OverpassExposureChunkResult,
   type PopulationExposure,
   type PopulationExposurePart,
   type WorldPopRequestChunk,
@@ -18,6 +24,18 @@ import {
 import { overpassCacheKey, overpassFreshUntil, resolveOverpassRuntimeConfig, type OverpassRuntimeConfig } from "../../../lib/overpass-runtime.ts";
 
 export const dynamic = "force-dynamic";
+
+type CachedOsmExposureChunk = {
+  schemaVersion: "osm-exposure-chunk-v1";
+  chunkId: string;
+  areaKm2: number;
+  buildingIdDeltas: string;
+  roadWayIdDeltas: string;
+  facilityIds: string[];
+  facilities: ExposureFacility[];
+  osmBaseTimestamp?: string;
+  fetchedAt: string;
+};
 
 export async function GET(request: Request) {
   const unauthorized = await authorizeApiRequest(request, "viewer");
@@ -64,14 +82,16 @@ export async function POST(request: Request) {
     const actor = await apiActor(request);
     const year = configuredWorldPopYear();
     const reusablePending = !force && sameInput && cached?.population.state === "pending" ? cached.population : undefined;
+    const reusablePopulation = !force && sameInput && cached?.population.state === "ready" ? cached.population : undefined;
+    const reusableOsm = !force && sameInput && sameOsmProfile && cached?.osm.state === "pending" ? cached.osm : undefined;
     const [population, osm] = await Promise.all([
-      fetchPopulation(identity.aoi, year, reusablePending),
-      fetchOsmExposure(identity.aoi, overpassConfig, force),
+      reusablePopulation ? Promise.resolve(reusablePopulation) : fetchPopulation(identity.aoi, year, reusablePending),
+      fetchOsmExposure(identity.aoi, overpassConfig, force, reusableOsm),
     ]);
     const computedAt = new Date().toISOString();
     const osmFetchedAt = osm.state === "ready" && osm.fetchedAt ? Date.parse(osm.fetchedAt) : Number.NaN;
     const osmFreshRemainingMs = Number.isFinite(osmFetchedAt) ? Math.max(15 * 60_000, osmFetchedAt + overpassConfig.cacheTtlMs - Date.now()) : overpassConfig.cacheTtlMs;
-    const assessmentTtlMs = population.state === "pending"
+    const assessmentTtlMs = population.state === "pending" || osm.state === "pending"
       ? 60 * 60_000
       : osm.state === "ready" ? (osm.cacheStatus === "stale" ? 60 * 60_000 : Math.min(overpassConfig.cacheTtlMs, osmFreshRemainingMs)) : 6 * 60 * 60_000;
     const assessment: ExposureAssessment = {
@@ -218,38 +238,86 @@ async function requestWorldPopTask(endpoint: URL, taskId: string, year: number, 
   return parseWorldPopTask(JSON.parse(response), year, resolution, taskId);
 }
 
-async function fetchOsmExposure(aoi: ReturnType<typeof exposureAssessmentIdentity>["aoi"], config: OverpassRuntimeConfig, force: boolean): Promise<OsmExposure> {
-  const plan = prepareOverpassExposureQuery(aoi, {
+async function fetchOsmExposure(aoi: ReturnType<typeof exposureAssessmentIdentity>["aoi"], config: OverpassRuntimeConfig, force: boolean, pending?: OsmExposure): Promise<OsmExposure> {
+  const plan = prepareOverpassExposurePlan(aoi, {
     maximumAreaKm2: config.maximumAreaKm2,
+    chunkAreaKm2: config.chunkAreaKm2,
     serviceLabel: config.profileLabel,
     queryTimeoutSeconds: config.queryTimeoutSeconds,
   });
-  if (plan.state === "skipped") return {
-    state: "skipped",
-    provider: "OpenStreetMap · Overpass",
-    dataProfile: config.profile,
-    updateCadence: config.updateCadence,
-    facilityCounts: {},
-    facilities: [],
-    facilitiesTruncated: false,
-    message: plan.message,
-  };
-  const cacheKey = overpassCacheKey(config, "exposure", plan.cacheIdentity);
-  const cached = await readExposureCache(cacheKey);
-  if (!force && cached && Date.parse(cached.expiresAt) > Date.now()) {
-    return { ...cached.payload, cacheStatus: "fresh", dataProfile: config.profile, updateCadence: config.updateCadence };
+  if (plan.state === "skipped") return emptyOsmExposure("skipped", config, plan.message);
+
+  const aggregateCacheKey = overpassCacheKey(config, "exposure", `aggregate-v1:${plan.cacheIdentity}`);
+  const cachedAggregate = await readExposureCache(aggregateCacheKey);
+  const continuing = pending?.state === "pending" && pending.planHash === plan.planHash;
+  if (!force && !continuing && cachedAggregate && Date.parse(cachedAggregate.expiresAt) > Date.now()) {
+    return { ...cachedAggregate.payload, cacheStatus: "fresh", dataProfile: config.profile, updateCadence: config.updateCadence };
   }
-  try {
-    const response = await boundedFetch(config.endpoint.toString(), {
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-        "User-Agent": config.userAgent,
-      },
-      body: new URLSearchParams({ data: plan.query }).toString(),
-    }, (config.queryTimeoutSeconds + 5) * 1_000, 6 * 1024 * 1024);
-    const result = parseOverpassExposure(JSON.parse(response));
+
+  const priorRefreshStartedAt = continuing && pending.refreshStartedAt && Number.isFinite(Date.parse(pending.refreshStartedAt)) ? pending.refreshStartedAt : undefined;
+  const refreshStartedAt = force ? new Date().toISOString() : priorRefreshStartedAt;
+  const priorParts = new Map((continuing ? pending.parts ?? [] : []).map((part) => [part.chunkId, part]));
+  const readyChunks = new Map<string, { result: OverpassExposureChunkResult; fetchedAt: string }>();
+  for (const chunk of plan.chunks) {
+    const cached = await readExposureChunkCache(overpassCacheKey(config, "exposure", `chunk-v1:${chunk.chunkId}`), chunk.chunkId, chunk.areaKm2);
+    if (!cached || Date.parse(cached.expiresAt) <= Date.now()) continue;
+    if (refreshStartedAt && Date.parse(cached.fetchedAt) < Date.parse(refreshStartedAt)) continue;
+    readyChunks.set(chunk.chunkId, { result: cached.result, fetchedAt: cached.fetchedAt });
+  }
+
+  let attemptedChunkId = "";
+  let attemptedAt = "";
+  let attemptError = "";
+  if (readyChunks.size < plan.chunks.length) {
+    const next = plan.chunks
+      .filter((chunk) => !readyChunks.has(chunk.chunkId))
+      .sort((left, right) => (priorParts.get(left.chunkId)?.attempts ?? 0) - (priorParts.get(right.chunkId)?.attempts ?? 0) || left.chunkId.localeCompare(right.chunkId))[0];
+    attemptedChunkId = next.chunkId;
+    attemptedAt = new Date().toISOString();
+    try {
+      const response = await boundedFetch(config.endpoint.toString(), {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+          "User-Agent": config.userAgent,
+        },
+        body: new URLSearchParams({ data: next.query }).toString(),
+      }, (config.queryTimeoutSeconds + 5) * 1_000, 6 * 1024 * 1024);
+      const result = parseOverpassExposureChunk(JSON.parse(response), next.chunkId, next.areaKm2);
+      const stored = await writeExposureChunkCache(overpassCacheKey(config, "exposure", `chunk-v1:${next.chunkId}`), result, attemptedAt, config);
+      if (!stored) throw new Error("分块去重索引超过缓存安全上限，请缩小 AOI 或使用自建 OSM 服务");
+      readyChunks.set(next.chunkId, { result, fetchedAt: attemptedAt });
+    } catch (error) {
+      attemptError = safeUpstreamMessage(error, `${config.profileLabel}第 ${plan.chunks.indexOf(next) + 1} 块暂时不可用`);
+    }
+  }
+
+  const parts: OsmExposurePart[] = plan.chunks.map((chunk) => {
+    const ready = readyChunks.get(chunk.chunkId);
+    const prior = priorParts.get(chunk.chunkId);
+    if (ready) return {
+      chunkId: chunk.chunkId,
+      areaKm2: chunk.areaKm2,
+      state: "ready",
+      attempts: chunk.chunkId === attemptedChunkId ? (prior?.attempts ?? 0) + 1 : Math.max(1, prior?.attempts ?? 0),
+      fetchedAt: ready.fetchedAt,
+      lastAttemptAt: chunk.chunkId === attemptedChunkId ? attemptedAt : prior?.lastAttemptAt,
+      message: "分块已缓存并纳入跨块 ID 去重",
+    };
+    if (chunk.chunkId === attemptedChunkId && attemptError) return {
+      chunkId: chunk.chunkId,
+      areaKm2: chunk.areaKm2,
+      state: "unavailable",
+      attempts: (prior?.attempts ?? 0) + 1,
+      lastAttemptAt: attemptedAt,
+      message: attemptError,
+    };
+    return prior ?? { chunkId: chunk.chunkId, areaKm2: chunk.areaKm2, state: "waiting", attempts: 0, message: "等待受控查询" };
+  });
+
+  if (readyChunks.size === plan.chunks.length) {
+    const result = aggregateOverpassExposureChunks(plan.chunks.map((chunk) => readyChunks.get(chunk.chunkId)!.result));
     const fetchedAt = new Date().toISOString();
     const ready: OsmExposure = {
       state: "ready",
@@ -259,32 +327,32 @@ async function fetchOsmExposure(aoi: ReturnType<typeof exposureAssessmentIdentit
       cacheStatus: "refreshed",
       dataProfile: config.profile,
       updateCadence: config.updateCadence,
-      message: `${config.profileLabel} · ${plan.queryBasis}；建筑和道路是已映射要素计数，关键设施最多返回 300 个地图点位`,
+      completedParts: plan.chunks.length,
+      totalParts: plan.chunks.length,
+      parts,
+      planHash: plan.planHash,
+      message: `${config.profileLabel} · 已完成 ${plan.chunks.length}/${plan.chunks.length} 个非重叠分块，并按 OSM 类型与 ID 跨块去重；关键设施地图最多显示 300 个点位`,
     };
-    await writeExposureCache(cacheKey, ready, config);
+    await writeExposureCache(aggregateCacheKey, ready, config);
     return ready;
-  } catch (error) {
-    const cachedFetchedAt = cached ? Date.parse(cached.fetchedAt) : Number.NaN;
-    if (cached && Number.isFinite(cachedFetchedAt) && cachedFetchedAt + config.staleIfErrorMs > Date.now()) {
-      return {
-        ...cached.payload,
-        cacheStatus: "stale",
-        dataProfile: config.profile,
-        updateCadence: config.updateCadence,
-        message: `${cached.payload.message}；${config.profileLabel}刷新失败，当前使用 ${cached.fetchedAt} 的过期缓存，禁止据此认定设施或道路没有变化`,
-      };
-    }
-    return {
-      state: "unavailable",
-      provider: "OpenStreetMap · Overpass",
-      dataProfile: config.profile,
-      updateCadence: config.updateCadence,
-      facilityCounts: {},
-      facilities: [],
-      facilitiesTruncated: false,
-      message: safeUpstreamMessage(error, `${config.profileLabel}当前不可用`),
-    };
   }
+
+  const failedParts = parts.filter((part) => part.state === "unavailable").length;
+  return {
+    state: "pending",
+    provider: "OpenStreetMap · Overpass",
+    dataProfile: config.profile,
+    updateCadence: config.updateCadence,
+    facilityCounts: {},
+    facilities: [],
+    facilitiesTruncated: false,
+    completedParts: readyChunks.size,
+    totalParts: plan.chunks.length,
+    parts,
+    planHash: plan.planHash,
+    refreshStartedAt,
+    message: `${plan.message}；已完成 ${readyChunks.size}/${plan.chunks.length}${failedParts ? `，${failedParts} 块本轮失败，将优先续算未尝试分块后再重试` : ""}。未完成全部分块前不生成建筑、道路或设施总数`,
+  };
 }
 
 function worldPopEndpoint() {
@@ -374,6 +442,76 @@ function privateLiteral(hostname: string) {
 
 function delay(milliseconds: number) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function emptyOsmExposure(state: "skipped" | "unavailable", config: OverpassRuntimeConfig, message: string): OsmExposure {
+  return {
+    state,
+    provider: "OpenStreetMap · Overpass",
+    dataProfile: config.profile,
+    updateCadence: config.updateCadence,
+    facilityCounts: {},
+    facilities: [],
+    facilitiesTruncated: false,
+    message,
+  };
+}
+
+async function readExposureChunkCache(cacheKey: string, chunkId: string, areaKm2: number) {
+  try {
+    const cached = await getOsmQueryCache<CachedOsmExposureChunk>(cacheKey, "exposure");
+    const payload = cached?.payload;
+    if (!cached || !payload || payload.schemaVersion !== "osm-exposure-chunk-v1" || payload.chunkId !== chunkId) return null;
+    if (!Array.isArray(payload.facilityIds) || payload.facilityIds.length > 50_000 || payload.facilityIds.some((id) => !/^(node|way|relation):[1-9]\d*$/.test(id))) return null;
+    if (!Array.isArray(payload.facilities) || payload.facilities.length > 5_000 || payload.facilities.some((facility) => !validCachedFacility(facility))) return null;
+    const result: OverpassExposureChunkResult = {
+      chunkId,
+      areaKm2,
+      buildingIds: decodeOsmIdDeltas(payload.buildingIdDeltas),
+      roadWayIds: decodeOsmIdDeltas(payload.roadWayIdDeltas),
+      facilityIds: [...new Set(payload.facilityIds)].sort(),
+      facilities: payload.facilities,
+      osmBaseTimestamp: payload.osmBaseTimestamp,
+    };
+    return { ...cached, result };
+  } catch {
+    return null;
+  }
+}
+
+async function writeExposureChunkCache(cacheKey: string, result: OverpassExposureChunkResult, fetchedAt: string, config: OverpassRuntimeConfig) {
+  const payload: CachedOsmExposureChunk = {
+    schemaVersion: "osm-exposure-chunk-v1",
+    chunkId: result.chunkId,
+    areaKm2: result.areaKm2,
+    buildingIdDeltas: encodeOsmIdDeltas(result.buildingIds),
+    roadWayIdDeltas: encodeOsmIdDeltas(result.roadWayIds),
+    facilityIds: result.facilityIds,
+    facilities: result.facilities,
+    osmBaseTimestamp: result.osmBaseTimestamp,
+    fetchedAt,
+  };
+  return upsertOsmQueryCache({
+    cacheKey,
+    queryKind: "exposure",
+    dataProfile: config.profile,
+    payload,
+    fetchedAt,
+    expiresAt: overpassFreshUntil(fetchedAt, config),
+    osmBaseTimestamp: result.osmBaseTimestamp,
+  });
+}
+
+function validCachedFacility(value: unknown): value is ExposureFacility {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const facility = value as Partial<ExposureFacility>;
+  return typeof facility.id === "string" && facility.id.length <= 180
+    && ["health", "emergency", "shelter", "education", "power", "water"].includes(String(facility.kind))
+    && typeof facility.name === "string" && facility.name.length <= 160
+    && Number.isFinite(facility.latitude) && facility.latitude! >= -90 && facility.latitude! <= 90
+    && Number.isFinite(facility.longitude) && facility.longitude! >= -180 && facility.longitude! <= 180
+    && ["node", "way", "relation"].includes(String(facility.osmType))
+    && Number.isSafeInteger(facility.osmId) && facility.osmId! > 0;
 }
 
 async function readExposureCache(cacheKey: string) {

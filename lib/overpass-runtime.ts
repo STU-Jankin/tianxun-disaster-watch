@@ -4,6 +4,7 @@ export type OverpassCacheStatus = "refreshed" | "fresh" | "stale";
 // Covers the standard 30 km earthquake screening circle (~2,827 km²) with
 // modest geometric headroom while still rejecting genuinely broad scans.
 export const publicOverpassMaximumAreaKm2 = 3_500;
+export const publicOverpassChunkAreaKm2 = 750;
 
 export type OverpassRuntimeConfig = {
   endpoint: URL;
@@ -12,6 +13,7 @@ export type OverpassRuntimeConfig = {
   dataScope: "global_public" | "china";
   updateCadence: "upstream" | "daily";
   maximumAreaKm2: number;
+  chunkAreaKm2: number;
   cacheTtlMs: number;
   staleIfErrorMs: number;
   queryTimeoutSeconds: number;
@@ -33,6 +35,9 @@ export function resolveOverpassRuntimeConfig(environment: Record<string, string 
   const maximumAreaKm2 = profile === "public"
     ? publicOverpassMaximumAreaKm2
     : boundedNumber(environment.OVERPASS_MAX_AREA_KM2, 50_000, 2_500, 100_000);
+  const chunkAreaKm2 = profile === "public"
+    ? publicOverpassChunkAreaKm2
+    : boundedNumber(environment.OVERPASS_CHUNK_AREA_KM2, 2_500, 100, Math.min(5_000, maximumAreaKm2));
   const cacheTtlHours = profile === "public"
     ? boundedNumber(environment.OVERPASS_CACHE_TTL_HOURS, 24, 1, 24)
     : boundedNumber(environment.OVERPASS_CACHE_TTL_HOURS, 26, 6, 72);
@@ -48,6 +53,7 @@ export function resolveOverpassRuntimeConfig(environment: Record<string, string 
     dataScope: profile === "china_daily" ? "china" : "global_public",
     updateCadence: profile === "china_daily" ? "daily" : "upstream",
     maximumAreaKm2,
+    chunkAreaKm2,
     cacheTtlMs: cacheTtlHours * 60 * 60_000,
     staleIfErrorMs: staleIfErrorHours * 60 * 60_000,
     queryTimeoutSeconds,

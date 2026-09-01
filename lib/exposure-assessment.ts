@@ -4,7 +4,7 @@ import { normalizeAntimeridianGeometry, validateGeoGeometry } from "./geo-geomet
 import { publicOverpassMaximumAreaKm2, type OverpassCacheStatus, type OverpassProfile } from "./overpass-runtime.ts";
 import polygonClipping, { type MultiPolygon as ClippingMultiPolygon, type Polygon as ClippingPolygon } from "polygon-clipping";
 
-export const exposureAssessmentModelVersion = "tianxun-exposure-screening-v3" as const;
+export const exposureAssessmentModelVersion = "tianxun-exposure-screening-v4" as const;
 export const maximumWorldPopAreaKm2 = 50_000;
 export const maximumOverpassAreaKm2 = publicOverpassMaximumAreaKm2;
 
@@ -64,7 +64,7 @@ export type WorldPopRequestChunk = {
 };
 
 export type OsmExposure = {
-  state: "ready" | "skipped" | "unavailable";
+  state: "ready" | "pending" | "skipped" | "unavailable";
   provider: "OpenStreetMap · Overpass";
   mappedBuildingCount?: number;
   mappedRoadWayCount?: number;
@@ -77,7 +77,38 @@ export type OsmExposure = {
   cacheStatus?: OverpassCacheStatus;
   dataProfile?: OverpassProfile;
   updateCadence?: "upstream" | "daily";
+  completedParts?: number;
+  totalParts?: number;
+  parts?: OsmExposurePart[];
+  planHash?: string;
+  refreshStartedAt?: string;
   message: string;
+};
+
+export type OsmExposurePart = {
+  chunkId: string;
+  areaKm2: number;
+  state: "ready" | "waiting" | "unavailable";
+  attempts: number;
+  fetchedAt?: string;
+  lastAttemptAt?: string;
+  message: string;
+};
+
+export type OverpassExposureChunkResult = {
+  chunkId: string;
+  areaKm2: number;
+  buildingIds: number[];
+  roadWayIds: number[];
+  facilityIds: string[];
+  facilities: ExposureFacility[];
+  osmBaseTimestamp?: string;
+};
+
+export type OverpassExposureQueryChunk = {
+  chunkId: string;
+  areaKm2: number;
+  query: string;
 };
 
 export type ExposureAssessment = {
@@ -175,6 +206,39 @@ export function worldPopRequestPlan(aoi: ExposureAoi, requestedYear = new Date()
   return { state: "ready" as const, year, resolution, payload: { geojson: aoi.geometry, year, resolution } };
 }
 
+export function prepareOverpassExposurePlan(aoi: ExposureAoi, options: { maximumAreaKm2?: number; chunkAreaKm2?: number; serviceLabel?: string; queryTimeoutSeconds?: number } = {}) {
+  const maximumAreaKm2 = Math.max(1, options.maximumAreaKm2 ?? maximumOverpassAreaKm2);
+  const serviceLabel = typeof options.serviceLabel === "string" && options.serviceLabel.trim() ? options.serviceLabel.trim().slice(0, 80) : "公共 Overpass";
+  if (aoi.crossesAntimeridian) return { state: "skipped" as const, message: `范围跨越日期变更线，${serviceLabel}分块查询未执行` };
+  if (aoi.areaKm2 > maximumAreaKm2) return {
+    state: "skipped" as const,
+    message: `范围 ${Math.round(aoi.areaKm2).toLocaleString()} km²，超过${serviceLabel}分块任务总量上限 ${Math.round(maximumAreaKm2).toLocaleString()} km²，已安全跳过 OSM；人口统计请以 WorldPop 状态为准`,
+  };
+  const chunkAreaKm2 = Math.max(25, Math.min(maximumAreaKm2, options.chunkAreaKm2 ?? maximumAreaKm2));
+  const geometries = aoi.areaKm2 > chunkAreaKm2 ? partitionExposureGeometry(aoi.geometry, chunkAreaKm2) : [aoi.geometry];
+  if (geometries.length > 64) return { state: "skipped" as const, message: `${serviceLabel}需要拆分为 ${geometries.length} 块，超过 64 块安全上限，请缩小 AOI` };
+  const chunks: OverpassExposureQueryChunk[] = geometries.map((geometry) => {
+    const validation = validateGeoGeometry(geometry, { maximumAreaKm2, maximumVertices: 20_000, maximumRingVertices: 5_000, allowOverlappingMultiPolygon: true });
+    if (!validation.ok) throw new Error(validation.reason || "OSM 分块几何无效");
+    const queryPlan = prepareOverpassExposureQuery({ ...aoi, geometry, areaKm2: validation.areaKm2, bbox: geometryBbox(geometry) }, {
+      maximumAreaKm2: chunkAreaKm2,
+      serviceLabel,
+      queryTimeoutSeconds: options.queryTimeoutSeconds,
+    });
+    if (queryPlan.state !== "ready") throw new Error(queryPlan.message);
+    return { chunkId: queryPlan.cacheIdentity, areaKm2: validation.areaKm2, query: queryPlan.query };
+  });
+  const cacheIdentity = `osm-chunk-v1:${aoiFingerprint(aoi.geometry)}`;
+  return {
+    state: "ready" as const,
+    cacheIdentity,
+    planHash: `${cacheIdentity}:${Math.round(chunkAreaKm2 * 100)}:${chunks.length}`,
+    chunks,
+    queryBasis: "AOI 外环非重叠分块；建筑、道路和设施按 OSM 类型与 ID 跨块去重；内洞暂不从查询中扣除" as const,
+    message: chunks.length > 1 ? `将按 ${chunks.length} 个非重叠分块受控查询，每次处理 1 块并保存进度` : "范围较小，使用单个受控查询块",
+  };
+}
+
 export function prepareOverpassExposureQuery(aoi: ExposureAoi, options: { maximumAreaKm2?: number; serviceLabel?: string; queryTimeoutSeconds?: number } = {}) {
   const maximumAreaKm2 = Math.max(1, options.maximumAreaKm2 ?? maximumOverpassAreaKm2);
   const serviceLabel = typeof options.serviceLabel === "string" && options.serviceLabel.trim() ? options.serviceLabel.trim().slice(0, 80) : "公共 Overpass";
@@ -194,9 +258,111 @@ export function prepareOverpassExposureQuery(aoi: ExposureAoi, options: { maximu
     state: "ready" as const,
     bbox: aoi.bbox,
     cacheIdentity: aoiFingerprint(aoi.geometry),
-    queryBasis: "AOI 外环多边形筛查；内洞暂不从公共 OSM 查询中扣除" as const,
-    query: `[out:json][timeout:${timeoutSeconds}];\n(\n${selectors("way[\"building\"]")}\n)->.buildings;\n(\n${selectors("way[\"highway\"]")}\n)->.roads;\n(\n${selectors(`nwr["amenity"~"^(${facilityAmenity})$"]`)}\n${selectors("nwr[\"emergency\"=\"ambulance_station\"]")}\n${selectors("nwr[\"power\"~\"^(plant|substation)$\"]")}\n${selectors("nwr[\"man_made\"~\"^(water_works|wastewater_plant|pumping_station)$\"]")}\n)->.facilities;\n.buildings out count;\n.roads out count;\n.facilities out count;\n.facilities out center qt 300;`,
+    queryBasis: "AOI 外环多边形筛查；按 OSM 类型与 ID 去重" as const,
+    query: `[out:json][timeout:${timeoutSeconds}];\n(\n${selectors("way[\"building\"]")}\n)->.buildings;\n(\n${selectors("way[\"highway\"]")}\n)->.roads;\n(\n${selectors(`nwr["amenity"~"^(${facilityAmenity})$"]`)}\n${selectors("nwr[\"emergency\"=\"ambulance_station\"]")}\n${selectors("nwr[\"power\"~\"^(plant|substation)$\"]")}\n${selectors("nwr[\"man_made\"~\"^(water_works|wastewater_plant|pumping_station)$\"]")}\n)->.facilities;\n.buildings out ids qt;\n.buildings out count;\n.roads out ids qt;\n.roads out count;\n.facilities out center qt;\n.facilities out count;`,
   };
+}
+
+export function parseOverpassExposureChunk(payload: unknown, chunkId: string, areaKm2: number): OverpassExposureChunkResult {
+  if (!payload || typeof payload !== "object" || !Array.isArray((payload as { elements?: unknown }).elements)) throw new Error("Overpass 分块响应结构无效");
+  const record = payload as { osm3s?: { timestamp_osm_base?: unknown }; elements: Array<Record<string, unknown>> };
+  const buildingIds = new Set<number>();
+  const roadWayIds = new Set<number>();
+  const facilityIds = new Set<string>();
+  const facilities = new Map<string, ExposureFacility>();
+  const counts: number[] = [];
+  let section = 0;
+  for (const element of record.elements) {
+    if (element.type === "count") {
+      const count = countTotal(element);
+      if (count === null) throw new Error("Overpass 分块统计缺少计数");
+      counts.push(count);
+      section += 1;
+      continue;
+    }
+    const type = String(element.type ?? "");
+    const osmId = numberValue(element.id);
+    if (!Number.isSafeInteger(osmId) || osmId! <= 0 || !["node", "way", "relation"].includes(type)) throw new Error("Overpass 分块返回无效要素 ID");
+    if (section === 0) {
+      if (type !== "way") throw new Error("Overpass 建筑分块返回非 way 要素");
+      buildingIds.add(osmId!);
+    } else if (section === 1) {
+      if (type !== "way") throw new Error("Overpass 道路分块返回非 way 要素");
+      roadWayIds.add(osmId!);
+    } else if (section === 2) {
+      facilityIds.add(`${type}:${osmId}`);
+      for (const facility of overpassFacility(element)) facilities.set(facility.id, facility);
+    } else {
+      throw new Error("Overpass 分块响应出现未定义区段");
+    }
+  }
+  if (counts.length !== 3) throw new Error("Overpass 分块响应缺少建筑、道路或设施区段");
+  if (counts[0] !== buildingIds.size || counts[1] !== roadWayIds.size || counts[2] !== facilityIds.size) throw new Error("Overpass 分块 ID 数量与统计计数不一致");
+  return {
+    chunkId,
+    areaKm2,
+    buildingIds: [...buildingIds].sort((left, right) => left - right),
+    roadWayIds: [...roadWayIds].sort((left, right) => left - right),
+    facilityIds: [...facilityIds].sort(),
+    facilities: [...facilities.values()].sort((left, right) => left.id.localeCompare(right.id)),
+    osmBaseTimestamp: typeof record.osm3s?.timestamp_osm_base === "string" ? record.osm3s.timestamp_osm_base : undefined,
+  };
+}
+
+export function aggregateOverpassExposureChunks(chunks: OverpassExposureChunkResult[]): OverpassExposureResult {
+  if (!chunks.length) throw new Error("没有可汇总的 OSM 分块");
+  const buildingIds = new Set<number>();
+  const roadWayIds = new Set<number>();
+  const facilityIds = new Set<string>();
+  const facilities = new Map<string, ExposureFacility>();
+  for (const chunk of chunks) {
+    chunk.buildingIds.forEach((id) => buildingIds.add(id));
+    chunk.roadWayIds.forEach((id) => roadWayIds.add(id));
+    chunk.facilityIds.forEach((id) => facilityIds.add(id));
+    chunk.facilities.forEach((facility) => facilities.set(facility.id, facility));
+  }
+  const allFacilities = [...facilities.values()].sort((left, right) => left.id.localeCompare(right.id));
+  const facilityCounts: Partial<Record<ExposureFacilityKind, number>> = {};
+  for (const facility of allFacilities) facilityCounts[facility.kind] = (facilityCounts[facility.kind] ?? 0) + 1;
+  const timestamps = chunks.map((chunk) => chunk.osmBaseTimestamp).filter((value): value is string => Boolean(value)).sort();
+  return {
+    mappedBuildingCount: buildingIds.size,
+    mappedRoadWayCount: roadWayIds.size,
+    mappedKeyFacilityCount: facilityIds.size,
+    facilityCounts,
+    facilities: allFacilities.slice(0, 300),
+    facilitiesTruncated: facilityIds.size > 300 || facilityIds.size > allFacilities.length,
+    osmBaseTimestamp: timestamps[0],
+  };
+}
+
+export function encodeOsmIdDeltas(ids: number[]) {
+  const sorted = [...new Set(ids)].sort((left, right) => left - right);
+  let prior = 0;
+  return sorted.map((id) => {
+    if (!Number.isSafeInteger(id) || id <= 0) throw new Error("OSM ID 无效");
+    const delta = id - prior;
+    prior = id;
+    return delta.toString(36);
+  }).join(".");
+}
+
+export function decodeOsmIdDeltas(encoded: string, maximumIds = 500_000) {
+  if (typeof encoded !== "string" || encoded.length > 4 * 1024 * 1024) throw new Error("OSM ID 缓存无效");
+  if (!encoded) return [];
+  const parts = encoded.split(".");
+  if (parts.length > maximumIds) throw new Error("OSM ID 缓存超过数量上限");
+  const ids: number[] = [];
+  let prior = 0;
+  for (const part of parts) {
+    if (!/^[0-9a-z]+$/.test(part)) throw new Error("OSM ID 缓存编码无效");
+    const delta = Number.parseInt(part, 36);
+    const id = prior + delta;
+    if (!Number.isSafeInteger(delta) || delta <= 0 || !Number.isSafeInteger(id)) throw new Error("OSM ID 缓存数值无效");
+    ids.push(id);
+    prior = id;
+  }
+  return ids;
 }
 
 export function parseOverpassExposure(payload: unknown): OverpassExposureResult {
@@ -271,7 +437,7 @@ export function exposureRiskInput(population: PopulationExposure, osm: OsmExposu
 }
 
 export function exposureAssessmentStatus(population: PopulationExposure, osm: OsmExposure): ExposureAssessment["status"] {
-  if (population.state === "pending") return "pending";
+  if (population.state === "pending" || osm.state === "pending") return "pending";
   if (population.state === "ready" && osm.state === "ready") return "complete";
   if (population.state === "ready" || osm.state === "ready") return "partial";
   return "unavailable";
@@ -319,20 +485,20 @@ function outerPolygonRings(geometry: EventGeometry): Array<Array<[number, number
 }
 
 export function partitionExposureGeometry(geometry: EventGeometry, maximumAreaKm2: number): EventGeometry[] {
-  if (geometry.type !== "Polygon" && geometry.type !== "MultiPolygon") throw new Error("WorldPop 分块仅支持 Polygon/MultiPolygon");
-  const targetAreaKm2 = Math.max(1_000, maximumAreaKm2);
+  if (geometry.type !== "Polygon" && geometry.type !== "MultiPolygon") throw new Error("暴露度分块仅支持 Polygon/MultiPolygon");
+  const targetAreaKm2 = Math.max(1, maximumAreaKm2);
   const queue: EventGeometry[] = [geometry];
   const completed: EventGeometry[] = [];
   let splits = 0;
   while (queue.length) {
     const current = queue.shift()!;
     const validation = validateGeoGeometry(current, { maximumAreaKm2: 25_000_000, maximumVertices: 20_000, maximumRingVertices: 5_000, allowOverlappingMultiPolygon: true });
-    if (!validation.ok) throw new Error(validation.reason || "WorldPop 分块前几何无效");
+    if (!validation.ok) throw new Error(validation.reason || "暴露度分块前几何无效");
     if (validation.areaKm2 <= targetAreaKm2) {
       completed.push(current);
       continue;
     }
-    if (splits >= 64) throw new Error("WorldPop 范围分块过多，请缩小 AOI");
+    if (splits >= 64) throw new Error("暴露度范围分块过多，请缩小 AOI");
     splits += 1;
     const bbox = geometryBbox(current);
     const centerLatitude = (bbox[1] + bbox[3]) / 2;
@@ -344,7 +510,7 @@ export function partitionExposureGeometry(geometry: EventGeometry, maximumAreaKm
       ? [[bbox[0], bbox[1], midpoint, bbox[3]], [midpoint, bbox[1], bbox[2], bbox[3]]]
       : [[bbox[0], bbox[1], bbox[2], midpoint], [bbox[0], midpoint, bbox[2], bbox[3]]];
     const children = boxes.flatMap((box) => intersectGeometryWithBbox(current, box));
-    if (children.length < 2) throw new Error("WorldPop 范围无法安全分块，请缩小 AOI");
+    if (children.length < 2) throw new Error("暴露度范围无法安全分块，请缩小 AOI");
     queue.push(...children);
   }
   return completed.sort((left, right) => {

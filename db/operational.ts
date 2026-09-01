@@ -580,9 +580,9 @@ export async function getOsmQueryCache<T = unknown>(cacheKey: string, queryKind:
   }
 }
 
-export async function upsertOsmQueryCache<T>(record: OsmQueryCacheRecord<T>): Promise<void> {
+export async function upsertOsmQueryCache<T>(record: OsmQueryCacheRecord<T>): Promise<boolean> {
   const payloadJson = JSON.stringify(record.payload);
-  if (payloadJson.length > 2 * 1024 * 1024) return;
+  if (payloadJson.length > 2 * 1024 * 1024) return false;
   await ensureOperationalSchema();
   const db = await database();
   await db.prepare(`INSERT INTO osm_query_cache (cache_key, query_kind, data_profile, payload_json, fetched_at, expires_at, osm_base_timestamp)
@@ -594,6 +594,7 @@ export async function upsertOsmQueryCache<T>(record: OsmQueryCacheRecord<T>): Pr
     db.prepare(`DELETE FROM osm_query_cache WHERE expires_at < ?`).bind(retentionCutoff),
     db.prepare(`DELETE FROM osm_query_cache WHERE cache_key IN (SELECT cache_key FROM osm_query_cache ORDER BY fetched_at DESC LIMIT -1 OFFSET 500)`),
   ]);
+  return true;
 }
 
 export function collapseCanonicalEventsByMasterId(events: DisasterEvent[]) {
