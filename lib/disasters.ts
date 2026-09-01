@@ -11,7 +11,7 @@ export type HazardType =
   | "ice";
 
 export type ScopeId = "wuxi" | "jiangsu" | "china" | "global";
-export type PhenomenonStage = "observed" | "forecast" | "warning" | "driver" | "context";
+export type PhenomenonStage = "observed" | "nowcast" | "forecast" | "warning" | "driver" | "context";
 export type HazardSubtype = "landslide" | "debris_flow" | "rockfall" | "slope_failure" | "mass_movement";
 
 export type EventEvidence = {
@@ -343,13 +343,13 @@ export function calculateTimeScore(occurredAt: string, temporal: { phenomenonSta
   const now = Date.now();
   const stage = temporal.phenomenonStage ?? "observed";
   if (stage === "driver" || stage === "context") return stage === "driver" ? 0 : 4;
-  if (stage === "warning" || stage === "forecast") {
+  if (stage === "warning" || stage === "forecast" || stage === "nowcast") {
     const issued = new Date(temporal.issuedAt ?? occurredAt).getTime();
     const validFrom = new Date(temporal.validFrom ?? occurredAt).getTime();
     if (!Number.isFinite(issued) || !Number.isFinite(validFrom)) return 0;
     const issueAgeHours = Math.max(0, (now - issued) / 3_600_000);
     const leadHours = Math.max(0, (validFrom - now) / 3_600_000);
-    const ceiling = stage === "warning" ? 18 : 15;
+    const ceiling = stage === "warning" ? 18 : stage === "forecast" ? 15 : 12;
     return Math.max(0, Math.round(ceiling * 2 ** (-issueAgeHours / 72) * 2 ** (-leadHours / 120)));
   }
   if (occurred > now + 5 * 60_000) return 0;
@@ -393,7 +393,7 @@ export function getObservationTimeline(
   const stage = context.phenomenonStage ?? "observed";
   const goldenHours = policy.goldenHours;
   const now = Date.now();
-  if (stage === "forecast" || stage === "warning") {
+  if (stage === "forecast" || stage === "warning" || stage === "nowcast") {
     const referenceAt = Number.isFinite(validFrom) ? validFrom : Number.isFinite(issued) ? issued : latestActivity;
     const horizonEnd = (Number.isFinite(issued) ? issued : latestActivity) + policy.forecastHorizonHours * 3_600_000;
     const declaredEnd = declaredEnds.length ? Math.min(...declaredEnds) : horizonEnd;
@@ -410,7 +410,7 @@ export function getObservationTimeline(
       referenceAt: new Date(referenceAt).toISOString(),
       phase,
       requiresReview: !declaredEnds.length,
-      rationale: `${stage === "forecast" ? "预报" : "预警"}任务严格截止于权威有效期；严重度不延长官方报次。${policy.rationale}`,
+      rationale: `${stage === "forecast" ? "预报" : stage === "nowcast" ? "临近危险" : "预警"}任务严格截止于产品或权威有效期；严重度不延长报次。${policy.rationale}`,
     };
   }
   const longTermTarget = (context.targets ?? []).some((target) => /形变|过火|烧毁|植被|水体|岸线|堆积|退水|损毁|冰|雪/.test(target));

@@ -1985,7 +1985,7 @@ function canonicalizeEvents(events: DisasterEvent[]) {
 }
 
 function phenomenonStageRank(value: PhenomenonStage) {
-  return { driver: 1, context: 2, forecast: 3, warning: 4, observed: 5 }[value];
+  return { driver: 1, context: 2, forecast: 3, nowcast: 3, warning: 4, observed: 5 }[value];
 }
 
 function severityRank(value: DisasterEvent["severity"]) {

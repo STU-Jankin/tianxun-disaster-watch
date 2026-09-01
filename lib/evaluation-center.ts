@@ -489,7 +489,7 @@ function candidateMatches(benchmark: EvaluationBenchmarkCase, candidate: Evaluat
 
 function forecastCandidateSpatiallyMatches(benchmark: EvaluationBenchmarkCase, candidate: EvaluationCandidate) {
   const event = candidate.event;
-  if (benchmark.hazard !== "landslide" || event.hazard !== "landslide" || !["forecast", "warning"].includes(event.phenomenonStage)) return false;
+  if (benchmark.hazard !== "landslide" || event.hazard !== "landslide" || !["forecast", "nowcast", "warning"].includes(event.phenomenonStage)) return false;
   const capturedAtMs = Date.parse(candidate.capturedAt);
   const occurredAtMs = Date.parse(benchmark.occurredAt);
   const leadMinutes = (occurredAtMs - capturedAtMs) / 60_000;

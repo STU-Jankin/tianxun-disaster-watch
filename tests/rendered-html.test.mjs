@@ -193,7 +193,7 @@ test("includes free official tsunami, typhoon, CAP and volcano-status connectors
   assert.match(route, /selectBalancedEvents/);
   assert.match(route, /information statement\|cancell\?ation/);
   assert.match(disasters, /tsunami: \{ goldenHours: 24, followupHours: 336, hardReviewHours: 720/);
-  assert.match(disasters, /PhenomenonStage = "observed" \| "forecast" \| "warning"/);
+  assert.match(disasters, /PhenomenonStage = "observed" \| "nowcast" \| "forecast" \| "warning"/);
 });
 
 test("models canonical events, evidence provenance and AOI dispatch gates", async () => {

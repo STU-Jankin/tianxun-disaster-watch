@@ -32,6 +32,7 @@ import { amapTravelModeLabels, type AmapRoadRoutingResponse, type AmapTravelMode
 import { isRoadDisruptionList, normalizeRoadDisruptionGeoJson, roadDisruptionFeatureCollection, roadDisruptionKindLabel, type RoadDisruption, type RoadDisruptionRegistryEntry } from "../lib/response-disruptions";
 import { infrastructureKindLabel, isInfrastructureAssessment, type InfrastructureAssessment } from "../lib/osm-infrastructure";
 import { deriveLandslideWorkflow, landslideSarTemplates, type LandslideSarTemplate, type LandslideTerrainResult, type LandslideTerrainScreening } from "../lib/landslide-planning";
+import type { LandslideForecastReady, LandslideForecastResponse } from "../lib/landslide-forecast";
 import { sarImagingModeOptions, sarPayloadProfiles, type SarImagingModeId } from "../lib/satellite-payloads";
 import { cycloneTrackingGeometry, cycloneTrackingSliceAt, nearestCycloneFrameIndex, type CycloneTrackingTarget } from "../lib/cyclone-tracking-target";
 import type { MissionPlanningProblem, MissionPlanningSummary, PlanningConstraintAssessment } from "../lib/mission-planning";
@@ -68,7 +69,7 @@ const severityLabels = { red: "红色", orange: "橙色", yellow: "黄色", blue
 const severityRanks = { blue: 1, yellow: 2, orange: 3, red: 4 };
 const locationQualityLabels: Record<DisasterEvent["locationQuality"], string> = { precise: "精确点位", estimated: "估算点位", representative: "区域代表点", unknown: "位置待核验" };
 const confidenceLabels: Record<DisasterEvent["confidenceLevel"], string> = { high: "高可信", medium: "中可信", low: "低可信" };
-const phenomenonLabels: Record<DisasterEvent["phenomenonStage"], string> = { observed: "实况", forecast: "预报", warning: "预警", driver: "驱动因子", context: "背景资料" };
+const phenomenonLabels: Record<DisasterEvent["phenomenonStage"], string> = { observed: "实况", nowcast: "临近危险", forecast: "预报", warning: "预警", driver: "驱动因子", context: "背景资料" };
 const observationPhaseLabels: Record<DisasterEvent["observationPhase"], string> = { forecast: "预报候选期", golden: "黄金观测期", followup: "后续观测期", archive: "已归档" };
 const taskFieldLabels: Record<string, string> = {
   aoiType: "AOI 类型",
@@ -2300,7 +2301,7 @@ function DetailPanel({ event, exposureAssessment, onExposureChange, currentUser,
     </div>
     <div className="observation-deadline"><span>{observationDeadlineLabel(event)}</span><strong>{remainingObservationTime(observationDeadline(event))}</strong><small>{event.observationRationale} 复核点 {formatTimeWithYear(event.observationReviewAt)}；有效期/归档点 {formatTimeWithYear(event.observationExpiresAt)} UTC+08。</small></div>
     <WeatherForecastCard latitude={event.latitude} longitude={event.longitude} maximumCloudPercent={30} />
-    {event.hazard === "landslide" ? <LandslidePlanningCard key={event.masterEventId} event={event} terrain={terrainScreening} templateCount={landslideTemplateCount} taskAllowed={canBuildTerrainTask} onTerrainChange={onTerrainChange} onAddTasks={(screening) => onAddLandslideTasks(event, screening)} /> : null}
+    {event.hazard === "landslide" ? <><LandslideForecastCard key={`forecast-${event.masterEventId}`} event={event} /><LandslidePlanningCard key={event.masterEventId} event={event} terrain={terrainScreening} templateCount={landslideTemplateCount} taskAllowed={canBuildTerrainTask} onTerrainChange={onTerrainChange} onAddTasks={(screening) => onAddLandslideTasks(event, screening)} /></> : null}
     {event.cycloneForecast ? <section className="cyclone-forecast-card">
       <h3>官方台风预报 · {event.cycloneForecast.source}</h3>
       <div className="forecast-validity"><span>发布 {formatTimeWithYear(event.cycloneForecast.issuedAt)} UTC+08</span><span>有效至 {formatTimeWithYear(event.cycloneForecast.forecastValidUntil)} UTC+08</span></div>
@@ -2323,7 +2324,7 @@ function DetailPanel({ event, exposureAssessment, onExposureChange, currentUser,
     <section className="evidence-chain"><h3>证据链</h3>{event.evidence.map((item, index) => <a key={`${item.source}-${item.sourceEventId}-${item.role}-${index}`} href={safeHttpUrl(item.sourceUrl)} target="_blank" rel="noreferrer"><span>{item.source}</span><small>{evidenceRoleLabel(item.role)} · {formatTime(item.observedAt)}</small></a>)}</section>
     {event.updateCount > 1 ? <section className="update-history"><h3>过程更新 · 共 {event.updateCount} 期</h3>{event.updateHistory.slice(0, 8).map((item, index) => <a key={`${item.source}-${item.sourceEventId}`} href={safeHttpUrl(item.sourceUrl)} target="_blank" rel="noreferrer"><i>{index === 0 ? "最新" : String(event.updateCount - index).padStart(2, "0")}</i><span><strong>{item.title}</strong><small>{item.source} · {formatTimeWithYear(item.observedAt)}</small></span></a>)}</section> : null}
     <dl>
-      <div><dt>{event.phenomenonStage === "observed" ? "发生时间" : "发布时间"}</dt><dd>{formatTimeWithYear(event.phenomenonStage === "observed" ? event.occurredAt : event.issuedAt)} UTC+08</dd></div>
+      <div><dt>{event.phenomenonStage === "observed" ? "发生时间" : event.phenomenonStage === "nowcast" ? "临近产品时间" : "发布时间"}</dt><dd>{formatTimeWithYear(event.phenomenonStage === "observed" ? event.occurredAt : event.issuedAt)} UTC+08</dd></div>
       {event.validFrom ? <div><dt>生效时间</dt><dd>{formatTimeWithYear(event.validFrom)} UTC+08</dd></div> : null}
       {event.validTo ? <div><dt>权威有效至</dt><dd>{formatTimeWithYear(event.validTo)} UTC+08</dd></div> : null}
       <div><dt>最新更新</dt><dd>{formatTimeWithYear(event.updatedAt)} UTC+08</dd></div>
@@ -2481,6 +2482,51 @@ function exposureFacilityColor(kind: ExposureFacilityKind) {
 
 function impactRiskLabel(level: NonNullable<DisasterEvent["impactRisk"]>["level"]) {
   return level === "very_high" ? "极高" : level === "high" ? "高" : level === "moderate" ? "中" : level === "low" ? "低" : "待评估";
+}
+
+function LandslideForecastCard({ event }: { event: DisasterEvent }) {
+  const radiusKm = Math.min(20, Math.max(3, Number.isFinite(event.locationAccuracyKm) ? Math.ceil(event.locationAccuracyKm) : 10));
+  const [load, setLoad] = useState<{ state: "loading" | "ready" | "error"; forecast?: LandslideForecastReady; message?: string }>({ state: "loading" });
+  const [retry, setRetry] = useState(0);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const start = window.setTimeout(() => {
+      const params = new URLSearchParams({ latitude: String(event.latitude), longitude: String(event.longitude), radiusKm: String(radiusKm) });
+      setLoad({ state: "loading" });
+      fetch(`/api/landslide-forecast?${params}`, { signal: controller.signal, cache: "no-store" })
+        .then(async (response) => ({ response, result: await response.json() as LandslideForecastResponse }))
+        .then(({ response, result }) => {
+          if (result.state === "ready") setLoad({ state: "ready", forecast: result });
+          else setLoad({ state: "error", message: result.message || `预报筛查请求失败（HTTP ${response.status}）` });
+        })
+        .catch((error) => { if (!controller.signal.aborted) setLoad({ state: "error", message: error instanceof Error ? error.message : "预报筛查请求失败" }); });
+    }, 0);
+    return () => { window.clearTimeout(start); controller.abort(); };
+  }, [event.latitude, event.longitude, radiusKm, retry]);
+
+  const forecast = load.forecast;
+  return <section className="landslide-forecast-card" aria-live="polite">
+    <div className="landslide-forecast-heading"><div><span>RAINFALL-TRIGGER OUTLOOK</span><h3>降雨触发预报 · 试验筛查</h3></div><strong>{load.state === "ready" ? "不自动告警" : load.state === "loading" ? "计算中" : "暂不可用"}</strong></div>
+    <div className="landslide-product-boundary" aria-label="滑坡危险信息时间层级">
+      <span><b>历史回算</b>检验过去表现</span><span><b>临近危险</b>判断当前条件</span><span className="active"><b>24/48h预报</b>人工预置任务</span><span><b>72h趋势</b>低置信监视</span>
+    </div>
+    {load.state === "loading" ? <p className="landslide-forecast-loading">正在读取未来降雨、本地10年降雨P95与DEM坡度…</p> : null}
+    {load.state === "error" ? <div className="landslide-forecast-error" role="alert"><strong>本轮未生成预报筛查</strong><p>{load.message}</p><button onClick={() => setRetry((value) => value + 1)}>重试</button></div> : null}
+    {forecast ? <>
+      <div className="landslide-forecast-meta"><span>查询 {forecast.latitude.toFixed(3)}°, {forecast.longitude.toFixed(3)}° · 半径 {forecast.radiusKm} km</span><span>计算 {formatTimeWithYear(forecast.fetchedAt)} UTC+08</span><span>本地基准 {forecast.baselinePeriod.start.slice(0, 4)}—{forecast.baselinePeriod.end.slice(0, 4)} · {forecast.baselinePeriod.validDayCount} 天</span><span>DEM最大近似坡度 {forecast.terrain.maximumSlopeDeg == null ? "—" : `${forecast.terrain.maximumSlopeDeg.toFixed(1)}°`}</span></div>
+      {forecast.inputWarnings.length ? <div className="landslide-input-warnings" role="status"><strong>本轮输入不完整，结果已降级</strong>{forecast.inputWarnings.map((warning) => <span key={warning}>{warning}</span>)}</div> : null}
+      <div className="landslide-horizons">{forecast.horizons.map((horizon) => <article key={horizon.leadHours} className={horizon.triggerLevel}>
+        <div><b>未来 {horizon.leadHours}h</b><time>{formatTimeWithYear(horizon.validFrom)}—{formatTimeWithYear(horizon.validTo)}</time></div>
+        <strong>{horizon.triggerLabel}</strong>
+        <dl><div><dt>24h预报雨量</dt><dd>{horizon.precipitationMm.toFixed(1)} mm</dd></div><div><dt>本地日雨P95</dt><dd>{horizon.localDailyP95Mm == null ? "—" : `${horizon.localDailyP95Mm.toFixed(1)} mm`}</dd></div><div><dt>相对P95</dt><dd>{horizon.rainfallExceedanceRatio == null ? "—" : `${horizon.rainfallExceedanceRatio.toFixed(2)}×`}</dd></div><div><dt>最大6h雨量</dt><dd>{horizon.maximumSixHourPrecipitationMm.toFixed(1)} mm</dd></div></dl>
+        <p>{horizon.action}</p>
+        <details><summary>查看判定依据</summary>{horizon.basis.map((item) => <small key={item}>{item}</small>)}<small>可信度：{horizon.confidence === "medium" ? "中等，仅供试验筛查" : horizon.confidence === "low" ? "低，仅作趋势" : "输入不足"}</small></details>
+      </article>)}</div>
+      <p className="landslide-forecast-boundary"><b>边界：</b>{forecast.dataBoundary}</p>
+      <details className="landslide-forecast-method"><summary>模型口径与数据来源</summary><p>{forecast.note}</p><div><a href={safeHttpUrl(forecast.sourceUrls.forecast)} target="_blank" rel="noreferrer">未来降雨 ↗</a><a href={safeHttpUrl(forecast.sourceUrls.climatology)} target="_blank" rel="noreferrer">历史基准 ↗</a><a href={safeHttpUrl(forecast.sourceUrls.terrain)} target="_blank" rel="noreferrer">DEM ↗</a><a href={safeHttpUrl(forecast.sourceUrls.method)} target="_blank" rel="noreferrer">NASA LHASA方法 ↗</a></div></details>
+    </> : null}
+  </section>;
 }
 
 function LandslidePlanningCard({ event, terrain, templateCount, taskAllowed, onTerrainChange, onAddTasks }: { event: DisasterEvent; terrain?: LandslideTerrainScreening; templateCount: number; taskAllowed: boolean; onTerrainChange: (terrain?: LandslideTerrainScreening) => void; onAddTasks: (terrain: LandslideTerrainScreening) => void }) {
@@ -3646,7 +3692,7 @@ function createSatelliteTask(event: DisasterEvent, operatorConfirmed: boolean): 
   const forecastEnd = event.cycloneForecast ? Date.parse(event.cycloneForecast.forecastValidUntil) : Number.POSITIVE_INFINITY;
   const cycloneForecastUsable = !event.cycloneForecast || forecastEnd > now + 3_600_000;
   const sourceVerified = event.dispatchEligibility === "ready" && cycloneForecastUsable;
-  const requestedStart = event.phenomenonStage === "forecast" || event.phenomenonStage === "warning"
+  const requestedStart = event.phenomenonStage === "forecast" || event.phenomenonStage === "nowcast" || event.phenomenonStage === "warning"
     ? Math.max(now, Date.parse(event.validFrom ?? event.issuedAt))
     : now;
   const phaseEnd = new Date(event.observationPhase === "golden" ? event.observationReviewAt : event.observationExpiresAt).getTime();

@@ -119,8 +119,8 @@ export function deriveLandslideWorkflow(event: Pick<DisasterEvent, "hazard" | "p
   if (event.sourcePresence === "retained" || event.lifecycleStatus === "monitoring") {
     return { stage: "followup", label: "后续复核期", evidenceMeaning: "当前短时源未再次报告，系统仅按原观测期保留。", dispatchRule: "只能用于残余形变或灾后复核，必须确认事件仍具观测价值。", requiresTerrainReview: true };
   }
-  if (event.phenomenonStage === "forecast" || event.phenomenonStage === "driver") {
-    return { stage: "risk_model", label: "模型风险信号", evidenceMeaning: "表示降雨/易发性条件，不是已经发生滑坡的遥感或现场证据。", dispatchRule: "可生成筛查候选，但必须人工圈定 AOI，禁止标记为已确认滑坡。", requiresTerrainReview: true };
+  if (event.phenomenonStage === "forecast" || event.phenomenonStage === "nowcast" || event.phenomenonStage === "driver") {
+    return { stage: "risk_model", label: event.phenomenonStage === "nowcast" ? "临近危险信号" : "模型风险信号", evidenceMeaning: "表示降雨/易发性条件，不是已经发生滑坡的遥感或现场证据。", dispatchRule: "可生成筛查候选，但必须人工圈定 AOI，禁止标记为已确认滑坡。", requiresTerrainReview: true };
   }
   if (event.phenomenonStage === "warning") {
     return { stage: "official_warning", label: "官方风险预警", evidenceMeaning: "权威机构发布了区域风险预警，预警行政区不等于滑坡体边界。", dispatchRule: "可用于预置观测，必须以地形约束缩小 AOI 并人工核对。", requiresTerrainReview: true };

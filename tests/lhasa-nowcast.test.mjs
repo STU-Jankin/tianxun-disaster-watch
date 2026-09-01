@@ -31,12 +31,13 @@ test("decodes the official 8-bit grayscale layout and creates review-only high-r
   const productTime = "2026-08-26T00:00:00.000Z";
   const candidates = lhasaCandidatesFromRaster(raster, productTime, "https://example.test/lhasa.png", Date.parse("2026-08-26T06:00:00Z"));
   assert.equal(candidates.length, 1);
-  assert.equal(candidates[0].phenomenonStage, "forecast");
+  assert.equal(candidates[0].phenomenonStage, "nowcast");
   assert.equal(candidates[0].requiresReview, true);
   assert.equal(candidates[0].magnitude, 96);
   assert.equal(candidates[0].magnitudeUnit, "%");
   assert.equal(candidates[0].validTo, "2026-08-27T00:00:00.000Z");
   assert.match(candidates[0].description, /不是已发生滑坡或泥石流的边界/);
+  assert.match(candidates[0].description, /不是未来数日预报/);
   assert.equal(lhasaCandidatesFromRaster(raster, productTime, "https://example.test/lhasa.png", Date.parse("2026-08-27T06:01:00Z")).length, 0, "stale nowcasts must not re-enter the alert list");
 });
 

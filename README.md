@@ -8,7 +8,8 @@
 
 - 接入应急管理部地质灾害快报、USGS 与 EMSC 地震、USGS Ground Failure 震生滑坡概率、NVE Jordskredvarsling 官方区域预警、NASA EONET、GDACS、NOAA NHC 与 NWS Alerts、加拿大 ECCC GeoMet、日本气象厅 JMA、Copernicus EMS Rapid Mapping、USGS HANS、Smithsonian GVP 与 NASA LHASA。
 - 应急管理部通报只有在正文明确给出发生时间、灾种和受影响地时才进入“实况”，同一灾害后续通报聚合为一个主事件；官方地名经高德编码并近似归一到 WGS84，始终按代表点要求人工核对 AOI。跨境灾害分别保存起源国家和受影响国家。
-- USGS Ground Failure 仅把黄色及以上模型产品作为“预报”并强制复核；NVE 使用 Kartverket 官方市县 Polygon/MultiPolygon 恢复预警适用区；NASA LHASA 读取带批次时间的免认证灰度风险图，实时地图仍只产出官方24小时有效期内不低于80%的高风险区。评测链路会把原始概率PNG及其校验值、尺寸和概率直方图另行归档，低风险格不会进入实时事件列表。
+- USGS Ground Failure 仅把黄色及以上模型产品作为“预报”并强制复核；NVE 使用 Kartverket 官方市县 Polygon/MultiPolygon 恢复预警适用区；NASA LHASA 读取带批次时间的免认证灰度风险图，并明确标为“临近危险”而非未来预报，实时地图仍只产出官方24小时有效期内不低于80%的高风险区。评测链路会把原始概率PNG及其校验值、尺寸和概率直方图另行归档，低风险格不会进入实时事件列表。
+- 滑坡详情提供独立的24/48/72小时降雨触发试验筛查：按地点读取未来逐小时降雨、前期48小时雨量、模式土壤含水量、Copernicus DEM坡度和本地10年日雨P95，输出透明的触发等级而不是伪概率。24/48小时只供人工预置任务，72小时明确降为低置信趋势；模型未经过区域历史校准，缺少岩性、PGA、SMAP剖面湿度和官方隐患点时禁止自动告警或下发。
 - 第一优先级的 NASA FIRMS、WMO SWIC/CAP、Copernicus GloFAS，以及第二优先级的 OCHA ReliefWeb 已有独立连接器；需要密钥或订阅地址的源会明确显示“待配置”，配置字段见 `.env.example`。
 - 中国气象数据网 CMA 支持两条独立链路：带几何的 CAP/GeoJSON 预警流，以及 `SURF_CHN_MUL_HOR_3H` 地面站核验流。后者按官方目录约滞后2天、每日更新，仅作为独立核验数据读取；在没有预警编号、流域或台风编号等确定关联键时，不自动并入灾害、不单独创建任务，也不会替换权威事件中心和等级。
 - 免密钥的 MET Norway Locationforecast 为全球默认逐小时天气底座；配置 QWeather 后优先使用其格点预报，失败或额度耗尽时自动回退。二者均按事件或任务 AOI 查询未来72小时云量、降水、风速和光学气象窗口，采用30分钟服务端缓存，且不改变灾害等级，也不把数值模式结果冒充站点实况或官方预警。
