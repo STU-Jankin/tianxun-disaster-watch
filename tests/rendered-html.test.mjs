@@ -290,6 +290,14 @@ test("shows STK-like reachable, planned and actual imaging footprints without co
   assert.match(styles, /\.imaging-range-control/);
   assert.match(dashboard, /reachable-imaging-corridor/);
   assert.match(geometry, /tle_sgp4_incidence_envelope/);
+  assert.match(dashboard, /卫星过境与成像范围/);
+  assert.match(dashboard, /跟随卫星/);
+  assert.match(dashboard, /PASS_PREVIEW_HALF_WINDOW_SECONDS/);
+  assert.match(dashboard, /formatTimeWithSeconds/);
+  assert.match(dashboard, /instantaneous-reachable-slice/);
+  assert.match(geometry, /buildInstantaneousReachableSlice/);
+  assert.match(styles, /\.imaging-capture-segment/);
+  assert.match(styles, /\.satellite-playback-marker/);
 });
 
 test("keeps satellite simulation results mounted while previewing opportunities", async () => {

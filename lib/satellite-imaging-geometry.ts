@@ -16,6 +16,11 @@ export type ReachableImagingCorridor = {
   basis: "tle_sgp4_incidence_envelope";
 };
 
+export type InstantaneousReachableSlice = ReachableImagingCorridor & {
+  centeredAt: string;
+  displaySpanSeconds: number;
+};
+
 /**
  * Builds a time-local ground-access envelope, not an antenna beam pattern.
  * Each side is the strip swept between the near/far incidence limits while
@@ -84,6 +89,42 @@ export function buildReachableImagingCorridor(input: {
     sampleCount: samples.length,
     basis: "tle_sgp4_incidence_envelope",
   };
+}
+
+/**
+ * Builds a short, moving cross-track slice for pass playback. The short
+ * along-track span is deliberately labelled as a display slice: it shows
+ * where the incidence envelope is at one moment, not an antenna beam pattern
+ * or an executed image footprint.
+ */
+export function buildInstantaneousReachableSlice(input: {
+  tleLine1: string;
+  tleLine2: string;
+  at: string | Date;
+  incidenceAngleMinDeg: number;
+  incidenceAngleMaxDeg: number;
+  lookSides: readonly SarLookSide[];
+  displaySpanSeconds?: number;
+}): InstantaneousReachableSlice | null {
+  const centeredAtMs = new Date(input.at).getTime();
+  if (!Number.isFinite(centeredAtMs)) return null;
+  const displaySpanSeconds = clamp(input.displaySpanSeconds ?? 4, 1, 10);
+  const halfSpanMs = displaySpanSeconds * 500;
+  const corridor = buildReachableImagingCorridor({
+    tleLine1: input.tleLine1,
+    tleLine2: input.tleLine2,
+    start: new Date(centeredAtMs - halfSpanMs),
+    end: new Date(centeredAtMs + halfSpanMs),
+    incidenceAngleMinDeg: input.incidenceAngleMinDeg,
+    incidenceAngleMaxDeg: input.incidenceAngleMaxDeg,
+    lookSides: input.lookSides,
+    stepSeconds: Math.max(1, Math.ceil(displaySpanSeconds / 2)),
+  });
+  return corridor ? {
+    ...corridor,
+    centeredAt: new Date(centeredAtMs).toISOString(),
+    displaySpanSeconds,
+  } : null;
 }
 
 export function groundReachForIncidence(altitudeKm: number, incidenceAngleDeg: number) {

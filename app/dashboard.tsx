@@ -100,6 +100,7 @@ type TimeWindow = "all" | "1h" | "6h" | "24h" | "7d";
 type TimeBasis = "occurred" | "updated";
 type PhaseFilter = "all" | DisasterEvent["observationPhase"];
 type ExportFormat = "json" | "csv" | "geojson";
+const PASS_PREVIEW_HALF_WINDOW_SECONDS = 5 * 60;
 type SourceStatus = {
   sourceId: string;
   name: string;
@@ -1321,6 +1322,7 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
   const taskForecastLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const aoiLayerRef = useRef<import("leaflet").GeoJSON | null>(null);
   const opportunityLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
+  const opportunityDynamicLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const productFootprintLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const responseLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
   const exposureLayerRef = useRef<import("leaflet").FeatureGroup | null>(null);
@@ -1341,12 +1343,15 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
   const [vertexLongitude, setVertexLongitude] = useState("");
   const [vertexLatitude, setVertexLatitude] = useState("");
   const [orbitsVisible, setOrbitsVisible] = useState(false);
-  const [imagingTimeSelection, setImagingTimeSelection] = useState<{ opportunityId: string; percent: number }>({ opportunityId: "", percent: 50 });
+  const [imagingTimeSelection, setImagingTimeSelection] = useState<{ opportunityId: string; offsetSeconds: number }>({ opportunityId: "", offsetSeconds: 0 });
+  const [imagingPlayback, setImagingPlayback] = useState(false);
+  const [imagingPlaybackSpeed, setImagingPlaybackSpeed] = useState<1 | 10>(10);
+  const [imagingFollowSatellite, setImagingFollowSatellite] = useState(false);
   const [productFootprints, setProductFootprints] = useState<ObservationProduct[]>([]);
   const [clusterSelection, setClusterSelection] = useState<DisasterEvent[]>([]);
   const previewWindow = opportunityPreview?.window;
   const imagingRangeOpportunityId = previewWindow?.opportunityId ?? activeTask?.opportunityId ?? "";
-  const imagingTimePercent = imagingTimeSelection.opportunityId === imagingRangeOpportunityId ? imagingTimeSelection.percent : 50;
+  const imagingOffsetSeconds = imagingTimeSelection.opportunityId === imagingRangeOpportunityId ? imagingTimeSelection.offsetSeconds : 0;
   const opportunityClosestAt = previewWindow?.closestApproachAt ?? activeTask?.closestApproachAt;
   const opportunityInterval = useMemo(() => {
     if (!activeTask || !opportunityClosestAt) return null;
@@ -1359,9 +1364,41 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
       ? { start, end }
       : { start: center - estimatedDurationMs / 2, end: center + estimatedDurationMs / 2 };
   }, [activeTask, opportunityClosestAt, previewWindow]);
-  const imagingPreviewAt = opportunityInterval
-    ? new Date(opportunityInterval.start + (opportunityInterval.end - opportunityInterval.start) * imagingTimePercent / 100).toISOString()
-    : opportunityClosestAt;
+  const passPreviewInterval = useMemo(() => {
+    const center = Date.parse(opportunityClosestAt ?? "");
+    return Number.isFinite(center) ? {
+      start: center - PASS_PREVIEW_HALF_WINDOW_SECONDS * 1_000,
+      end: center + PASS_PREVIEW_HALF_WINDOW_SECONDS * 1_000,
+    } : null;
+  }, [opportunityClosestAt]);
+  const imagingPreviewAt = opportunityClosestAt
+    ? new Date(Date.parse(opportunityClosestAt) + imagingOffsetSeconds * 1_000).toISOString()
+    : undefined;
+  const imagingPreviewMs = Date.parse(imagingPreviewAt ?? "");
+  const imagingWithinCapture = Boolean(opportunityInterval && Number.isFinite(imagingPreviewMs) && imagingPreviewMs >= opportunityInterval.start && imagingPreviewMs <= opportunityInterval.end);
+  const captureStartPercent = opportunityInterval && passPreviewInterval
+    ? Math.max(0, Math.min(100, (opportunityInterval.start - passPreviewInterval.start) / (passPreviewInterval.end - passPreviewInterval.start) * 100))
+    : 50;
+  const captureEndPercent = opportunityInterval && passPreviewInterval
+    ? Math.max(captureStartPercent, Math.min(100, (opportunityInterval.end - passPreviewInterval.start) / (passPreviewInterval.end - passPreviewInterval.start) * 100))
+    : 50;
+  const captureDurationSeconds = opportunityInterval ? Math.max(1, (opportunityInterval.end - opportunityInterval.start) / 1_000) : 0;
+  const imagingPlaybackActive = imagingPlayback && imagingTimeSelection.opportunityId === imagingRangeOpportunityId;
+  useEffect(() => {
+    if (!imagingPlaybackActive || !passPreviewInterval) return;
+    const timer = window.setInterval(() => {
+      setImagingTimeSelection((current) => {
+        const offsetSeconds = current.opportunityId === imagingRangeOpportunityId ? current.offsetSeconds : -PASS_PREVIEW_HALF_WINDOW_SECONDS;
+        const nextOffsetSeconds = Math.min(PASS_PREVIEW_HALF_WINDOW_SECONDS, offsetSeconds + imagingPlaybackSpeed / 5);
+        if (nextOffsetSeconds >= PASS_PREVIEW_HALF_WINDOW_SECONDS) window.setTimeout(() => setImagingPlayback(false), 0);
+        return {
+          opportunityId: imagingRangeOpportunityId,
+          offsetSeconds: nextOffsetSeconds,
+        };
+      });
+    }, 200);
+    return () => window.clearInterval(timer);
+  }, [imagingPlaybackActive, imagingPlaybackSpeed, imagingRangeOpportunityId, passPreviewInterval]);
   const activeTrackingSlice = useMemo(() => {
     if (activeTask?.hazard !== "cyclone" || !opportunityClosestAt || !activeTask.timeIndexedAoi?.length) return undefined;
     return cycloneTrackingSliceAt(activeTask.timeIndexedAoi, opportunityClosestAt);
@@ -1422,6 +1459,7 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
       selectedLayerRef.current = L.featureGroup().addTo(map);
       taskForecastLayerRef.current = L.featureGroup().addTo(map);
       opportunityLayerRef.current = L.featureGroup().addTo(map);
+      opportunityDynamicLayerRef.current = L.featureGroup().addTo(map);
       productFootprintLayerRef.current = L.featureGroup().addTo(map);
       responseLayerRef.current = L.featureGroup().addTo(map);
       exposureLayerRef.current = L.featureGroup().addTo(map);
@@ -1450,6 +1488,7 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
       selectedLayerRef.current = null;
       taskForecastLayerRef.current = null;
       opportunityLayerRef.current = null;
+      opportunityDynamicLayerRef.current = null;
       productFootprintLayerRef.current = null;
       responseLayerRef.current = null;
       exposureLayerRef.current = null;
@@ -1886,29 +1925,20 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
     let cancelled = false;
     void Promise.all([import("leaflet"), import("../lib/orbit-simulation"), import("../lib/satellite-imaging-geometry")]).then(([L, orbit, imaging]) => {
       if (cancelled) return;
-      const at = new Date(imagingPreviewAt ?? opportunityClosestAt);
+      const at = new Date(opportunityClosestAt);
       const position = orbit.propagateTle(satellite.tleLine1!, satellite.tleLine2!, at);
       if (!position) return;
-      const targetLatitude = activeTrackingSlice?.center[1] ?? activeTask.latitude;
       const targetLongitude = activeTrackingSlice?.center[0] ?? activeTask.longitude;
       const displaySubpointLongitude = unwrapLongitudeNear(position.longitude, targetLongitude);
-      // Keep the review overlay close to the actual coarse-screening interval;
-      // a full orbital arc would dwarf the AOI and falsely resemble a swath.
       const simulationLevel = previewWindow?.simulationLevel ?? activeTask.simulationLevel;
       const assumedSensor = simulationLevel === "assumed_sensor";
-      const intervalMinutes = opportunityInterval ? Math.max(0.1, (opportunityInterval.end - opportunityInterval.start) / 120_000) : 0.25;
-      const track = orbit.buildGroundTrack(satellite.tleLine1!, satellite.tleLine2!, at, assumedSensor ? intervalMinutes : 2, assumedSensor ? intervalMinutes : 2, assumedSensor ? 5 : 15);
+      const track = orbit.buildGroundTrack(satellite.tleLine1!, satellite.tleLine2!, at, 5, 5, 15);
       [...track.past, ...track.future].forEach((segment) => L.polyline(segment.map(([latitude, longitude]) => [latitude, unwrapLongitudeNear(longitude, targetLongitude)]), { color: "#6546b3", weight: 3, opacity: 0.92, dashArray: "8 4", interactive: false, className: "selected-opportunity-track" }).addTo(layer));
       const radiusKm = previewWindow?.searchRadiusKm ?? activeTask.orbitSearchRadiusKm ?? 350;
-      let searchCircle: import("leaflet").Circle | null = null;
       if (simulationLevel === "orbit_only") {
-        searchCircle = L.circle([position.latitude, displaySubpointLongitude], { radius: radiusKm * 1_000, color: "#6546b3", weight: 2, fillColor: "#8d78cf", fillOpacity: 0.08, dashArray: "6 5", className: "selected-opportunity-search-circle" });
+        const searchCircle = L.circle([position.latitude, displaySubpointLongitude], { radius: radiusKm * 1_000, color: "#6546b3", weight: 2, fillColor: "#8d78cf", fillOpacity: 0.08, dashArray: "6 5", className: "selected-opportunity-search-circle" });
         searchCircle.bindTooltip(`TLE 轨道粗筛搜索圈 · 半径 ${radiusKm} km（不是 SAR 幅宽）`, { sticky: true });
         searchCircle.addTo(layer);
-      } else {
-        const lookLine = L.polyline([[position.latitude, displaySubpointLongitude], [targetLatitude, targetLongitude]], { color: "#6546b3", weight: 2, opacity: 0.8, dashArray: "5 4", interactive: true });
-        lookLine.bindTooltip(`${assumedSensor ? "假设传感器" : "传感器模型"}侧视关系 · 地面轨迹距 AOI 中心约 ${previewWindow?.minimumGroundTrackDistanceKm ?? activeTask.minimumGroundTrackDistanceKm ?? "--"} km`, { sticky: true });
-        lookLine.addTo(layer);
       }
       if (assumedSensor && opportunityInterval) {
         const profileMinimum = satellite.payloadProfile?.incidenceAngleDeg.min ?? activeTask.incidenceAngleMinDeg;
@@ -1923,30 +1953,73 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
           lookSides: previewWindow?.reachableLookSides ?? activeTask.opportunityReachableLookSides ?? satellite.payloadProfile?.lookSides ?? ["left", "right"],
         });
         if (corridor) {
-          const corridorLayer = L.geoJSON(unwrapForecastGeometry(corridor.geometry as DisasterEvent["geometry"], targetLongitude) as GeoJSON.GeoJsonObject, { style: { color: "#008eaa", weight: 2, fillColor: "#20bed1", fillOpacity: 0.1, dashArray: "4 4", className: "reachable-imaging-corridor" } }).addTo(layer);
-          corridorLayer.bindTooltip(`可达拍摄走廊 · 入射角 ${Math.max(profileMinimum, activeTask.incidenceAngleMinDeg)}–${Math.min(profileMaximum, activeTask.incidenceAngleMaxDeg)}° · 横轨地距约 ${corridor.nearGroundRangeKm}–${corridor.farGroundRangeKm} km · ${corridor.lookSides.map((side) => side === "left" ? "左视" : "右视").join("/")} · TLE/SGP4 试算`, { sticky: true });
+          const corridorLayer = L.geoJSON(unwrapForecastGeometry(corridor.geometry as DisasterEvent["geometry"], targetLongitude) as GeoJSON.GeoJsonObject, { style: { color: "#008eaa", weight: 2, fillColor: "#20bed1", fillOpacity: 0.07, dashArray: "4 4", className: "reachable-imaging-corridor" } }).addTo(layer);
+          corridorLayer.bindTooltip(`计划成像段可达包络 · 入射角 ${Math.max(profileMinimum, activeTask.incidenceAngleMinDeg)}–${Math.min(profileMaximum, activeTask.incidenceAngleMaxDeg)}° · 横轨地距约 ${corridor.nearGroundRangeKm}–${corridor.farGroundRangeKm} km · ${corridor.lookSides.map((side) => side === "left" ? "左视" : "右视").join("/")} · TLE/SGP4 试算`, { sticky: true });
         }
       }
-      const closestMarker = L.circleMarker([position.latitude, displaySubpointLongitude], { radius: 7, color: "#6546b3", weight: 3, fillColor: "#fff", fillOpacity: 1, className: "selected-opportunity-subpoint" });
-      closestMarker.bindTooltip(`${satellite.interfaceName || satellite.commonName} · 时间轴子星点 · ${formatTimeWithYear(position.at)} UTC+08 · ${position.direction === "ascending" ? "升轨" : "降轨"} · TLE/SGP4 外推`, { direction: "top" });
-      closestMarker.addTo(layer);
       const aoiBounds = aoiLayerRef.current?.getBounds();
       const plannedFootprint = previewWindow?.footprintGeometry ?? activeTask.opportunityFootprint;
       if (simulationLevel !== "orbit_only" && plannedFootprint) {
         const footprintLayer = L.geoJSON(unwrapForecastGeometry(plannedFootprint as DisasterEvent["geometry"], targetLongitude) as GeoJSON.GeoJsonObject, { style: { color: "#006dc7", weight: 3, fillColor: "#2c8ee0", fillOpacity: 0.2, dashArray: "7 4", className: "selected-opportunity-footprint" } }).addTo(layer);
         footprintLayer.bindTooltip(`${previewWindow?.imagingMode ?? activeTask.imagingMode ?? "成像模式"} · 计划/标称成像足迹 ${previewWindow?.nominalSceneCrossTrackKm ?? activeTask.opportunitySceneCrossTrackKm ?? "--"}×${previewWindow?.nominalSceneAlongTrackKm ?? activeTask.opportunitySceneAlongTrackKm ?? "--"} km · 预计覆盖 ${previewWindow?.coveragePercent ?? activeTask.opportunityCoveragePercent ?? "--"}%（不是实拍回执）`, { sticky: true });
-        const focusBounds = footprintLayer.getBounds();
-        if (aoiBounds?.isValid()) focusBounds.extend(aoiBounds);
-        if (focusBounds.isValid()) fitWithOverlay(map, focusBounds, 12);
-      } else {
-        const focusBounds = L.latLngBounds([[position.latitude, displaySubpointLongitude], [targetLatitude, targetLongitude]]);
-        if (searchCircle) focusBounds.extend(searchCircle.getBounds());
-        if (aoiBounds?.isValid()) focusBounds.extend(aoiBounds);
-        if (focusBounds.isValid()) fitWithOverlay(map, focusBounds, activeTrackingSlice ? 9 : 7);
       }
+      if (aoiBounds?.isValid()) L.rectangle(aoiBounds, { opacity: 0, fillOpacity: 0, interactive: false }).addTo(layer);
+      const passBounds = layer.getBounds();
+      if (!imagingFollowSatellite && passBounds.isValid()) fitWithOverlay(map, passBounds, 6);
     }).catch(() => setMapError("已选 TLE 轨道机会无法绘制；AOI 和任务字段仍可使用。"));
     return () => { cancelled = true; layer.clearLayers(); };
-  }, [activeTask, activeTrackingSlice, fitWithOverlay, fleet.satellites, imagingPreviewAt, mapReady, opportunityClosestAt, opportunityInterval, previewWindow]);
+  }, [activeTask, activeTrackingSlice, fitWithOverlay, fleet.satellites, imagingFollowSatellite, mapReady, opportunityClosestAt, opportunityInterval, previewWindow]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    const layer = opportunityDynamicLayerRef.current;
+    if (!mapReady || !map || !layer) return;
+    layer.clearLayers();
+    if (!activeTask || !imagingPreviewAt || !opportunityClosestAt || !["orbit_only", "assumed_sensor", "sensor_model"].includes(String(previewWindow?.simulationLevel ?? activeTask.simulationLevel))) return;
+    const satelliteNoradId = previewWindow?.satelliteNoradId ?? activeTask.satelliteNoradId;
+    const satellite = fleet.satellites.find((candidate) => candidate.noradId === satelliteNoradId && candidate.orbitStatus === "current" && candidate.tleLine1 && candidate.tleLine2);
+    if (!satellite) return;
+    let cancelled = false;
+    void Promise.all([import("leaflet"), import("../lib/orbit-simulation"), import("../lib/satellite-imaging-geometry")]).then(([L, orbit, imaging]) => {
+      if (cancelled) return;
+      const position = orbit.propagateTle(satellite.tleLine1!, satellite.tleLine2!, new Date(imagingPreviewAt));
+      if (!position) return;
+      const targetLatitude = activeTrackingSlice?.center[1] ?? activeTask.latitude;
+      const targetLongitude = activeTrackingSlice?.center[0] ?? activeTask.longitude;
+      const displaySubpointLongitude = unwrapLongitudeNear(position.longitude, targetLongitude);
+      const simulationLevel = previewWindow?.simulationLevel ?? activeTask.simulationLevel;
+      if (simulationLevel !== "orbit_only") {
+        const profileMinimum = satellite.payloadProfile?.incidenceAngleDeg.min ?? activeTask.incidenceAngleMinDeg;
+        const profileMaximum = satellite.payloadProfile?.incidenceAngleDeg.max ?? activeTask.incidenceAngleMaxDeg;
+        const instantaneousSlice = imaging.buildInstantaneousReachableSlice({
+          tleLine1: satellite.tleLine1!,
+          tleLine2: satellite.tleLine2!,
+          at: imagingPreviewAt,
+          incidenceAngleMinDeg: Math.max(profileMinimum, activeTask.incidenceAngleMinDeg),
+          incidenceAngleMaxDeg: Math.min(profileMaximum, activeTask.incidenceAngleMaxDeg),
+          lookSides: previewWindow?.reachableLookSides ?? activeTask.opportunityReachableLookSides ?? satellite.payloadProfile?.lookSides ?? ["left", "right"],
+        });
+        if (instantaneousSlice) {
+          const sliceLayer = L.geoJSON(unwrapForecastGeometry(instantaneousSlice.geometry as DisasterEvent["geometry"], targetLongitude) as GeoJSON.GeoJsonObject, { style: { color: "#00a5c5", weight: 3, fillColor: "#34d6e5", fillOpacity: 0.24, className: "instantaneous-reachable-slice" } }).addTo(layer);
+          sliceLayer.bindTooltip(`当前时刻可达横带 · ${formatTimeWithSeconds(imagingPreviewAt)} UTC+08 · 仅为 ${instantaneousSlice.displaySpanSeconds} 秒显示切片，不是波束方向图`, { sticky: true });
+        }
+        if (imagingWithinCapture) {
+          const lookLine = L.polyline([[position.latitude, displaySubpointLongitude], [targetLatitude, targetLongitude]], { color: "#ef8b22", weight: 3, opacity: 0.9, dashArray: "5 4", interactive: true, className: "active-imaging-look-line" });
+          lookLine.bindTooltip(`当前处于计划成像段 · 指向任务 AOI · ${formatTimeWithSeconds(imagingPreviewAt)} UTC+08`, { sticky: true });
+          lookLine.addTo(layer);
+        }
+      }
+      const markerIcon = L.divIcon({ className: "satellite-div-icon", html: `<div class="satellite-playback-marker${imagingWithinCapture ? " capturing" : ""}">◆</div>`, iconSize: [34, 34], iconAnchor: [17, 17] });
+      const marker = L.marker([position.latitude, displaySubpointLongitude], { icon: markerIcon, keyboard: false, interactive: true, zIndexOffset: 900 });
+      marker.bindTooltip(`${satellite.interfaceName || satellite.commonName} · ${imagingWithinCapture ? "计划成像段" : "过境预演"} · ${formatTimeWithSeconds(position.at)} UTC+08 · ${position.direction === "ascending" ? "升轨" : "降轨"} · TLE/SGP4 外推`, { direction: "top" });
+      marker.addTo(layer);
+      if (imagingFollowSatellite) {
+        const zoom = Math.max(5, map.getZoom());
+        map.setView([position.latitude, displaySubpointLongitude], zoom, { animate: imagingPlaybackActive, duration: 0.18 });
+      }
+    }).catch(() => setMapError("卫星过境时刻无法外推；静态计划足迹仍可使用。"));
+    return () => { cancelled = true; layer.clearLayers(); };
+  }, [activeTask, activeTrackingSlice, fleet.satellites, imagingFollowSatellite, imagingPlaybackActive, imagingPreviewAt, imagingWithinCapture, mapReady, opportunityClosestAt, previewWindow]);
 
   useEffect(() => {
     const layer = productFootprintLayerRef.current;
@@ -2090,6 +2163,8 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
   const displayedReachableNearKm = previewWindow?.reachableNearKm ?? activeTask?.opportunityReachableNearKm;
   const displayedReachableFarKm = previewWindow?.reachableFarKm ?? activeTask?.opportunityReachableFarKm;
   const displayedPlannedFootprint = previewWindow?.footprintGeometry ?? activeTask?.opportunityFootprint;
+  const captureWindowWidthPercent = Math.max(0.55, captureEndPercent - captureStartPercent);
+  const imagingOffsetLabel = imagingOffsetSeconds === 0 ? "最近过境" : `${imagingOffsetSeconds > 0 ? "+" : "−"}${Math.abs(Math.round(imagingOffsetSeconds))} 秒`;
 
   return <div className="map-stage" role="region" aria-label="灾害与任务地图" inert={obscured ? true : undefined} aria-hidden={obscured || undefined}>
     <div ref={containerRef} className="leaflet-map" aria-label={`${scopes[scope].label}灾害事件地图`} />
@@ -2107,12 +2182,23 @@ function MapView({ scope, events, selected, exposureAssessment, terrainScreening
       <input type="range" min="0" max={forecastFrames.length - 1} value={Math.min(forecastFrameIndex, forecastFrames.length - 1)} onChange={(event) => setForecastSelection({ eventId: forecastOwnerId, index: Number(event.target.value) })} aria-label="选择台风预报小时" />
       <small>{activeForecastFrame.windFields.length ? activeForecastFrame.windFields.map((field) => `≥${field.thresholdKnots} kt 象限风圈`).join(" · ") : "本时次无可用官方风圈"} · {activeForecastFrame.uncertaintyRadiusKm || activeForecastFrame.uncertaintyGeometry ? "含分时不确定区" : displayedCycloneForecast?.uncertaintyGeometry ? "显示本报次总体不确定区" : "无不确定区数据"}{activeTask?.hazard === "cyclone" ? " · 拖动仅浏览预测，不改变已选卫星机会" : ""}</small>
     </div> : null}
-    {activeTask && opportunityInterval && opportunityClosestAt && displayedOpportunityLevel !== "orbit_only" ? <div className="imaging-range-control" role="group" aria-label="卫星拍摄范围时间轴">
-      <div><strong>卫星拍摄范围</strong><span>{previewWindow ? "候选机会预览" : "已选机会"} · {previewWindow?.satelliteLabel ?? previewWindow?.satelliteId ?? activeTask.satelliteId ?? "卫星待定"}</span></div>
-      <time>{formatTimeWithYear(imagingPreviewAt ?? opportunityClosestAt)} UTC+08</time>
-      <input type="range" min="0" max="100" step="1" value={imagingTimePercent} onChange={(event) => setImagingTimeSelection({ opportunityId: imagingRangeOpportunityId, percent: Number(event.target.value) })} aria-label="选择成像时窗内的卫星位置" />
-      <div className="imaging-range-legend"><span><i className="reachable" />可达拍摄走廊{displayedReachableNearKm != null && displayedReachableFarKm != null ? ` ${displayedReachableNearKm}–${displayedReachableFarKm} km` : ""}</span><span><i className="planned" />{displayedPlannedFootprint ? "计划成像足迹" : "计划足迹待返回"}</span><span><i className="actual" />实拍产品 {productFootprints.length}</span></div>
-      <small>青色是 TLE/SGP4、入射角与左右视形成的时窗可达包络；蓝色是计划/标称场景；绿色只在收到 STAC 产品几何后出现。拖动仅改变卫星时刻显示。</small>
+    {activeTask && opportunityInterval && opportunityClosestAt && displayedOpportunityLevel !== "orbit_only" ? <div className="imaging-range-control" role="group" aria-label="卫星过境与成像范围时间轴">
+      <div><strong>卫星过境与成像范围</strong><span>{previewWindow ? "候选机会预览" : "已选机会"} · {previewWindow?.satelliteLabel ?? previewWindow?.satelliteId ?? activeTask.satelliteId ?? "卫星待定"}</span></div>
+      <div className="imaging-playback-status"><time>{formatTimeWithSeconds(imagingPreviewAt ?? opportunityClosestAt)} UTC+08</time><b className={imagingWithinCapture ? "capturing" : "passing"}>{imagingWithinCapture ? "计划成像段" : `过境预演 · ${imagingOffsetLabel}`}</b></div>
+      <div className="imaging-playback-actions">
+        <button aria-pressed={imagingPlaybackActive} onClick={() => { if (!imagingPlaybackActive && imagingOffsetSeconds >= 0) setImagingTimeSelection({ opportunityId: imagingRangeOpportunityId, offsetSeconds: -PASS_PREVIEW_HALF_WINDOW_SECONDS }); setImagingPlayback(!imagingPlaybackActive); }}>{imagingPlaybackActive ? "暂停" : "播放"}</button>
+        <button onClick={() => setImagingPlaybackSpeed((speed) => speed === 1 ? 10 : 1)} aria-label={`当前播放速度 ${imagingPlaybackSpeed} 倍，点击切换`}>{imagingPlaybackSpeed}×</button>
+        <button onClick={() => { setImagingPlayback(false); setImagingTimeSelection({ opportunityId: imagingRangeOpportunityId, offsetSeconds: 0 }); }}>回到成像</button>
+        <button aria-pressed={imagingFollowSatellite} onClick={() => setImagingFollowSatellite((following) => !following)}>{imagingFollowSatellite ? "查看全程" : "跟随卫星"}</button>
+      </div>
+      <div className="imaging-pass-slider">
+        <span className="imaging-capture-segment" style={{ left: `${captureStartPercent}%`, width: `${captureWindowWidthPercent}%` }} title={`计划成像 ${captureDurationSeconds.toFixed(1)} 秒`} />
+        <input type="range" min={-PASS_PREVIEW_HALF_WINDOW_SECONDS} max={PASS_PREVIEW_HALF_WINDOW_SECONDS} step="1" value={imagingOffsetSeconds} onChange={(event) => { setImagingPlayback(false); setImagingTimeSelection({ opportunityId: imagingRangeOpportunityId, offsetSeconds: Number(event.target.value) }); }} aria-label="选择最近过境点前后五分钟的卫星位置" aria-valuetext={`${formatTimeWithSeconds(imagingPreviewAt ?? opportunityClosestAt)}，${imagingWithinCapture ? "位于计划成像段" : imagingOffsetLabel}`} />
+      </div>
+      <div className="imaging-pass-labels"><span>−5 分钟</span><span>最近过境</span><span>+5 分钟</span></div>
+      <div className="imaging-capture-detail"><span>计划成像</span><time>{formatTimeWithSeconds(new Date(opportunityInterval.start).toISOString())}—{formatTimeWithSeconds(new Date(opportunityInterval.end).toISOString())}</time><b>{captureDurationSeconds.toFixed(1)} 秒</b></div>
+      <div className="imaging-range-legend"><span><i className="instant" />瞬时可达横带</span><span><i className="reachable" />成像段可达包络{displayedReachableNearKm != null && displayedReachableFarKm != null ? ` ${displayedReachableNearKm}–${displayedReachableFarKm} km` : ""}</span><span><i className="planned" />{displayedPlannedFootprint ? "计划成像足迹" : "计划足迹待返回"}</span><span><i className="actual" />实拍产品 {productFootprints.length}</span></div>
+      <small>亮青色横带和卫星标记随时间移动；淡青色是计划成像段包络，蓝色是计划场景，绿色只来自实拍产品。均为 TLE/SGP4 试算，不是波束方向图。</small>
     </div> : null}
     {activeTask ? <div className="map-review-toolbar" role="group" aria-label="任务AOI地图复核">
       <div><strong>{activeTask.title}</strong><span>{activeTrackingSlice ? `拍摄时刻台风${activeTrackingTarget === "center" ? "预测中心" : activeTrackingTarget === "wind_field" ? "风圈" : "路径不确定区"} · +${activeTrackingSlice.leadHours}h · ${formatTimeWithYear(opportunityClosestAt!)} UTC+08 · ${activeTrackingSlice.center[1].toFixed(3)}°, ${activeTrackingSlice.center[0].toFixed(3)}°` : ["polygon", "multi"].includes(activeTask.aoiType) ? `${customAoiPartCount(activeTask.customGeometry)} 块自定义 AOI` : "正在显示任务 AOI"}{displayedOpportunityLevel === "orbit_only" ? ` · TLE 轨道粗筛 · 最近约 ${previewWindow?.minimumGroundTrackDistanceKm ?? activeTask.minimumGroundTrackDistanceKm ?? "--"} km` : displayedOpportunityLevel === "assumed_sensor" ? ` · 假设传感器试算 · ${previewWindow?.imagingMode ?? activeTask.imagingMode ?? "模式待选"}` : ""}</span></div>
@@ -3473,6 +3559,10 @@ function formatTime(value: string) {
 
 function formatTimeWithYear(value: string) {
   return new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(value));
+}
+
+function formatTimeWithSeconds(value: string) {
+  return new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date(value));
 }
 
 function formatCardTime(value: string) {
