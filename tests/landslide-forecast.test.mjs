@@ -31,9 +31,25 @@ test("builds bounded key-free Open-Meteo forecast and climatology URLs", async (
   assert.equal(forecast.searchParams.get("past_hours"), "48");
   assert.equal(forecast.searchParams.get("forecast_hours"), "72");
   assert.match(forecast.searchParams.get("hourly"), /soil_moisture_27_to_81cm/);
+  const chinaPilot = new URL(buildOpenMeteoLandslideForecastUrl(29.56, 106.55, "cma_grapes_global"));
+  assert.equal(chinaPilot.searchParams.get("models"), "cma_grapes_global");
   const history = new URL(buildOpenMeteoLandslideClimatologyUrl(29.5, 90.5, { start: "2015-01-01", end: "2024-12-31" }));
   assert.equal(history.origin, "https://archive-api.open-meteo.com");
   assert.equal(history.searchParams.get("daily"), "precipitation_sum");
+});
+
+test("routes Chongqing and Jiangsu pilots to CMA GRAPES without pretending thresholds are calibrated", async () => {
+  const { matchLandslidePilotRegion } = await import(new URL(`../lib/landslide-pilot-regions.ts?test=${Date.now()}-${Math.random()}`, import.meta.url));
+  const chongqing = matchLandslidePilotRegion("中国 · 重庆市 · 武隆区");
+  assert.equal(chongqing?.id, "chongqing");
+  assert.equal(chongqing?.forecastModel.id, "cma_grapes_global");
+  assert.match(chongqing?.officialReviewRule ?? "", /官方等级/);
+  const jiangsu = matchLandslidePilotRegion("中国 · 江苏省 · 常州市溧阳市");
+  assert.equal(jiangsu?.id, "jiangsu");
+  assert.match(jiangsu?.applicability ?? "", /重点带/);
+  assert.equal(jiangsu?.calibrationStatus, "regional_routing_only");
+  assert.equal(matchLandslidePilotRegion("中国 · 四川省"), null);
+  assert.equal(matchLandslidePilotRegion(""), null);
 });
 
 test("parses hourly forecast and rejects discontinuous time axes", async () => {

@@ -565,3 +565,15 @@ test("adds on-demand hourly weather to event details and satellite tasks", async
   assert.match(dashboard, /weatherImagingWindows/);
   assert.match(css, /\.weather-card/);
 });
+
+test("shows strict Chongqing and Jiangsu landslide pilot boundaries", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const dashboard = await readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8");
+  const route = await readFile(new URL("../app/api/landslide-forecast/route.ts", import.meta.url), "utf8");
+  const pilots = await readFile(new URL("../lib/landslide-pilot-regions.ts", import.meta.url), "utf8");
+  for (const text of ["REGIONAL PILOT", "区域阈值未标定", "officialReviewRule", "regionHint"]) assert.ok(dashboard.includes(text));
+  assert.match(route, /matchLandslidePilotRegion/);
+  assert.match(route, /pilotRegion\?\.forecastModel\.id/);
+  for (const text of ["重庆区域试验", "江苏区域试验", "宁镇低山丘陵", "徐连低山丘陵", "环太湖低山丘陵", "regional_routing_only"]) assert.ok(pilots.includes(text));
+  assert.match(pilots, /平原区降雨信号不得直接解释为滑坡风险/);
+});

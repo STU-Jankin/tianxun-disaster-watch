@@ -1,4 +1,7 @@
 import type { LandslideTerrainResult } from "./landslide-planning.ts";
+import type { LandslidePilotRegion } from "./landslide-pilot-regions.ts";
+
+export type LandslideForecastModelId = "best_match" | "cma_grapes_global";
 
 export type LandslideTriggerLevel = "low_signal" | "watch" | "elevated" | "high" | "outside_slope_scope" | "unclassified";
 
@@ -26,7 +29,15 @@ export type LandslideForecastReady = {
   state: "ready";
   product: "tianxun-rainfall-trigger-screening-v1";
   modelStatus: "experimental_unvalidated";
-  provider: "Open-Meteo Best Match · Copernicus DEM";
+  provider: string;
+  weatherModel: {
+    id: LandslideForecastModelId;
+    label: string;
+    nativeResolutionKm: number | null;
+    updateIntervalHours: number | null;
+    selectionReason: string;
+  };
+  pilotRegion: LandslidePilotRegion | null;
   latitude: number;
   longitude: number;
   radiusKm: number;
@@ -48,7 +59,7 @@ export type LandslideForecastReady = {
 
 export type LandslideForecastResponse = LandslideForecastReady | {
   state: "unavailable";
-  provider: "Open-Meteo Best Match · Copernicus DEM";
+  provider: string;
   message: string;
 };
 
@@ -76,7 +87,7 @@ export function landslideForecastBaselinePeriod(now = new Date()) {
   return { start: `${startYear}-01-01`, end: `${endYear}-12-31` };
 }
 
-export function buildOpenMeteoLandslideForecastUrl(latitude: number, longitude: number) {
+export function buildOpenMeteoLandslideForecastUrl(latitude: number, longitude: number, model: LandslideForecastModelId = "best_match") {
   validateCoordinate(latitude, longitude);
   const url = new URL("https://api.open-meteo.com/v1/forecast");
   url.search = new URLSearchParams({
@@ -88,6 +99,7 @@ export function buildOpenMeteoLandslideForecastUrl(latitude: number, longitude: 
     timezone: "UTC",
     timeformat: "iso8601",
   }).toString();
+  if (model === "cma_grapes_global") url.searchParams.set("models", model);
   return url.toString();
 }
 
@@ -145,6 +157,8 @@ export function buildLandslideForecast(input: {
   fetchedAt?: string;
   baselinePeriod?: { start: string; end: string };
   inputWarnings?: string[];
+  pilotRegion?: LandslidePilotRegion | null;
+  weatherModel?: LandslideForecastModelId;
 }): LandslideForecastReady {
   const fetchedAt = utcIso(input.fetchedAt ?? new Date().toISOString());
   const fetchedAtMs = Date.parse(fetchedAt);
@@ -188,11 +202,27 @@ export function buildLandslideForecast(input: {
     };
   });
   const baselinePeriod = input.baselinePeriod ?? landslideForecastBaselinePeriod(new Date(fetchedAt));
+  const weatherModel = input.weatherModel ?? input.pilotRegion?.forecastModel.id ?? "best_match";
+  const regionalModel = weatherModel === "cma_grapes_global";
   return {
     state: "ready",
     product: "tianxun-rainfall-trigger-screening-v1",
     modelStatus: "experimental_unvalidated",
-    provider: "Open-Meteo Best Match · Copernicus DEM",
+    provider: regionalModel ? "Open-Meteo · CMA GRAPES Global · Copernicus DEM" : "Open-Meteo Best Match · Copernicus DEM",
+    weatherModel: regionalModel ? {
+      id: "cma_grapes_global",
+      label: "CMA GRAPES Global",
+      nativeResolutionKm: 15,
+      updateIntervalHours: 6,
+      selectionReason: "重庆/江苏区域试验固定选择中国气象局全球模式；Open-Meteo按小时插值输出不代表模式原生时间分辨率。",
+    } : {
+      id: "best_match",
+      label: "Open-Meteo Best Match",
+      nativeResolutionKm: null,
+      updateIntervalHours: null,
+      selectionReason: "区域试验范围外继续使用按位置自动选择的全球天气模式。",
+    },
+    pilotRegion: input.pilotRegion ?? null,
     latitude: input.series.latitude,
     longitude: input.series.longitude,
     radiusKm: input.radiusKm,
@@ -208,8 +238,8 @@ export function buildLandslideForecast(input: {
     inputWarnings: (input.inputWarnings ?? []).map((item) => item.replace(/[\r\n]+/g, " ").slice(0, 180)).slice(0, 4),
     horizons,
     sourceUrls: { forecast: forecastDocumentationUrl, climatology: archiveDocumentationUrl, terrain: terrainDocumentationUrl, method: nasaMethodUrl },
-    dataBoundary: "这是地点/AOI中心的降雨触发条件筛查，不是空间概率栅格、滑坡体边界或官方地质灾害预警。24/48小时可用于人工预置任务；72小时只作趋势监视。",
-    note: "规则使用未来24小时降雨相对本地10年日降雨P95的倍数、前期48小时降雨和NASA LHASA采用的10°坡度显示门槛。它没有复刻NASA XGBoost模型，也未使用岩性、PGA、SMAP剖面湿度或区域标定，因此不输出滑坡概率，不允许自动下发。Open-Meteo许可需按实际使用场景核对，正式业务应使用自建或有服务保障的数据链路。",
+    dataBoundary: "这是地点/AOI中心的降雨触发条件筛查，不是空间概率栅格、滑坡体边界或官方地质灾害预警。24/48小时可用于人工预置任务；72小时只作趋势监视。重庆/江苏试验配置只改变数据路由和复核口径，不冒充已标定的地方模型。",
+    note: "规则使用未来24小时降雨相对本地10年日降雨P95的倍数、前期48小时降雨和NASA LHASA采用的10°坡度显示门槛。它没有复刻NASA XGBoost模型，也未使用岩性、PGA、SMAP剖面湿度或完成区域样本标定，因此不输出滑坡概率，不允许自动下发。Open-Meteo许可需按实际使用场景核对，正式业务应使用自建或有服务保障的数据链路。",
   };
 }
 

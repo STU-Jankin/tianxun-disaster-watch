@@ -2492,7 +2492,7 @@ function LandslideForecastCard({ event }: { event: DisasterEvent }) {
   useEffect(() => {
     const controller = new AbortController();
     const start = window.setTimeout(() => {
-      const params = new URLSearchParams({ latitude: String(event.latitude), longitude: String(event.longitude), radiusKm: String(radiusKm) });
+      const params = new URLSearchParams({ latitude: String(event.latitude), longitude: String(event.longitude), radiusKm: String(radiusKm), regionHint: `${event.country} ${event.title}`.slice(0, 180) });
       setLoad({ state: "loading" });
       fetch(`/api/landslide-forecast?${params}`, { signal: controller.signal, cache: "no-store" })
         .then(async (response) => ({ response, result: await response.json() as LandslideForecastResponse }))
@@ -2503,7 +2503,7 @@ function LandslideForecastCard({ event }: { event: DisasterEvent }) {
         .catch((error) => { if (!controller.signal.aborted) setLoad({ state: "error", message: error instanceof Error ? error.message : "预报筛查请求失败" }); });
     }, 0);
     return () => { window.clearTimeout(start); controller.abort(); };
-  }, [event.latitude, event.longitude, radiusKm, retry]);
+  }, [event.country, event.latitude, event.longitude, event.title, radiusKm, retry]);
 
   const forecast = load.forecast;
   return <section className="landslide-forecast-card" aria-live="polite">
@@ -2514,6 +2514,14 @@ function LandslideForecastCard({ event }: { event: DisasterEvent }) {
     {load.state === "loading" ? <p className="landslide-forecast-loading">正在读取未来降雨、本地10年降雨P95与DEM坡度…</p> : null}
     {load.state === "error" ? <div className="landslide-forecast-error" role="alert"><strong>本轮未生成预报筛查</strong><p>{load.message}</p><button onClick={() => setRetry((value) => value + 1)}>重试</button></div> : null}
     {forecast ? <>
+      {forecast.pilotRegion ? <div className={`landslide-pilot-profile ${forecast.pilotRegion.id}`}>
+        <div><span>REGIONAL PILOT</span><strong>{forecast.pilotRegion.label}</strong><b>区域阈值未标定</b></div>
+        <p>{forecast.pilotRegion.calibrationLabel}</p>
+        <dl><div><dt>天气模式</dt><dd>{forecast.weatherModel.label} · 原生约 {forecast.weatherModel.nativeResolutionKm} km / 每 {forecast.weatherModel.updateIntervalHours} 小时更新</dd></div><div><dt>适用范围</dt><dd>{forecast.pilotRegion.applicability}</dd></div><div><dt>重点区域</dt><dd>{forecast.pilotRegion.focusAreas.join("、")}</dd></div><div><dt>卫星目标</dt><dd>{forecast.pilotRegion.observationTargets.join("、")}</dd></div></dl>
+        <p className="landslide-pilot-rule">{forecast.pilotRegion.officialReviewRule}</p>
+        <small>{forecast.pilotRegion.limitation}</small>
+        <a href={safeHttpUrl(forecast.pilotRegion.officialReferenceUrl)} target="_blank" rel="noreferrer">{forecast.pilotRegion.officialReferenceLabel} ↗</a>
+      </div> : null}
       <div className="landslide-forecast-meta"><span>查询 {forecast.latitude.toFixed(3)}°, {forecast.longitude.toFixed(3)}° · 半径 {forecast.radiusKm} km</span><span>计算 {formatTimeWithYear(forecast.fetchedAt)} UTC+08</span><span>本地基准 {forecast.baselinePeriod.start.slice(0, 4)}—{forecast.baselinePeriod.end.slice(0, 4)} · {forecast.baselinePeriod.validDayCount} 天</span><span>DEM最大近似坡度 {forecast.terrain.maximumSlopeDeg == null ? "—" : `${forecast.terrain.maximumSlopeDeg.toFixed(1)}°`}</span></div>
       {forecast.inputWarnings.length ? <div className="landslide-input-warnings" role="status"><strong>本轮输入不完整，结果已降级</strong>{forecast.inputWarnings.map((warning) => <span key={warning}>{warning}</span>)}</div> : null}
       <div className="landslide-horizons">{forecast.horizons.map((horizon) => <article key={horizon.leadHours} className={horizon.triggerLevel}>

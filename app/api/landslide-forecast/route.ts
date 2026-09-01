@@ -7,9 +7,11 @@ import {
   parseOpenMeteoLandslideClimatology,
   parseOpenMeteoLandslideForecast,
   type LandslideForecastReady,
+  type LandslideForecastModelId,
   type OpenMeteoClimatology,
 } from "../../../lib/landslide-forecast";
 import { analyzeTerrainElevations, prepareTerrainSamplingPlan, type LandslideTerrainResult } from "../../../lib/landslide-planning";
+import { matchLandslidePilotRegion } from "../../../lib/landslide-pilot-regions";
 
 export const dynamic = "force-dynamic";
 
@@ -29,6 +31,9 @@ export async function GET(request: Request) {
   const latitude = Number(url.searchParams.get("latitude"));
   const longitude = Number(url.searchParams.get("longitude"));
   const radiusKm = Number(url.searchParams.get("radiusKm") ?? 10);
+  const regionHint = safeRegionHint(url.searchParams.get("regionHint"));
+  const pilotRegion = matchLandslidePilotRegion(regionHint);
+  const weatherModel = pilotRegion?.forecastModel.id ?? "best_match";
   let terrainPlan: ReturnType<typeof prepareTerrainSamplingPlan>;
   try {
     terrainPlan = prepareTerrainSamplingPlan({ latitude, longitude, radiusKm });
@@ -36,14 +41,14 @@ export async function GET(request: Request) {
     return unavailable(error instanceof Error ? error.message : "滑坡预报查询参数无效", 400);
   }
 
-  const cacheKey = terrainPlan.cacheKey;
+  const cacheKey = `${terrainPlan.cacheKey}:${pilotRegion?.id ?? "global"}:${weatherModel}`;
   const cache = forecastState.__tianxunLandslideForecastCache ??= new Map();
   const cached = cache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return ready(cached.value, "hit");
 
   try {
     const period = landslideForecastBaselinePeriod();
-    const series = await fetchForecast(latitude, longitude);
+    const series = await fetchForecast(latitude, longitude, weatherModel);
     const [climatologyResult, terrainResult] = await Promise.allSettled([
       fetchClimatology(latitude, longitude, period),
       fetchTerrain(terrainPlan),
@@ -57,7 +62,7 @@ export async function GET(request: Request) {
       message: `DEM坡度不可用：${safeReason(terrainResult.reason)}`,
     };
     if (terrainResult.status === "rejected") inputWarnings.push(`DEM坡度不可用：${safeReason(terrainResult.reason)}`);
-    const value = buildLandslideForecast({ series, climatology, terrain, radiusKm: terrainPlan.radiusKm, baselinePeriod: period, inputWarnings });
+    const value = buildLandslideForecast({ series, climatology, terrain, radiusKm: terrainPlan.radiusKm, baselinePeriod: period, inputWarnings, pilotRegion, weatherModel });
     cache.set(cacheKey, { value, expiresAt: Date.now() + 30 * 60_000 });
     prune(cache, 300);
     return ready(value, "miss");
@@ -69,8 +74,8 @@ export async function GET(request: Request) {
   }
 }
 
-async function fetchForecast(latitude: number, longitude: number) {
-  const response = await boundedFetch(buildOpenMeteoLandslideForecastUrl(latitude, longitude), "Open-Meteo未来降雨", 1_000_000);
+async function fetchForecast(latitude: number, longitude: number, weatherModel: LandslideForecastModelId) {
+  const response = await boundedFetch(buildOpenMeteoLandslideForecastUrl(latitude, longitude, weatherModel), "Open-Meteo未来降雨", 1_000_000);
   return parseOpenMeteoLandslideForecast(JSON.parse(response));
 }
 
@@ -126,6 +131,11 @@ function unavailable(message: string, status: number) {
 
 function safeReason(value: unknown) {
   return (value instanceof Error ? value.message : "请求失败").replace(/[\r\n]+/g, " ").slice(0, 140);
+}
+
+function safeRegionHint(value: string | null) {
+  if (!value) return "";
+  return value.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 180);
 }
 
 function prune<T>(cache: Map<string, CacheEntry<T>>, maximum: number) {
