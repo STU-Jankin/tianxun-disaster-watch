@@ -433,6 +433,14 @@ export const lhasaV1GranuleProbes = sqliteTable("lhasa_v1_granule_probes", {
   timeEnd: text("time_end"),
   message: text("message").notNull(),
   checkedAt: text("checked_at").notNull(),
+  readStatus: text("read_status").notNull().default("not_started"),
+  storageKey: text("storage_key"),
+  storageBackend: text("storage_backend"),
+  payloadSha256: text("payload_sha256"),
+  byteLength: integer("byte_length"),
+  readJson: text("read_json"),
+  readMessage: text("read_message"),
+  readAt: text("read_at"),
 }, (table) => [
   index("lhasa_v1_granule_probes_status_date_idx").on(table.status, table.productDate),
 ]);

@@ -22,6 +22,7 @@ import {
 import type { ForecastRasterStorageBackend } from "../lib/forecast-raster-storage.ts";
 import type { LhasaRiskRasterSummary } from "../lib/lhasa-nowcast.ts";
 import type { LhasaV1GranuleProbeRecord, LhasaV1GranuleStatus } from "../lib/lhasa-v1-history.ts";
+import type { LhasaV1CaseReadResult, LhasaV1ReadStatus } from "../lib/lhasa-v1-replay.ts";
 
 type TaskRecord = Record<string, unknown> & {
   taskId: string;
@@ -372,7 +373,7 @@ export function ensureOperationalSchema() {
     `CREATE INDEX IF NOT EXISTS evaluation_cases_verification_time_idx ON evaluation_benchmark_cases (verification_status, occurred_at)`,
     `CREATE TABLE IF NOT EXISTS evaluation_runs (run_id TEXT PRIMARY KEY NOT NULL, model_version TEXT NOT NULL, case_count INTEGER NOT NULL, eligible_count INTEGER NOT NULL, detected_count INTEGER NOT NULL, report_json TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS evaluation_runs_created_idx ON evaluation_runs (created_at)`,
-    `CREATE TABLE IF NOT EXISTS lhasa_v1_granule_probes (case_id TEXT PRIMARY KEY NOT NULL, product_date TEXT NOT NULL, status TEXT NOT NULL, collection_concept_id TEXT NOT NULL, granule_concept_id TEXT, producer_granule_id TEXT, download_url TEXT, granule_size_mb REAL, time_start TEXT, time_end TEXT, message TEXT NOT NULL, checked_at TEXT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS lhasa_v1_granule_probes (case_id TEXT PRIMARY KEY NOT NULL, product_date TEXT NOT NULL, status TEXT NOT NULL, collection_concept_id TEXT NOT NULL, granule_concept_id TEXT, producer_granule_id TEXT, download_url TEXT, granule_size_mb REAL, time_start TEXT, time_end TEXT, message TEXT NOT NULL, checked_at TEXT NOT NULL, read_status TEXT NOT NULL DEFAULT 'not_started', storage_key TEXT, storage_backend TEXT, payload_sha256 TEXT, byte_length INTEGER, read_json TEXT, read_message TEXT, read_at TEXT)`,
     `CREATE INDEX IF NOT EXISTS lhasa_v1_granule_probes_status_date_idx ON lhasa_v1_granule_probes (status, product_date)`,
     `CREATE TABLE IF NOT EXISTS forecast_raster_products (product_id TEXT PRIMARY KEY NOT NULL, source_id TEXT NOT NULL, product_time TEXT NOT NULL, valid_from TEXT NOT NULL, valid_to TEXT NOT NULL, source_url TEXT NOT NULL, payload_sha256 TEXT NOT NULL, storage_key TEXT NOT NULL, storage_backend TEXT NOT NULL, content_type TEXT NOT NULL, byte_length INTEGER NOT NULL, source_width INTEGER NOT NULL, source_height INTEGER NOT NULL, group_pixels INTEGER NOT NULL, grid_width INTEGER NOT NULL, grid_height INTEGER NOT NULL, summary_json TEXT NOT NULL, archived_at TEXT NOT NULL)`,
     `CREATE UNIQUE INDEX IF NOT EXISTS forecast_raster_products_source_time_uidx ON forecast_raster_products (source_id, product_time)`,
@@ -397,6 +398,18 @@ export function ensureOperationalSchema() {
     if (!evaluationNames.has("outcome")) evaluationMigrations.push(db.prepare(`ALTER TABLE evaluation_benchmark_cases ADD COLUMN outcome TEXT NOT NULL DEFAULT 'event'`));
     if (!evaluationNames.has("calibration_group")) evaluationMigrations.push(db.prepare(`ALTER TABLE evaluation_benchmark_cases ADD COLUMN calibration_group TEXT`));
     if (evaluationMigrations.length) await db.batch(evaluationMigrations);
+    const lhasaColumns = await db.prepare(`PRAGMA table_info(lhasa_v1_granule_probes)`).all<{ name: string }>();
+    const lhasaNames = new Set(lhasaColumns.results.map((column) => column.name));
+    const lhasaMigrations: DatabaseStatement[] = [];
+    if (!lhasaNames.has("read_status")) lhasaMigrations.push(db.prepare(`ALTER TABLE lhasa_v1_granule_probes ADD COLUMN read_status TEXT NOT NULL DEFAULT 'not_started'`));
+    if (!lhasaNames.has("storage_key")) lhasaMigrations.push(db.prepare(`ALTER TABLE lhasa_v1_granule_probes ADD COLUMN storage_key TEXT`));
+    if (!lhasaNames.has("storage_backend")) lhasaMigrations.push(db.prepare(`ALTER TABLE lhasa_v1_granule_probes ADD COLUMN storage_backend TEXT`));
+    if (!lhasaNames.has("payload_sha256")) lhasaMigrations.push(db.prepare(`ALTER TABLE lhasa_v1_granule_probes ADD COLUMN payload_sha256 TEXT`));
+    if (!lhasaNames.has("byte_length")) lhasaMigrations.push(db.prepare(`ALTER TABLE lhasa_v1_granule_probes ADD COLUMN byte_length INTEGER`));
+    if (!lhasaNames.has("read_json")) lhasaMigrations.push(db.prepare(`ALTER TABLE lhasa_v1_granule_probes ADD COLUMN read_json TEXT`));
+    if (!lhasaNames.has("read_message")) lhasaMigrations.push(db.prepare(`ALTER TABLE lhasa_v1_granule_probes ADD COLUMN read_message TEXT`));
+    if (!lhasaNames.has("read_at")) lhasaMigrations.push(db.prepare(`ALTER TABLE lhasa_v1_granule_probes ADD COLUMN read_at TEXT`));
+    if (lhasaMigrations.length) await db.batch(lhasaMigrations);
     const intentColumns = await db.prepare(`PRAGMA table_info(task_cancellation_intents)`).all<{ name: string }>();
     if (!intentColumns.results.some((column) => column.name === "owner")) await db.prepare(`ALTER TABLE task_cancellation_intents ADD COLUMN owner TEXT NOT NULL DEFAULT 'legacy'`).run();
     const sessionColumns = await db.prepare(`PRAGMA table_info(web_sessions)`).all<{ name: string }>();
@@ -673,11 +686,13 @@ export async function deleteEvaluationCase(caseId: string) {
 export async function listLhasaV1GranuleProbes(limit = 100): Promise<LhasaV1GranuleProbeRecord[]> {
   await ensureOperationalSchema();
   const db = await database();
-  const rows = await db.prepare(`SELECT case_id AS caseId, product_date AS productDate, status, collection_concept_id AS collectionConceptId, granule_concept_id AS granuleConceptId, producer_granule_id AS producerGranuleId, download_url AS downloadUrl, granule_size_mb AS granuleSizeMb, time_start AS timeStart, time_end AS timeEnd, message, checked_at AS checkedAt FROM lhasa_v1_granule_probes ORDER BY product_date, case_id LIMIT ?`)
+  const rows = await db.prepare(`SELECT case_id AS caseId, product_date AS productDate, status, collection_concept_id AS collectionConceptId, granule_concept_id AS granuleConceptId, producer_granule_id AS producerGranuleId, download_url AS downloadUrl, granule_size_mb AS granuleSizeMb, time_start AS timeStart, time_end AS timeEnd, message, checked_at AS checkedAt, read_status AS readStatus, storage_key AS storageKey, storage_backend AS storageBackend, payload_sha256 AS payloadSha256, byte_length AS byteLength, read_json AS readJson, read_message AS readMessage, read_at AS readAt FROM lhasa_v1_granule_probes ORDER BY product_date, case_id LIMIT ?`)
     .bind(Math.max(1, Math.min(100, limit))).all<Record<string, unknown>>();
   return rows.results.flatMap((row) => {
     const status = String(row.status) as LhasaV1GranuleStatus;
-    if (!row.caseId || !row.productDate || !["available", "not_found", "metadata_error"].includes(status)) return [];
+    const readStatus = String(row.readStatus ?? "not_started") as LhasaV1ReadStatus;
+    if (!row.caseId || !row.productDate || !["available", "not_found", "metadata_error"].includes(status) || !["not_started", "ready", "credential_required", "download_error", "parse_error", "outside_coverage", "no_data"].includes(readStatus)) return [];
+    const storageBackend = ["r2", "filesystem"].includes(String(row.storageBackend)) ? String(row.storageBackend) as ForecastRasterStorageBackend : undefined;
     return [{
       caseId: String(row.caseId), productDate: String(row.productDate), status, collectionConceptId: String(row.collectionConceptId),
       granuleConceptId: row.granuleConceptId ? String(row.granuleConceptId) : undefined,
@@ -686,6 +701,14 @@ export async function listLhasaV1GranuleProbes(limit = 100): Promise<LhasaV1Gran
       granuleSizeMb: row.granuleSizeMb === null || row.granuleSizeMb === undefined ? undefined : Number(row.granuleSizeMb),
       timeStart: row.timeStart ? String(row.timeStart) : undefined, timeEnd: row.timeEnd ? String(row.timeEnd) : undefined,
       message: String(row.message ?? ""), checkedAt: String(row.checkedAt),
+      readStatus,
+      storageKey: row.storageKey ? String(row.storageKey) : undefined,
+      storageBackend,
+      payloadSha256: typeof row.payloadSha256 === "string" && /^[a-f0-9]{64}$/.test(row.payloadSha256) ? row.payloadSha256 : undefined,
+      byteLength: row.byteLength === null || row.byteLength === undefined ? undefined : Number(row.byteLength),
+      readResult: lhasaReadResultFromJson(row.readJson),
+      readMessage: row.readMessage ? String(row.readMessage) : undefined,
+      readAt: row.readAt ? String(row.readAt) : undefined,
     }];
   });
 }
@@ -698,6 +721,36 @@ export async function upsertLhasaV1GranuleProbe(probe: LhasaV1GranuleProbeRecord
     ON CONFLICT(case_id) DO UPDATE SET product_date=excluded.product_date, status=excluded.status, collection_concept_id=excluded.collection_concept_id, granule_concept_id=excluded.granule_concept_id, producer_granule_id=excluded.producer_granule_id, download_url=excluded.download_url, granule_size_mb=excluded.granule_size_mb, time_start=excluded.time_start, time_end=excluded.time_end, message=excluded.message, checked_at=excluded.checked_at`)
     .bind(probe.caseId, probe.productDate, probe.status, probe.collectionConceptId, probe.granuleConceptId ?? null, probe.producerGranuleId ?? null, probe.downloadUrl ?? null, probe.granuleSizeMb ?? null, probe.timeStart ?? null, probe.timeEnd ?? null, probe.message, probe.checkedAt).run();
   return probe;
+}
+
+export async function updateLhasaV1GranuleRead(caseId: string, update: {
+  readStatus: LhasaV1ReadStatus;
+  storageKey?: string;
+  storageBackend?: ForecastRasterStorageBackend;
+  payloadSha256?: string;
+  byteLength?: number;
+  readResult?: LhasaV1CaseReadResult;
+  readMessage: string;
+  readAt: string;
+}) {
+  await ensureOperationalSchema();
+  const db = await database();
+  await db.prepare(`UPDATE lhasa_v1_granule_probes SET read_status=?, storage_key=?, storage_backend=?, payload_sha256=?, byte_length=?, read_json=?, read_message=?, read_at=? WHERE case_id=?`)
+    .bind(update.readStatus, update.storageKey ?? null, update.storageBackend ?? null, update.payloadSha256 ?? null, update.byteLength ?? null, update.readResult ? JSON.stringify(update.readResult) : null, update.readMessage, update.readAt, caseId).run();
+}
+
+function lhasaReadResultFromJson(value: unknown): LhasaV1CaseReadResult | undefined {
+  if (typeof value !== "string" || !value) return undefined;
+  try {
+    const parsed = JSON.parse(value) as LhasaV1CaseReadResult;
+    const classes = [0, 1, 2, null];
+    if (!classes.includes(parsed.pointValue) || !classes.includes(parsed.neighborhoodMaximum) || parsed.interpretation !== "same_day_nowcast") return undefined;
+    if (!Array.isArray(parsed.neighborhoodRadiusCells) || parsed.neighborhoodRadiusCells.length !== 2 || !parsed.neighborhoodRadiusCells.every((item) => Number.isInteger(item) && item >= 1 && item <= 24)) return undefined;
+    if (!Array.isArray(parsed.window) || parsed.window.length !== 4 || !Array.isArray(parsed.boundingBox) || parsed.boundingBox.length !== 4 || !Array.isArray(parsed.resolutionDegrees) || parsed.resolutionDegrees.length !== 2) return undefined;
+    return parsed;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function listEvaluationRuns(limit = 10): Promise<DetectionEvaluationReport[]> {

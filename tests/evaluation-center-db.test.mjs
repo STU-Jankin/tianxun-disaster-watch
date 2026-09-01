@@ -99,6 +99,23 @@ test("persists benchmark cases and reads spatial-temporal replay candidates", as
       checkedAt: "2026-09-01T12:00:00.000Z",
     });
     assert.equal((await database.listLhasaV1GranuleProbes())[0].producerGranuleId, "Global_Landslide_Nowcast_v1.1_20201231.tif");
+    await database.updateLhasaV1GranuleRead(forecastBenchmark.caseId, {
+      readStatus: "ready",
+      storageKey: "lhasa-v1/2020/12/sample.tif",
+      storageBackend: "filesystem",
+      payloadSha256: "a".repeat(64),
+      byteLength: 7_000_000,
+      readResult: {
+        pointValue: 1, neighborhoodMaximum: 2, neighborhoodRadiusCells: [3, 3], validCellCount: 49, moderateCellCount: 2, highCellCount: 1,
+        window: [10, 10, 17, 17], rasterWidth: 43_200, rasterHeight: 14_400, boundingBox: [-180, -60, 180, 60], resolutionDegrees: [1 / 120, 1 / 120], noDataValue: 255, interpretation: "same_day_nowcast",
+      },
+      readMessage: "同日nowcast读取完成。",
+      readAt: "2026-09-01T13:00:00.000Z",
+    });
+    const historicalRead = (await database.listLhasaV1GranuleProbes())[0];
+    assert.equal(historicalRead.readStatus, "ready");
+    assert.equal(historicalRead.readResult.neighborhoodMaximum, 2);
+    assert.equal(historicalRead.payloadSha256, "a".repeat(64));
     await database.persistIngestionArtifacts({
       refreshId: "refresh-evaluation-forecast",
       sources: [],

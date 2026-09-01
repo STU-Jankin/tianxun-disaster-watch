@@ -1,3 +1,6 @@
+import type { ForecastRasterStorageBackend } from "./forecast-raster-storage.ts";
+import type { LhasaV1CaseReadResult, LhasaV1ReadStatus } from "./lhasa-v1-replay.ts";
+
 export const lhasaV1CollectionConceptId = "C2036912694-GES_DISC";
 export const lhasaV1DatasetUrl = "https://catalog.data.gov/dataset/global-landslide-nowcast-from-lhasa-l4-1-day-1-km-x-1-km-version-1-1-global_landslide_nowc";
 export const lhasaV1Doi = "10.5067/0D23ALHMHHT5";
@@ -23,6 +26,14 @@ export type LhasaV1GranuleMetadata = {
 export type LhasaV1GranuleProbeRecord = LhasaV1GranuleMetadata & {
   caseId: string;
   checkedAt: string;
+  readStatus: LhasaV1ReadStatus;
+  storageKey?: string;
+  storageBackend?: ForecastRasterStorageBackend;
+  payloadSha256?: string;
+  byteLength?: number;
+  readResult?: LhasaV1CaseReadResult;
+  readMessage?: string;
+  readAt?: string;
 };
 
 export function lhasaV1ProductDate(occurredAt: string) {

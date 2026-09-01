@@ -12,14 +12,16 @@ import {
   persistEvaluationRun,
   upsertEvaluationCase,
   upsertLhasaV1GranuleProbe,
+  updateLhasaV1GranuleRead,
 } from "../../../db/operational";
 import { apiActor, ApiInputError, authorizeApiRequest, enforceRateLimit, readJsonObject, rejectCrossOriginBrowserWrite } from "../../../lib/api-security";
 import { evaluateDetectionBenchmarks, evaluationCoverageGapMinutes, evaluationWindow, type EvaluationBenchmarkCase, type EvaluationObjective } from "../../../lib/evaluation-center";
 import type { HazardSubtype, HazardType } from "../../../lib/disasters";
 import { decodeLhasaRiskPng, lhasaRiskAtLocation } from "../../../lib/lhasa-nowcast";
-import { readForecastRasterObject } from "../../../lib/forecast-raster-storage";
+import { readForecastRasterObject, storeForecastRasterObject } from "../../../lib/forecast-raster-storage";
 import { buildNasaGlcPilot, nasaGlcCsvUrl, nasaGlcDatasetUrl, nasaGlcMaximumCsvBytes, nasaGlcPilotLimit, nasaGlcPilotPrefix } from "../../../lib/official-landslide-benchmark";
 import { lhasaV1CollectionConceptId, lhasaV1CoverageEnd, lhasaV1CoverageStart, lhasaV1DatasetUrl, lhasaV1Doi, lhasaV1ProductDate, probeLhasaV1Granule, type LhasaV1GranuleMetadata, type LhasaV1GranuleProbeRecord } from "../../../lib/lhasa-v1-history";
+import { downloadLhasaV1GeoTiff, lhasaV1MaximumBatchProducts, readLhasaV1CaseWindows, type LhasaV1ReadStatus } from "../../../lib/lhasa-v1-replay";
 
 export const dynamic = "force-dynamic";
 
@@ -143,19 +145,78 @@ export async function POST(request: Request) {
         const productDate = lhasaV1ProductDate(benchmark.occurredAt);
         const metadata = productDate ? dateResults.get(productDate) : undefined;
         const probe: LhasaV1GranuleProbeRecord = metadata
-          ? { caseId: benchmark.caseId, checkedAt, ...metadata }
+          ? { caseId: benchmark.caseId, checkedAt, readStatus: "not_started", ...metadata }
           : {
               caseId: benchmark.caseId,
               productDate: benchmark.occurredAt.slice(0, 10),
               status: "metadata_error",
               collectionConceptId: lhasaV1CollectionConceptId,
               checkedAt,
+              readStatus: "not_started",
               message: `样本日期不在LHASA 1.1官方覆盖期（${lhasaV1CoverageStart}至${lhasaV1CoverageEnd}）。`,
             };
         await upsertLhasaV1GranuleProbe(probe);
         probes.push(probe);
       }
       return Response.json({ probes, summary: lhasaProbeSummary(probes), checkedAt, downloadRequiresEarthdata: true }, { headers: privateHeaders() });
+    }
+    if (action === "read_official_lhasa_v1_batch") {
+      const bearerToken = process.env.EARTHDATA_BEARER_TOKEN?.trim() ?? "";
+      if (!bearerToken) throw new ApiInputError("尚未配置Earthdata服务端凭据；历史GeoTIFF不能下载，也不能生成模型结果", 409);
+      const [cases, probes] = await Promise.all([listEvaluationCases(), listLhasaV1GranuleProbes()]);
+      const caseById = new Map(cases.map((item) => [item.caseId, item]));
+      const completed = new Set<LhasaV1ReadStatus>(["ready", "outside_coverage", "no_data"]);
+      const pending = probes.filter((probe) => probe.status === "available" && probe.downloadUrl && !completed.has(probe.readStatus));
+      const productDates = [...new Set(pending.map((probe) => probe.productDate))].slice(0, lhasaV1MaximumBatchProducts);
+      if (!productDates.length) throw new ApiInputError("没有待读取的历史产品；请先核查产品，或现有产品已全部处理", 409);
+      let processedProducts = 0;
+      for (const productDate of productDates) {
+        const productProbes = pending.filter((probe) => probe.productDate === productDate);
+        const readAt = new Date().toISOString();
+        const downloadUrl = productProbes[0]?.downloadUrl;
+        let stage: "download" | "archive" | "parse" = "download";
+        let archiveInfo: { storageKey: string; storageBackend: "r2" | "filesystem"; payloadSha256: string; byteLength: number } | undefined;
+        try {
+          if (!downloadUrl || productProbes.some((probe) => probe.downloadUrl !== downloadUrl)) throw new Error("该日期的产品下载地址不一致");
+          const downloaded = await downloadLhasaV1GeoTiff(downloadUrl, bearerToken);
+          const filename = productProbes[0].producerGranuleId ?? `Global_Landslide_Nowcast_v1.1_${productDate.replaceAll("-", "")}.tif`;
+          const storageKey = `lhasa-v1/${productDate.slice(0, 4)}/${productDate.slice(5, 7)}/${filename.replace(/\.tif$/i, "")}-${downloaded.payloadSha256.slice(0, 12)}.tif`;
+          stage = "archive";
+          const storageBackend = await storeForecastRasterObject({
+            storageKey,
+            bytes: downloaded.bytes,
+            contentType: downloaded.contentType,
+            metadata: { dataset: "NASA-LHASA-v1.1", productDate, sha256: downloaded.payloadSha256 },
+          });
+          archiveInfo = { storageKey, storageBackend, payloadSha256: downloaded.payloadSha256, byteLength: downloaded.byteLength };
+          stage = "parse";
+          const replayCases = productProbes.flatMap((probe) => {
+            const benchmark = caseById.get(probe.caseId);
+            return benchmark ? [{ caseId: benchmark.caseId, latitude: benchmark.latitude, longitude: benchmark.longitude, locationToleranceKm: benchmark.locationToleranceKm }] : [];
+          });
+          const reads = await readLhasaV1CaseWindows(downloaded.bytes, replayCases);
+          for (const probe of productProbes) {
+            const result = reads.get(probe.caseId);
+            const readStatus: LhasaV1ReadStatus = !result ? "outside_coverage" : result.validCellCount ? "ready" : "no_data";
+            const readMessage = result
+              ? result.validCellCount
+                ? `同日nowcast读取完成：点值${lhasaClass(result.pointValue)}；容差邻域东西${result.neighborhoodRadiusCells[0]}格/南北${result.neighborhoodRadiusCells[1]}格，最高${lhasaClass(result.neighborhoodMaximum)}。`
+                : "核验点容差邻域全部为无数据值；不能据此判定模型为低风险。"
+              : "核验点位于LHASA 1.1官方60°N–60°S覆盖范围之外。";
+            await updateLhasaV1GranuleRead(probe.caseId, {
+              readStatus, storageKey, storageBackend, payloadSha256: downloaded.payloadSha256, byteLength: downloaded.byteLength,
+              readResult: result, readMessage, readAt,
+            });
+          }
+          processedProducts += 1;
+        } catch (error) {
+          const readStatus: LhasaV1ReadStatus = stage === "parse" ? "parse_error" : "download_error";
+          const readMessage = safeLhasaReadError(error, stage);
+          for (const probe of productProbes) await updateLhasaV1GranuleRead(probe.caseId, { readStatus, ...archiveInfo, readMessage, readAt });
+        }
+      }
+      const refreshed = await listLhasaV1GranuleProbes();
+      return Response.json({ processedProducts, maximumBatchProducts: lhasaV1MaximumBatchProducts, summary: lhasaProbeSummary(refreshed), probes: refreshed }, { headers: privateHeaders() });
     }
     if (action === "delete_case") {
       const caseId = text(body.caseId, "样本编号", 120);
@@ -278,13 +339,35 @@ async function readBoundedCatalogText(response: Response, maximumBytes: number) 
 }
 
 function lhasaProbeSummary(probes: LhasaV1GranuleProbeRecord[]) {
+  const available = probes.filter((item) => item.status === "available");
+  const readable = available.filter((item) => item.readStatus === "ready" && item.readResult);
+  const completed = available.filter((item) => ["ready", "outside_coverage", "no_data"].includes(item.readStatus));
   return {
     total: probes.length,
-    available: probes.filter((item) => item.status === "available").length,
+    available: available.length,
     notFound: probes.filter((item) => item.status === "not_found").length,
     errors: probes.filter((item) => item.status === "metadata_error").length,
     lastCheckedAt: probes.map((item) => item.checkedAt).sort().at(-1) ?? null,
+    readCompleted: completed.length,
+    readable: readable.length,
+    readPending: Math.max(0, available.length - completed.length),
+    readErrors: available.filter((item) => ["download_error", "parse_error"].includes(item.readStatus)).length,
+    sameDayModerateOrHigh: readable.filter((item) => (item.readResult?.neighborhoodMaximum ?? -1) >= 1).length,
+    sameDayHigh: readable.filter((item) => item.readResult?.neighborhoodMaximum === 2).length,
+    archivedProducts: new Set(readable.map((item) => item.payloadSha256).filter(Boolean)).size,
+    archivedBytes: [...new Map(readable.filter((item) => item.payloadSha256 && item.byteLength).map((item) => [item.payloadSha256!, item.byteLength!])).values()].reduce((sum, bytes) => sum + bytes, 0),
+    lastReadAt: available.map((item) => item.readAt).filter((value): value is string => Boolean(value)).sort().at(-1) ?? null,
   };
+}
+
+function lhasaClass(value: number | null) {
+  return value === 2 ? "高" : value === 1 ? "中" : value === 0 ? "低" : "无数据";
+}
+
+function safeLhasaReadError(error: unknown, stage: "download" | "archive" | "parse") {
+  const prefix = stage === "parse" ? "GeoTIFF结构或像元读取失败" : stage === "archive" ? "GeoTIFF归档失败" : "Earthdata下载失败";
+  const detail = (error instanceof Error ? error.message : "unknown error").replace(/https?:\/\/\S+/g, "上游地址").replace(/Bearer\s+\S+/gi, "凭据").slice(0, 180);
+  return `${prefix}：${detail}；不能据此判定模型未命中。`;
 }
 
 function publicProbeError(error: unknown) {
